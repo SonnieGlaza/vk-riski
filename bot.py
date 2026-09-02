@@ -14,6 +14,16 @@ def truncate_label(text, max_len=40):
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "…"
+    
+def format_numbered_list(items, start_from=1):
+    """Превращает список вариантов в текст с нумерацией: '1 — вариант', '2 — вариант' и т.д."""
+    lines = []
+    for i, item in enumerate(items, start=start_from):
+        # Обрезаем длинные строки, чтобы не ломать ВК-сообщение
+        short = item[:60] + ("…" if len(item) > 60 else "")
+        lines.append(f"{i} — {short}")
+    return "\n".join(lines)
+
 # -----------------------------------------------------
 
 # ================= НАСТРОЙКИ ИЗ ENV =================
@@ -290,37 +300,63 @@ def send_message(user_id, message, keyboard=None, attachment=None):
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
+def ask_step_with_numbers(user_id, step_key):
+    """Отправляет вопрос и нумерованный список вариантов (без кнопок)."""
+    question = QUESTIONS[step_key]
+    options = OPTIONS[step_key]
 
-def kb_start():
-    return json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
+    list_text = format_numbered_list(options)
+    message = f"{question}\n\n{list_text}\n\nНапишите номер(а) выбранного варианта(ов) через запятую (например: 1, 3)."
 
-def kb_options(step_key):
-    opts = OPTIONS[step_key]
-    rows = []
-    for i in range(0, len(opts), 2):
-        row = []
-        label1 = truncate_label(opts[i])
-        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
-        if i + 1 < len(opts):
-            label2 = truncate_label(opts[i+1])
-            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
-        rows.append(row)
-    return json.dumps({"one_time": False, "buttons": rows})
+    send_message(user_id, message)
 
-
-def kb_university(page):
+def ask_university_page(user_id, page):
     start = page * ITEMS_PER_PAGE
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
     items = UNIVERSITIES[start:end]
-    rows = []
-    for i in range(0, len(items), 2):
-        row = []
-        label1 = truncate_label(items[i])
-        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
-        if i + 1 < len(items):
-            label2 = truncate_label(items[i+1])
-            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
-        rows.append(row)
+
+    if not items:
+        send_message(user_id, "Список вузов пуст.")
+        return
+
+    list_text = format_numbered_list(items, start_from=start + 1)
+
+    nav = []
+    if page > 0:
+        nav.append("← 0 — Назад к началу списка")
+    if end < len(UNIVERSITIES):
+        nav.append(f"→ {len(UNIVERSITIES) // ITEMS_PER_PAGE + 1} — Следующая страница")
+
+    nav_text = "\n".join(nav) if nav else ""
+
+    message = (
+        "Выберите ваш вуз из списка:\n\n"
+        f"{list_text}\n\n"
+        f"{nav_text}\n\n"
+        "Введите номер вуза (например: 5). Если нужен другой список — используйте номера навигации."
+    )
+    send_message(user_id, message)
+
+def parse_numbered_input(text, items, start_from=1):
+    """
+    text: строка вида '1', '1, 3', '2' и т.п.
+    items: список вариантов
+    возвращает список выбранных значений или None, если ввод некорректен
+    """
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if not parts:
+        return None
+
+    selected = []
+    for p in parts:
+        if not p.isdigit():
+            return None  # не цифра — ошибка
+        idx = int(p) - start_from
+        if idx < 0 or idx >= len(items):
+            return None  # номер вне диапазона
+        selected.append(items[idx])
+
+    return selected
 
     nav = []
     if page > 0:

@@ -305,6 +305,140 @@ MESSAGES = {
 
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 
+def export_to_table(admin_id):
+    conn = get_db()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM answers")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        send_message(admin_id, MESSAGES["no_data"])
+        return
+
+    # ---------- Генерируем .xlsx через openpyxl ----------
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Анкеты"
+
+    cols = list(rows[0].keys())
+
+    # Заголовки жирным
+    header_font = Font(bold=True)
+    for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    # Данные
+    for row_idx, r in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(cols, start=1):
+            val = r[col_name]
+            ws.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+
+    # Авто-ширина колонок (примерная)
+    for col_idx, col_name in enumerate(cols, start=1):
+        max_len = max(len(str(col_name)), max(
+            (len(str(r[col_name])) if r[col_name] else 0) for r in rows
+        ))
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+
+    fname = "survey_export.xlsx"
+    wb.save(fname)
+
+    # ---------- Пытаемся загрузить .xlsx в ВК ----------
+    try:
+        # Получаем адрес сервера для загрузки
+        upload_server = vk.docs.getMessagesUploadServer(
+            type="doc",
+            peer_id=admin_id
+        )
+        upload_url = upload_server["upload_url"]
+
+        # Загружаем файл на сервер ВК
+        import urllib.request
+        import urllib.error
+        import mimetypes
+        from io import BytesIO
+
+        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+        with open(fname, "rb") as f:
+            file_data = f.read()
+
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            upload_url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        resp = urllib.request.urlopen(req)
+        import json as _json
+        result = _json.loads(resp.read().decode("utf-8"))
+
+        if "file" not in result or not result["file"]:
+            raise Exception("Сервер ВК не принял файл")
+
+        # Сохраняем документ в ВК
+        doc = vk.docs.save(file=result["file"], title="Выгрузка анкет.xlsx")
+
+        # Достаём owner_id и id документа
+        if isinstance(doc, dict) and "doc" in doc:
+            d = doc["doc"]
+        elif isinstance(doc, dict) and "docs" in doc:
+            d = doc["docs"][0]
+        else:
+            raise Exception(f"Неожиданный ответ docs.save: {doc}")
+
+        att = f"doc{d['owner_id']}_{d['id']}"
+        send_message(admin_id, "📊 Вот выгрузка анкет в Excel:", attachment=att)
+
+    except Exception as e:
+        print(f"Ошибка загрузки .xlsx в ВК: {e}")
+
+        # ---------- Fallback: отправляем CSV текстом ----------
+        try:
+            out = io.StringIO()
+            writer = csv.DictWriter(out, fieldnames=cols)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(dict(r))
+            csv_text = out.getvalue()
+            out.close()
+
+            if len(csv_text) > 4000:
+                # Разбиваем на части
+                chunks = []
+                lines = csv_text.split("\n")
+                current = ""
+                for line in lines:
+                    if len(current) + len(line) + 1 > 4000:
+                        chunks.append(current)
+                        current = line + "\n"
+                    else:
+                        current += line + "\n"
+                if current:
+                    chunks.append(current)
+
+                for i, chunk in enumerate(chunks):
+                    header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
+                    send_message(admin_id, header + chunk)
+            else:
+                send_message(admin_id, "📊 Выгрузка анкет (CSV, откроется в Excel):\n\n" + csv_text)
+        except Exception as e2:
+            send_message(admin_id, f"Не удалось выгрузить данные: {e2}")
+
+    finally:
+        if os.path.exists(fname):
+            os.remove(fname)
+
 def send_message(user_id, message, keyboard=None, attachment=None):
     try:
         params = {

@@ -9,21 +9,41 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# --- ФУНКЦИЯ ОБРЕЗКИ ТЕКСТА (сразу после импортов) ---
+# --- ФУНКЦИЯ ОБРЕЗКИ ТЕКСТА ---
 def truncate_label(text, max_len=40):
     if len(text) <= max_len:
         return text
     return text[:max_len - 3] + "…"
     
 def format_numbered_list(items, start_from=1):
-    """Превращает список вариантов в текст с нумерацией: '1 — вариант', '2 — вариант' и т.д."""
+    """Делает нумерованный список: '1 — вариант', '2 — вариант' и т.д."""
     lines = []
     for i, item in enumerate(items, start=start_from):
-        # Обрезаем длинные строки, чтобы не ломать ВК-сообщение
-        short = item[:60] + ("…" if len(item) > 60 else "")
-        lines.append(f"{i} — {short}")
+        # Если строка очень длинная — обрежем, чтобы не ломать читаемость
+        if len(item) > 80:
+            item = item[:77] + "…"
+        lines.append(f"{i} — {item}")
     return "\n".join(lines)
 
+def parse_numbers_input(text, items, start_from=1):
+    """
+    Превращает ввод пользователя '1', '1, 3', '2' в реальные значения из списка.
+    Возвращает список значений или None, если ввод некорректен.
+    """
+    parts = [p.strip() for p in text.split(",") if p.strip()]
+    if not parts:
+        return None
+
+    selected = []
+    for p in parts:
+        if not p.isdigit():
+            return None  # не цифра
+        idx = int(p) - start_from
+        if idx < 0 or idx >= len(items):
+            return None  # номер вне диапазона
+        selected.append(items[idx])
+
+    return selected
 # -----------------------------------------------------
 
 # ================= НАСТРОЙКИ ИЗ ENV =================

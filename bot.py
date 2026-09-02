@@ -18,7 +18,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not VK_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
 # =====================================================
-vk_session = vk_api.VkApi(token=TOKEN)
+vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 longpoll = VkLongPoll(vk_session)
 # ----------------- БАЗА ДАННЫХ -----------------

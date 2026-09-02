@@ -1,32 +1,52 @@
-import os
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.utils import get_random_id
 import re
 import csv
 import io
+import os
 import json
 import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# ================= НАСТРОЙКИ =================
-TOKEN = os.environ.get("VK_TOKEN", "")
-ADMIN_IDS_RAW = os.environ.get("ADMIN_IDS", "")
-ADMIN_IDS = {int(x.strip()) for x in ADMIN_IDS_RAW.split(",") if x.strip()}
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@localhost:5432/db")
-# ==============================================
-
-vk_session = vk_api.VkApi(token=TOKEN)
-vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
-
+# --- РЕГЕКСЫ (скомпилированы один раз) ---
 try:
     PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
     EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 except re.error as e:
     print("ОШИБКА В REGEX:", e)
     raise
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def truncate_label(text, max_len=40):
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "…"
+
+def format_numbered_list(items, start_from=1):
+    lines = []
+    for i, item in enumerate(items, start=start_from):
+        if len(item) > 80:
+            item = item[:77] + "…"
+        lines.append(f"{i} — {item}")
+    return "\n".join(lines)
+
+def all_options_fit(options, max_len=40):
+    return all(len(opt) <= max_len for opt in options)
+
+# ================= НАСТРОЙКИ ИЗ ENV =================
+VK_TOKEN = os.getenv("VK_TOKEN")
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
+GROUP_ID = int(os.getenv("GROUP_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not VK_TOKEN or not DATABASE_URL:
+    raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
+# =====================================================
+vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk = vk_session.get_api()
+longpoll = VkLongPoll(vk_session)
 
 # ----------------- БАЗА ДАННЫХ -----------------
 def get_db():
@@ -86,7 +106,7 @@ def save_answer(user_id, field, value):
     conn = get_db()
     c = conn.cursor()
     c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-    c.execute('UPDATE answers SET ' + field + '=%s WHERE user_id=%s', (value, user_id))
+    c.execute(f'UPDATE answers SET {field}=%s WHERE user_id=%s', (value, user_id))
     conn.commit()
     conn.close()
 
@@ -114,7 +134,7 @@ UNIVERSITIES = [
     "КПОУ УР «Удмуртский республиканский колледж культуры»",
     "АНПОО «Международный Восточно-Европейский колледж»",
     "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
-    "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной»",
+    "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
     "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
     "АНПОО СПО «Ижевский финансово-юридический колледж»",
     "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
@@ -131,16 +151,19 @@ UNIVERSITIES = [
     "БПОУ УР «Увинский профессиональный колледж»",
     "БПОУ УР «Ярский политехникум»",
     "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
-    "БПОУ УР «Ижевский индустриальный техникум имени Е.Ф. Драгунова»",
+    "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
     "БПОУ УР «Глазовский политехнический колледж»",
-    "Минюст", "УдГУ", "УдГАУ", "ИжГТУ",
+    "Министерство юстиции Российской Федерации",
+    "ФГБОУ ВО «Удмуртский государственный университет»",
+    "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+    "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
     "БПОУ УР «Ижевский автотранспортный техникум»",
-    "ГИПУ",
+    "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»",
     "Сарапульский техникум машиностроения и информационных технологий"
 ]
 ITEMS_PER_PAGE = 10
 
-# ----------------- ШАГИ -----------------
+# ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
     "fio", "institution", "specialty", "study_group",
     "course", "form_of_study", "contacts",
@@ -154,25 +177,64 @@ STEP_TO_DB = {s: s for s in STEPS}
 
 QUESTIONS = {
     "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
-    "institution": "Выберите ваше учебное заведение из списка:",
+    "institution": "Выберите ваше учебное заведение из списка (используйте «далее» / «назад» для пролистывания):",
     "specialty": "Укажите вашу специальность обучения:",
     "study_group": "Укажите номер вашей учебной группы:",
     "course": "Выберите ваш курс обучения:",
     "form_of_study": "Выберите форму обучения:",
     "contacts": "Укажите контактные данные — телефон или e-mail (например: +79991234567 или student@mail.ru):",
-    "employment_status": "Ваш статус занятости прямо сейчас.\nВыберите один вариант, указав его номер:",
+    "employment_status": (
+        "Ваш статус занятости прямо сейчас.\n"
+        "Выберите один вариант, указав его номер:\n\n"
+        "1 — Работаю по трудовому договору (в том числе по совместительству)\n"
+        "2 — Работаю по гражданско-правовому договору (договор подряда, услуг и т.п.)\n"
+        "3 — Являюсь самозанятым / ИП / учредителем юрлица\n"
+        "4 — Прохожу оплачиваемую стажировку / практику у работодателя\n"
+        "5 — Работаю временно (разовые подработки), не по специальности обучения\n"
+        "6 — Ничего из вышеперечисленного"
+    ),
     "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
     "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
     "practice_eval": "Как вы в целом оцениваете результаты своих производственных практик у работодателей по специальности обучения?",
-    "events": "Участвовали ли вы в течение обучения в мероприятиях, которые помогают познакомиться с работодателями (ярмарки вакансий, дни карьеры, профтуры на предприятия, встречи с работодателями и т.д.)?",
+    "events": (
+        "Участвовали ли вы в течение обучения в мероприятиях, которые помогают познакомиться с работодателями "
+        "(ярмарки вакансий, дни карьеры, профтуры на предприятия, встречи с работодателями и т.д.)?"
+    ),
     "resume_status": "Наличие резюме для поиска работы:",
     "interview_training": "Проходили ли вы занятия или тренинги по навыкам прохождения собеседования?",
     "special_status": "Есть ли у вас особый статус или жизненные обстоятельства?",
-    "military": "Планируется ли в отношении вас призыв на военную службу в ближайшее время (после окончания текущего года обучения)?",
-    "maternity": "Планируете ли вы уходить в отпуск по уходу за ребёнком в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?",
+    "military": (
+        "Планируется ли в отношении вас призыв на военную службу в ближайшее время "
+        "(после окончания текущего года обучения)?"
+    ),
+    "maternity": (
+        "Планируете ли вы уходить в отпуск по уходу за ребёнком "
+        "в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?"
+    ),
     "graduate": "Являетесь ли вы студентом выпускного курса (оканчиваете программу в текущем учебном году)?",
-    "post_plans": "Ваши планы после выпуска.\nВыберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):",
-    "help_needed": "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной?\nВыберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):"
+    "post_plans": (
+        "Ваши планы после выпуска.\n"
+        "Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):\n\n"
+        "1 — У меня есть подписанный трудовой договор (или договор на целевое обучение)\n"
+        "2 — Есть устная договорённость с работодателем, но без подписанных документов\n"
+        "3 — Прохожу стажировку\n"
+        "4 — Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)\n"
+        "5 — Планирую продолжить обучение (магистратура / аспирантура и пр.)\n"
+        "6 — Сейчас ищу работу\n"
+        "7 — Пока нет планов"
+    ),
+    "help_needed": (
+        "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной?\n"
+        "Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):\n\n"
+        "1 — Подбор актуальных вакансий с учётом специальности\n"
+        "2 — Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем\n"
+        "3 — Профтур-экскурсии на предприятия\n"
+        "4 — Подбор оплачиваемой стажировки\n"
+        "5 — Подбор работодателя для практики\n"
+        "6 — Заключение договора с работодателем на целевое обучение\n"
+        "7 — Помощь с ЕЦП «Работа России»\n"
+        "8 — Другое (укажите)"
+    )
 }
 
 OPTIONS = {
@@ -226,25 +288,6 @@ OPTIONS = {
     "graduate": [
         "да, я учусь на выпускном курсе",
         "нет, я не на выпускном курсе"
-    ],
-    "post_plans": [
-        "У меня есть подписанный трудовой договор (или договор на целевое обучение)",
-        "Есть устная договорённость с работодателем, но без подписанных документов",
-        "Прохожу стажировку",
-        "Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)",
-        "Планирую продолжить обучение (магистратура / аспирантура и пр.)",
-        "Сейчас ищу работу",
-        "Пока нет планов"
-    ],
-    "help_needed": [
-        "Подбор актуальных вакансий с учётом специальности",
-        "Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем",
-        "Профтур-экскурсии на предприятия",
-        "Подбор оплачиваемой стажировки",
-        "Подбор работодателя для практики",
-        "Заключение договора с работодателем на целевое обучение",
-        "Помощь с ЕЦП «Работа России»",
-        "Другое (укажите)"
     ]
 }
 
@@ -272,15 +315,47 @@ MESSAGES = {
     "admin_only": "Эта команда доступна только администраторам.",
     "finished": (
         "✅ Спасибо! Анкета заполнена.\n\n"
-        "Если у вас возникнут вопросы, вы всегда можете написать сюда ещё раз."
+        "Если хотите пройти анкету заново — нажмите кнопку ниже."
     ),
     "already_finished": (
-        "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново, "
-        "напишите команду /restart."
+        "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже."
     )
 }
 
-# ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
+# ----------------- КЛАВИАТУРЫ -----------------
+
+def kb_start():
+    return json.dumps({
+        "one_time": False,
+        "buttons": [[{
+            "action": {"type": "text", "label": "Начать анкету"},
+            "color": "positive"
+        }]]
+    })
+
+def kb_restart():
+    return json.dumps({
+        "one_time": False,
+        "buttons": [[{
+            "action": {"type": "text", "label": "🔄 Пройти заново"},
+            "color": "negative"
+        }]]
+    })
+
+def kb_options(step_key):
+    opts = OPTIONS[step_key]
+    rows = []
+    for i in range(0, len(opts), 2):
+        row = []
+        label1 = truncate_label(opts[i])
+        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
+        if i + 1 < len(opts):
+            label2 = truncate_label(opts[i + 1])
+            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
+        rows.append(row)
+    return json.dumps({"one_time": False, "buttons": rows})
+
+# ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
 
 def send_message(user_id, message, keyboard=None, attachment=None):
     try:
@@ -297,35 +372,56 @@ def send_message(user_id, message, keyboard=None, attachment=None):
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
-def all_options_fit(options, max_len=40):
-    """Проверяет, влезают ли все варианты в кнопку ВК (лимит 40 символов)."""
-    return all(len(opt) <= max_len for opt in options)
+def ask_university_page(user_id, page):
+    start = page * ITEMS_PER_PAGE
+    end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
+    items = UNIVERSITIES[start:end]
 
-def kb_start():
-    return json.dumps({
-        "one_time": False,
-        "buttons": [[{
-            "action": {"type": "text", "label": "Начать анкету"},
-            "color": "positive"
-        }]]
-    })
+    list_text = format_numbered_list(items, start_from=start + 1)
 
-def kb_options(step_key):
-    opts = OPTIONS[step_key]
-    rows = []
-    for i in range(0, len(opts), 2):
-        row = []
-        row.append({"action": {"type": "text", "label": opts[i]}, "color": "primary"})
-        if i + 1 < len(opts):
-            row.append({"action": {"type": "text", "label": opts[i+1]}, "color": "primary"})
-        rows.append(row)
-    return json.dumps({"one_time": False, "buttons": rows})
+    nav = []
+    if page > 0:
+        nav.append("«назад» — предыдущая страница")
+    if end < len(UNIVERSITIES):
+        nav.append("«далее» — следующая страница")
+    nav_text = "\n".join(nav) if nav else ""
 
-def format_numbered_list(items, start_from=1):
-    lines = []
-    for i, item in enumerate(items, start=start_from):
-        lines.append(f"{i} — {item}")
-    return "\n".join(lines)
+    message = f"{QUESTIONS['institution']}\n\n{list_text}"
+    if nav_text:
+        message += f"\n\n{nav_text}"
+    message += "\n\nВведите номер вашего учебного заведения."
+    send_message(user_id, message)
+
+def ask_step(user_id, step_key, uni_page=0):
+    if step_key == "institution":
+        ask_university_page(user_id, uni_page)
+    elif step_key in OPTIONS and all_options_fit(OPTIONS[step_key]):
+        # Короткие варианты — кнопки
+        send_message(user_id, QUESTIONS[step_key], kb_options(step_key))
+    elif step_key in OPTIONS:
+        # Длинные варианты — нумерованный список
+        opts = OPTIONS[step_key]
+        list_text = format_numbered_list(opts)
+        if step_key in MULTI_STEPS:
+            hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
+        else:
+            hint = "Напишите номер выбранного варианта (например: 1)."
+        message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
+        send_message(user_id, message)
+    else:
+        # Свободный ввод
+        send_message(user_id, QUESTIONS[step_key])
+
+def advance_step(user_id, step_index):
+    next_idx = step_index + 1
+    if next_idx >= len(STEPS):
+        set_progress(user_id, next_idx, 0, 2)
+        send_message(user_id, MESSAGES["finished"], kb_restart())
+    else:
+        set_progress(user_id, next_idx, 0, 1)
+        ask_step(user_id, STEPS[next_idx])
+
+# ----------------- ПАРСИНГ -----------------
 
 def validate_contact(text):
     text = text.strip()
@@ -359,51 +455,7 @@ def parse_multi_numbers(text, max_val):
     except ValueError:
         return None
 
-def ask_step(user_id, step_key, uni_page=0):
-    if step_key == "institution":
-        ask_university_page(user_id, uni_page)
-    elif step_key in OPTIONS and all_options_fit(OPTIONS[step_key]):
-        send_message(user_id, QUESTIONS[step_key], kb_options(step_key))
-    elif step_key in OPTIONS:
-        opts = OPTIONS[step_key]
-        list_text = format_numbered_list(opts)
-        if step_key in MULTI_STEPS:
-            hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
-        else:
-            hint = "Напишите номер выбранного варианта (например: 1)."
-        message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
-        send_message(user_id, message)
-    else:
-        send_message(user_id, QUESTIONS[step_key])
-
-def ask_university_page(user_id, page):
-    start = page * ITEMS_PER_PAGE
-    end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
-    items = UNIVERSITIES[start:end]
-    list_text = format_numbered_list(items, start_from=start + 1)
-
-    nav = []
-    if page > 0:
-        nav.append("«назад» — предыдущая страница")
-    if end < len(UNIVERSITIES):
-        nav.append("«далее» — следующая страница")
-    nav_text = "\n".join(nav) if nav else ""
-
-    message = f"{QUESTIONS['institution']}\n\n{list_text}"
-    if nav_text:
-        message += f"\n\n{nav_text}"
-    message += "\n\nВведите номер вашего учебного заведения."
-    send_message(user_id, message)
-
-def advance_step(user_id, step_index):
-    """Сохраняет прогресс и переход к следующему шагу или завершает анкету."""
-    next_idx = step_index + 1
-    if next_idx >= len(STEPS):
-        set_progress(user_id, next_idx, 0, 2)  # started=2 — анкета завершена
-        send_message(user_id, MESSAGES["finished"])
-    else:
-        set_progress(user_id, next_idx, 0, 1)
-        ask_step(user_id, STEPS[next_idx])
+# ----------------- ВЫГРУЗКА -----------------
 
 def export_to_table(admin_id):
     conn = get_db()
@@ -411,26 +463,110 @@ def export_to_table(admin_id):
     c.execute("SELECT * FROM answers")
     rows = c.fetchall()
     conn.close()
+
     if not rows:
         send_message(admin_id, MESSAGES["no_data"])
         return
-    out = io.StringIO()
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Анкеты"
+
     cols = list(rows[0].keys())
-    writer = csv.DictWriter(out, fieldnames=cols)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow(dict(r))
-    fname = "survey_export.csv"
-    with open(fname, "w", encoding="utf-8-sig") as f:
-        f.write(out.getvalue())
-    out.close()
+
+    header_font = Font(bold=True)
+    for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, r in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(cols, start=1):
+            val = r[col_name]
+            ws.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+
+    for col_idx, col_name in enumerate(cols, start=1):
+        max_len = max(len(str(col_name)), max(
+            (len(str(r[col_name])) if r[col_name] else 0) for r in rows
+        ))
+        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+
+    fname = "survey_export.xlsx"
+    wb.save(fname)
+
     try:
-        upload = vk_api.VkUpload(vk_session)
-        doc = upload.document_message(fname, title="Выгрузка анкет")
-        att = f"doc{doc['owner_id']}_{doc['id']}"
-        send_message(admin_id, "Вот выгрузка собранных анкет:", attachment=att)
+        upload_server = vk.docs.getMessagesUploadServer(type="doc", peer_id=admin_id)
+        upload_url = upload_server["upload_url"]
+
+        import urllib.request
+
+        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+        with open(fname, "rb") as f:
+            file_data = f.read()
+
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            upload_url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read().decode("utf-8"))
+
+        if "file" not in result or not result["file"]:
+            raise Exception("Сервер ВК не принял файл")
+
+        doc = vk.docs.save(file=result["file"], title="Выгрузка анкет.xlsx")
+
+        if isinstance(doc, dict) and "doc" in doc:
+            d = doc["doc"]
+        elif isinstance(doc, dict) and "docs" in doc:
+            d = doc["docs"][0]
+        else:
+            raise Exception(f"Неожиданный ответ docs.save: {doc}")
+
+        att = f"doc{d['owner_id']}_{d['id']}"
+        send_message(admin_id, "📊 Вот выгрузка анкет в Excel:", attachment=att)
+
     except Exception as e:
-        send_message(admin_id, f"Ошибка при загрузке файла: {e}")
+        print(f"Ошибка загрузки .xlsx в ВК: {e}")
+        try:
+            out = io.StringIO()
+            writer = csv.DictWriter(out, fieldnames=cols)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(dict(r))
+            csv_text = out.getvalue()
+            out.close()
+
+            if len(csv_text) > 4000:
+                chunks = []
+                lines = csv_text.split("\n")
+                current = ""
+                for line in lines:
+                    if len(current) + len(line) + 1 > 4000:
+                        chunks.append(current)
+                        current = line + "\n"
+                    else:
+                        current += line + "\n"
+                if current:
+                    chunks.append(current)
+
+                for i, chunk in enumerate(chunks):
+                    header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
+                    send_message(admin_id, header + chunk)
+            else:
+                send_message(admin_id, "📊 Выгрузка анкет (CSV, откроется в Excel):\n\n" + csv_text)
+        except Exception as e2:
+            send_message(admin_id, f"Не удалось выгрузить данные: {e2}")
     finally:
         if os.path.exists(fname):
             os.remove(fname)
@@ -454,6 +590,12 @@ def handle_message(event):
         send_message(user_id, "Анкета сброшена. Нажмите «Начать анкету».", kb_start())
         return
 
+    # Кнопка «Пройти заново»
+    if text == "🔄 Пройти заново":
+        set_progress(user_id, 0, 0, 0)
+        send_message(user_id, MESSAGES["welcome"], kb_start())
+        return
+
     step_index, uni_page, started = get_progress(user_id)
 
     # Анкета не начата
@@ -467,14 +609,14 @@ def handle_message(event):
 
     # Анкета уже завершена
     if started == 2 or step_index >= len(STEPS):
-        send_message(user_id, MESSAGES["already_finished"])
+        send_message(user_id, MESSAGES["already_finished"], kb_restart())
         return
 
     step_key = STEPS[step_index]
 
     # --- Выбор вуза ---
     if step_key == "institution":
-        if text.lower() in ["далее", ">"]:
+        if text.lower() in ["далее", ">", "следующий"]:
             max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
             if uni_page < max_page:
                 set_progress(user_id, step_index, uni_page + 1, 1)

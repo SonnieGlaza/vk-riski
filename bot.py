@@ -10,20 +10,15 @@ import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# --- РЕГЕКСЫ (скомпилированы один раз) ---
+# --- РЕГЕКСЫ ---
 try:
-    PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+    PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
     EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 except re.error as e:
     print("ОШИБКА В REGEX:", e)
     raise
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def truncate_label(text, max_len=40):
-    if len(text) <= max_len:
-        return text
-    return text[:max_len - 3] + "…"
-
+# --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1):
     lines = []
     for i, item in enumerate(items, start=start_from):
@@ -31,9 +26,6 @@ def format_numbered_list(items, start_from=1):
             item = item[:77] + "…"
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
-
-def all_options_fit(options, max_len=40):
-    return all(len(opt) <= max_len for opt in options)
 
 # ================= НАСТРОЙКИ ИЗ ENV =================
 VK_TOKEN = os.getenv("VK_TOKEN")
@@ -183,16 +175,7 @@ QUESTIONS = {
     "course": "Выберите ваш курс обучения:",
     "form_of_study": "Выберите форму обучения:",
     "contacts": "Укажите контактные данные — телефон или e-mail (например: +79991234567 или student@mail.ru):",
-    "employment_status": (
-        "Ваш статус занятости прямо сейчас.\n"
-        "Выберите один вариант, указав его номер:\n\n"
-        "1 — Работаю по трудовому договору (в том числе по совместительству)\n"
-        "2 — Работаю по гражданско-правовому договору (договор подряда, услуг и т.п.)\n"
-        "3 — Являюсь самозанятым / ИП / учредителем юрлица\n"
-        "4 — Прохожу оплачиваемую стажировку / практику у работодателя\n"
-        "5 — Работаю временно (разовые подработки), не по специальности обучения\n"
-        "6 — Ничего из вышеперечисленного"
-    ),
+    "employment_status": "Ваш статус занятости прямо сейчас. Выберите один вариант, указав его номер:",
     "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
     "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
     "practice_eval": "Как вы в целом оцениваете результаты своих производственных практик у работодателей по специальности обучения?",
@@ -212,29 +195,8 @@ QUESTIONS = {
         "в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?"
     ),
     "graduate": "Являетесь ли вы студентом выпускного курса (оканчиваете программу в текущем учебном году)?",
-    "post_plans": (
-        "Ваши планы после выпуска.\n"
-        "Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):\n\n"
-        "1 — У меня есть подписанный трудовой договор (или договор на целевое обучение)\n"
-        "2 — Есть устная договорённость с работодателем, но без подписанных документов\n"
-        "3 — Прохожу стажировку\n"
-        "4 — Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)\n"
-        "5 — Планирую продолжить обучение (магистратура / аспирантура и пр.)\n"
-        "6 — Сейчас ищу работу\n"
-        "7 — Пока нет планов"
-    ),
-    "help_needed": (
-        "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной?\n"
-        "Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):\n\n"
-        "1 — Подбор актуальных вакансий с учётом специальности\n"
-        "2 — Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем\n"
-        "3 — Профтур-экскурсии на предприятия\n"
-        "4 — Подбор оплачиваемой стажировки\n"
-        "5 — Подбор работодателя для практики\n"
-        "6 — Заключение договора с работодателем на целевое обучение\n"
-        "7 — Помощь с ЕЦП «Работа России»\n"
-        "8 — Другое (укажите)"
-    )
+    "post_plans": "Ваши планы после выпуска. Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):",
+    "help_needed": "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной? Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):"
 }
 
 OPTIONS = {
@@ -288,6 +250,25 @@ OPTIONS = {
     "graduate": [
         "да, я учусь на выпускном курсе",
         "нет, я не на выпускном курсе"
+    ],
+    "post_plans": [
+        "У меня есть подписанный трудовой договор (или договор на целевое обучение)",
+        "Есть устная договорённость с работодателем, но без подписанных документов",
+        "Прохожу стажировку",
+        "Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)",
+        "Планирую продолжить обучение (магистратура / аспирантура и пр.)",
+        "Сейчас ищу работу",
+        "Пока нет планов"
+    ],
+    "help_needed": [
+        "Подбор актуальных вакансий с учётом специальности",
+        "Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем",
+        "Профтур-экскурсии на предприятия",
+        "Подбор оплачиваемой стажировки",
+        "Подбор работодателя для практики",
+        "Заключение договора с работодателем на целевое обучение",
+        "Помощь с ЕЦП «Работа России»",
+        "Другое (укажите)"
     ]
 }
 
@@ -308,7 +289,6 @@ MESSAGES = {
         "или\n"
         "• Адрес электронной почты в формате example@mail.ru"
     ),
-    "invalid_choice": "Пожалуйста, выберите один из вариантов, нажав на кнопку ниже.",
     "invalid_number": "Пожалуйста, введите номер от 1 до {}.",
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
@@ -322,7 +302,7 @@ MESSAGES = {
     )
 }
 
-# ----------------- КЛАВИАТУРЫ -----------------
+# ----------------- КЛАВИАТУРЫ (только старт/рестарт) -----------------
 
 def kb_start():
     return json.dumps({
@@ -341,19 +321,6 @@ def kb_restart():
             "color": "negative"
         }]]
     })
-
-def kb_options(step_key):
-    opts = OPTIONS[step_key]
-    rows = []
-    for i in range(0, len(opts), 2):
-        row = []
-        label1 = truncate_label(opts[i])
-        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
-        if i + 1 < len(opts):
-            label2 = truncate_label(opts[i + 1])
-            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
-        rows.append(row)
-    return json.dumps({"one_time": False, "buttons": rows})
 
 # ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
 
@@ -395,11 +362,8 @@ def ask_university_page(user_id, page):
 def ask_step(user_id, step_key, uni_page=0):
     if step_key == "institution":
         ask_university_page(user_id, uni_page)
-    elif step_key in OPTIONS and all_options_fit(OPTIONS[step_key]):
-        # Короткие варианты — кнопки
-        send_message(user_id, QUESTIONS[step_key], kb_options(step_key))
     elif step_key in OPTIONS:
-        # Длинные варианты — нумерованный список
+        # Все варианты — нумерованным списком, без кнопок
         opts = OPTIONS[step_key]
         list_text = format_numbered_list(opts)
         if step_key in MULTI_STEPS:
@@ -655,46 +619,35 @@ def handle_message(event):
             send_message(user_id, MESSAGES["invalid_contact"])
         return
 
-    # --- Вопросы с вариантами ---
+    # --- Вопросы с вариантами (все через нумерованный список) ---
     if step_key in OPTIONS:
         opts = OPTIONS[step_key]
-        uses_buttons = all_options_fit(opts)
 
-        if uses_buttons:
-            # Режим кнопок
-            opts_lower = [o.lower() for o in opts]
-            if text.lower() in opts_lower:
-                for o in opts:
-                    if o.lower() == text.lower():
-                        save_answer(user_id, STEP_TO_DB[step_key], o)
-                        break
-                advance_step(user_id, step_index)
-            else:
-                send_message(user_id, MESSAGES["invalid_choice"])
-            return
+        if step_key in MULTI_STEPS:
+            # Множественный выбор — сохраняем ТЕКСТЫ вариантов
+            nums = parse_multi_numbers(text, len(opts))
+            if nums is None:
+                send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
+                return
+            label = "; ".join(opts[n - 1] for n in nums)
+            save_answer(user_id, STEP_TO_DB[step_key], label)
         else:
-            # Режим нумерованного списка
-            if step_key in MULTI_STEPS:
-                nums = parse_multi_numbers(text, len(opts))
-                if nums is None:
-                    send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
-                    return
-                label = "; ".join(opts[n - 1] for n in nums)
-                save_answer(user_id, STEP_TO_DB[step_key], label)
-            else:
-                n = parse_single_number(text, len(opts))
-                if n is None:
-                    send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
-                    return
-                save_answer(user_id, STEP_TO_DB[step_key], opts[n - 1])
+            # Одиночный выбор — сохраняем ТЕКСТ варианта
+            n = parse_single_number(text, len(opts))
+            if n is None:
+                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
+                return
+            save_answer(user_id, STEP_TO_DB[step_key], opts[n - 1])
 
-            advance_step(user_id, step_index)
-            return
+        advance_step(user_id, step_index)
+        return
 
     # --- Свободный ввод ---
-    if len(text) < 2:
-        send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
-        return
+    if step_key not in ["post_plans", "help_needed"]:
+        if len(text) < 2:
+            send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
+            return
+
     save_answer(user_id, STEP_TO_DB[step_key], text)
     advance_step(user_id, step_index)
 

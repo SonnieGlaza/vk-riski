@@ -421,6 +421,30 @@ def parse_multi_numbers(text, max_val):
 
 # ----------------- ВЫГРУЗКА -----------------
 
+EXPORT_HEADERS = {
+    "user_id": "ID пользователя",
+    "fio": "ФИО",
+    "institution": "Учебное заведение",
+    "specialty": "Специальность",
+    "study_group": "Учебная группа",
+    "course": "Курс",
+    "form_of_study": "Форма обучения",
+    "contacts": "Контакты",
+    "employment_status": "Статус занятости",
+    "target_contract": "Целевой договор",
+    "experience": "Опыт работы",
+    "practice_eval": "Оценка практик",
+    "events": "Участие в мероприятиях",
+    "resume_status": "Наличие резюме",
+    "interview_training": "Тренинги по собеседованию",
+    "special_status": "Особый статус",
+    "military": "Призыв на военную службу",
+    "maternity": "Отпуск по уходу за ребёнком",
+    "graduate": "Выпускной курс",
+    "post_plans": "Планы после выпуска",
+    "help_needed": "Нужная помощь"
+}
+
 def export_to_table(admin_id):
     conn = get_db()
     c = conn.cursor(cursor_factory=RealDictCursor)
@@ -443,7 +467,7 @@ def export_to_table(admin_id):
 
     header_font = Font(bold=True)
     for col_idx, col_name in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell = ws.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 

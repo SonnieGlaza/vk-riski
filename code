@@ -1,0 +1,138 @@
+import vk_api
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+from vk_api.utils import get_random_id
+
+# Вставь сюда свой токен сообщества
+TOKEN = "vk1.a.LvaPDyqk_WfqzSUgNBysqdsnpKcfMm52qPd-Vauq3RW06urxUXfrPCk_6XalnNRrIkMVhG5P7-3FnakheAyhW9Edi0qGlgER7S_7V4JgP5lRWzxWD4GNHY6FSi8TfXPGAcAebYqTiKCS8wF8KlvFhKLZyBvvhellw8JgNSR5_cXWkAMcpQ5haERNgXs6euJfho_6EudWSfwVM2svzH_q4Q"
+vk_session = vk_api.VkApi(token=TOKEN)
+vk = vk_session.get_api()
+
+# Хранилище: user_id -> состояние и ответы
+user_data = {}
+
+# Шаги анкеты
+STEPS = [
+    "fio",
+    "university",
+    "specialty",
+    "group",
+    "course",
+    "form_of_study",
+    "contacts",
+    "employment_status",
+    "target_contract",
+    "experience_specialty"
+]
+
+# Варианты ответов для шагов с выбором
+OPTIONS = {
+    "course": ["1", "2", "3", "4", "5", "6"],
+    "form_of_study": ["очная", "заочная", "очно-заочная"],
+    "employment_status": [
+        "работаю по трудовому договору (в т. ч. по совместительству)",
+        "работаю по гражданско-правовому договору (договор подряда, услуг и т. п.)",
+        "являюсь самозанятым / ИП / учредителем юрлица",
+        "прохожу оплачиваемую стажировку/практику у работодателя",
+        "работаю временно/разовые подработки, не по специальности",
+        "ничего из вышеперечисленного"
+    ],
+    "target_contract": ["да", "нет"],
+    "experience_specialty": ["да", "нет"]
+}
+
+def make_keyboard(options):
+    keyboard = VkKeyboard()
+    for i, opt in enumerate(options):
+        keyboard.add_button(opt, color=VkKeyboardColor.SECONDARY)
+        if (i + 1) % 2 == 0 and i != len(options) - 1:
+            keyboard.add_line()
+    return keyboard.get_keyboard()
+
+def handle_message(event):
+    user_id = event.user_id
+    text = event.text.strip().lower()
+
+    # Инициализация, если пользователя нет
+    if user_id not in user_data:
+        user_data[user_id] = {"step_index": 0, "answers": {}}
+        send_question(user_id)
+        return
+
+    data = user_data[user_id]
+    step_key = STEPS[data["step_index"]]
+
+    # Если шаг предполагает выбор, проверяем, что пользователь выбрал из списка
+    if step_key in OPTIONS:
+        if text not in [opt.lower() for opt in OPTIONS[step_key]]:
+            send_message(user_id, "Пожалуйста, выберите вариант из кнопок ниже.")
+            return
+        # Сохраняем оригинальный вариант (не lower), чтобы красиво выглядело
+        for opt in OPTIONS[step_key]:
+            if opt.lower() == text:
+                data["answers"][step_key] = opt
+                break
+    else:
+        # Свободный ввод
+        data["answers"][step_key] = text
+
+    # Переход к следующему шагу
+    data["step_index"] += 1
+
+    if data["step_index"] >= len(STEPS):
+        finish_survey(user_id)
+    else:
+        send_question(user_id)
+
+def send_question(user_id):
+    data = user_data[user_id]
+    step_key = STEPS[data["step_index"]]
+
+    QUESTIONS = {
+        "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
+        "university": "Выберите учебное заведение из списка:",
+        "specialty": "Укажите вашу специальность:",
+        "group": "Укажите номер вашей группы:",
+        "course": "Выберите ваш курс:",
+        "form_of_study": "Укажите форму обучения:",
+        "contacts": "Укажите контактные данные (телефон или e-mail):",
+        "employment_status": "Ваш статус занятости прямо сейчас:",
+        "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
+        "experience_specialty": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?"
+    }
+
+    msg = QUESTIONS[step_key]
+
+    keyboard = None
+    if step_key in OPTIONS:
+        keyboard = make_keyboard(OPTIONS[step_key])
+
+    send_message(user_id, msg, keyboard)
+
+def send_message(user_id, text, keyboard=None):
+    vk.messages.send(
+        peer_id=user_id,
+        message=text,
+        random_id=get_random_id(),
+        keyboard=keyboard
+    )
+
+def finish_survey(user_id):
+    data = user_data[user_id]
+    answers = data["answers"]
+
+    # Тут можно отправить ответы себе в файл, в Google Sheets, в БД и т.п.
+    report = "Анкета завершена! Результаты:\n"
+    for k, v in answers.items():
+        report += f"{k}: {v}\n"
+
+    send_message(user_id, report)
+    # После завершения можно очистить память
+    del user_data[user_id]
+
+# Обработчик событий (пример для longpoll)
+from vk_api.longpoll import VkLongPoll
+longpoll = VkLongPoll(vk_session)
+
+for event in longpoll.listen():
+    if event.type == vk_api.events.EventType.MESSAGE_NEW and event.to_me:
+        handle_message(event)

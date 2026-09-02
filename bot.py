@@ -460,9 +460,9 @@ def export_to_table(admin_id):
 
 def ask_step(user_id, step_key, uni_page=0):
     if step_key == "institution":
-        send_message(user_id, QUESTIONS[step_key], kb_university(uni_page))
+        send_message(user_id, QUESTIONS[step_key])
     elif step_key in OPTIONS:
-        send_message(user_id, QUESTIONS[step_key], kb_options(step_key))
+        send_message(user_id, QUESTIONS[step_key])
     else:
         send_message(user_id, QUESTIONS[step_key])
 
@@ -484,7 +484,7 @@ def handle_message(event):
             set_progress(user_id, 0, 0, 1)
             ask_step(user_id, STEPS[0])
         else:
-            send_message(user_id, MESSAGES["welcome"], kb_start())
+            send_message(user_id, MESSAGES["welcome"])
         return
 
     step_key = STEPS[step_index]

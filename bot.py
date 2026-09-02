@@ -3,7 +3,8 @@ import re
 import csv
 import io
 from datetime import datetime
-
+import sqlite3
+import json
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.utils import get_random_id

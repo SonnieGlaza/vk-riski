@@ -1,15 +1,13 @@
-import os
-import re
-import csv
-import io
-from datetime import datetime
-import sqlite3
-import json
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.utils import get_random_id
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
+import re
+import csv
+import io
+import os
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ================= НАСТРОЙКИ ИЗ ENV =================
 VK_TOKEN = os.getenv("VK_TOKEN")
@@ -20,14 +18,19 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not VK_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
 # =====================================================
-
+vk_session = vk_api.VkApi(token=TOKEN)
+vk = vk_session.get_api()
+longpoll = VkLongPoll(vk_session)
 # ----------------- БАЗА ДАННЫХ -----------------
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
+
 def init_db():
-    conn = sqlite3.connect(DATABASE_URL)
+    conn = get_db()
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS answers (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             fio TEXT, institution TEXT, specialty TEXT, study_group TEXT,
             course TEXT, form_of_study TEXT, contacts TEXT,
             employment_status TEXT, target_contract TEXT, experience TEXT,
@@ -38,7 +41,7 @@ def init_db():
     ''')
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
-            user_id INTEGER PRIMARY KEY,
+            user_id BIGINT PRIMARY KEY,
             step_index INTEGER DEFAULT 0,
             uni_page INTEGER DEFAULT 0,
             started INTEGER DEFAULT 0
@@ -48,18 +51,21 @@ def init_db():
     conn.close()
 
 def get_progress(user_id):
-    conn = sqlite3.connect(DATABASE_URL)
+    conn = get_db()
     c = conn.cursor()
-    c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=?", (user_id,))
+    c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=%s", (user_id,))
     row = c.fetchone()
     conn.close()
     return (row[0], row[1], row[2]) if row else (0, 0, 0)
 
 def set_progress(user_id, step_index, uni_page=0, started=1):
-    conn = sqlite3.connect(DATABASE_URL)
+    conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO progress VALUES (?,?,?,?)",
-              (user_id, step_index, uni_page, started))
+    c.execute(
+        "INSERT INTO progress (user_id, step_index, uni_page, started) VALUES (%s,%s,%s,%s) "
+        "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s",
+        (user_id, step_index, uni_page, started, step_index, uni_page, started)
+    )
     conn.commit()
     conn.close()
 
@@ -70,14 +76,14 @@ def save_answer(user_id, field, value):
             "special_status","military","maternity","graduate","post_plans","help_needed"]
     if field not in cols:
         return
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db()
     c = conn.cursor()
-    c.execute("INSERT OR IGNORE INTO answers (user_id) VALUES (?)", (user_id,))
-    c.execute(f"UPDATE answers SET {field}=? WHERE user_id=?", (value, user_id))
+    c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+    c.execute(f'UPDATE answers SET {field}=%s WHERE user_id=%s', (value, user_id))
     conn.commit()
     conn.close()
 
-# ----------------- ДАННЫЕ И КОНФИГУРАЦИЯ -----------------
+# ----------------- СПИСОК ВУЗов -----------------
 UNIVERSITIES = [
     "БПОУ УР «Воткинский промышленный техникум»", "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
     "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»", "АПОУ УР «Глазовский аграрно-промышленный техникум»",
@@ -102,9 +108,9 @@ UNIVERSITIES = [
     "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»", "БПОУ УР «Ижевский автотранспортный техникум»", 
     "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»", "Сарапульский техникум машиностроения и информационных технологий"
 ]
-
 ITEMS_PER_PAGE = 10
 
+# ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
     "fio", "institution", "specialty", "study_group",
     "course", "form_of_study", "contacts",
@@ -114,7 +120,6 @@ STEPS = [
     "maternity", "graduate", "post_plans", "help_needed"
 ]
 
-# Сопоставление шагов и колонок в БД
 STEP_TO_DB = {
     "fio": "fio", "institution": "institution", "specialty": "specialty",
     "study_group": "study_group", "course": "course", "form_of_study": "form_of_study",
@@ -189,8 +194,6 @@ QUESTIONS = {
     )
 }
 
-
-# Одиночный выбор (кнопки)
 OPTIONS = {
     "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
     "form_of_study": ["очная", "очно-заочная", "заочная"],
@@ -237,7 +240,6 @@ OPTIONS = {
     ]
 }
 
-# Множественный выбор (номера через запятую)
 MULTI_STEPS = ["employment_status", "post_plans", "help_needed"]
 
 MESSAGES = {
@@ -263,6 +265,7 @@ MESSAGES = {
         "Если у вас возникнут вопросы, вы всегда можете написать сюда ещё раз."
     )
 }
+
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 
 def send_message(user_id, message, keyboard=None, attachment=None):
@@ -281,7 +284,7 @@ def send_message(user_id, message, keyboard=None, attachment=None):
         print(f"Ошибка отправки: {e}")
 
 def kb_start():
-    return '{"one_time":false,"buttons":[[{"action":{"type":"text","label":"Начать анкету"},"color":"positive"}]]}'
+    return json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
 
 def kb_options(step_key):
     opts = OPTIONS[step_key]
@@ -292,7 +295,6 @@ def kb_options(step_key):
         if i + 1 < len(opts):
             row.append({"action": {"type": "text", "label": opts[i+1]}, "color": "primary"})
         rows.append(row)
-    import json
     return json.dumps({"one_time": False, "buttons": rows})
 
 def kb_university(page):
@@ -313,7 +315,6 @@ def kb_university(page):
         nav.append({"action": {"type": "text", "label": "Далее →"}, "color": "secondary"})
     if nav:
         rows.append(nav)
-    import json
     return json.dumps({"one_time": False, "buttons": rows})
 
 def validate_contact(text):
@@ -374,20 +375,20 @@ def multi_to_text(step_key, nums):
     return "; ".join(labels[step_key][n-1] for n in nums)
 
 def export_to_table(admin_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    conn = get_db()
+    c = conn.cursor(cursor_factory=RealDictCursor)
     c.execute("SELECT * FROM answers")
     rows = c.fetchall()
-    cols = [d[0] for d in c.description]
     conn.close()
     if not rows:
         send_message(admin_id, MESSAGES["no_data"])
         return
     out = io.StringIO()
+    cols = list(rows[0].keys())
     writer = csv.DictWriter(out, fieldnames=cols)
     writer.writeheader()
     for r in rows:
-        writer.writerow(dict(zip(cols, r)))
+        writer.writerow(dict(r))
     fname = "survey_export.csv"
     with open(fname, "w", encoding="utf-8-sig") as f:
         f.write(out.getvalue())
@@ -417,7 +418,6 @@ def handle_message(event):
     user_id = event.user_id
     text = event.text.strip()
 
-    # --- Команды админа ---
     if text.lower() in ["/export", "/выгрузить"]:
         if user_id in ADMIN_IDS:
             export_to_table(user_id)
@@ -425,10 +425,8 @@ def handle_message(event):
             send_message(user_id, MESSAGES["admin_only"])
         return
 
-    # --- Получаем прогресс ---
     step_index, uni_page, started = get_progress(user_id)
 
-    # --- Если анкета ещё не начата — показываем приветствие ---
     if started == 0:
         if text == "Начать анкету":
             set_progress(user_id, 0, 0, 1)
@@ -437,10 +435,9 @@ def handle_message(event):
             send_message(user_id, MESSAGES["welcome"], kb_start())
         return
 
-    # --- Анкета уже начата ---
     step_key = STEPS[step_index]
 
-    # 1. Выбор ВУЗа (с навигацией)
+    # 1. Выбор ВУЗа
     if step_key == "institution":
         if text == "← Назад":
             if uni_page > 0:
@@ -480,7 +477,7 @@ def handle_message(event):
             send_message(user_id, MESSAGES["invalid_contact"])
             return
 
-    # 3. Множественный выбор (номера через запятую)
+    # 3. Множественный выбор
     if step_key in MULTI_STEPS:
         max_opt = {"employment_status": 6, "post_plans": 7, "help_needed": 8}[step_key]
         nums = parse_multi_choice(text, max_opt)

@@ -9,6 +9,13 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
+# --- ФУНКЦИЯ ОБРЕЗКИ ТЕКСТА (сразу после импортов) ---
+def truncate_label(text, max_len=40):
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "…"
+# -----------------------------------------------------
+
 # ================= НАСТРОЙКИ ИЗ ENV =================
 VK_TOKEN = os.getenv("VK_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
@@ -271,7 +278,7 @@ MESSAGES = {
 def send_message(user_id, message, keyboard=None, attachment=None):
     try:
         params = {
-            "user_id": user_id,
+            "peer_id": user_id,        
             "message": message,
             "random_id": get_random_id()
         }
@@ -283,6 +290,7 @@ def send_message(user_id, message, keyboard=None, attachment=None):
     except Exception as e:
         print(f"Ошибка отправки: {e}")
 
+
 def kb_start():
     return json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
 
@@ -291,11 +299,14 @@ def kb_options(step_key):
     rows = []
     for i in range(0, len(opts), 2):
         row = []
-        row.append({"action": {"type": "text", "label": opts[i]}, "color": "primary"})
+        label1 = truncate_label(opts[i])
+        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
         if i + 1 < len(opts):
-            row.append({"action": {"type": "text", "label": opts[i+1]}, "color": "primary"})
+            label2 = truncate_label(opts[i+1])
+            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
         rows.append(row)
     return json.dumps({"one_time": False, "buttons": rows})
+
 
 def kb_university(page):
     start = page * ITEMS_PER_PAGE
@@ -304,10 +315,13 @@ def kb_university(page):
     rows = []
     for i in range(0, len(items), 2):
         row = []
-        row.append({"action": {"type": "text", "label": items[i]}, "color": "primary"})
+        label1 = truncate_label(items[i])
+        row.append({"action": {"type": "text", "label": label1}, "color": "primary"})
         if i + 1 < len(items):
-            row.append({"action": {"type": "text", "label": items[i+1]}, "color": "primary"})
+            label2 = truncate_label(items[i+1])
+            row.append({"action": {"type": "text", "label": label2}, "color": "primary"})
         rows.append(row)
+
     nav = []
     if page > 0:
         nav.append({"action": {"type": "text", "label": "← Назад"}, "color": "secondary"})
@@ -315,7 +329,9 @@ def kb_university(page):
         nav.append({"action": {"type": "text", "label": "Далее →"}, "color": "secondary"})
     if nav:
         rows.append(nav)
+
     return json.dumps({"one_time": False, "buttons": rows})
+
 
 def validate_contact(text):
     text = text.strip()

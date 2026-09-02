@@ -477,7 +477,8 @@ def export_to_table(admin_id):
             ws.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
     for col_idx, col_name in enumerate(cols, start=1):
-                max_len = max(len(EXPORT_HEADERS.get(col_name, col_name)), max(
+        display_name = EXPORT_HEADERS.get(col_name, col_name)
+        max_len = max(len(str(display_name)), max(
             (len(str(r[col_name])) if r[col_name] else 0) for r in rows
         ))
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)

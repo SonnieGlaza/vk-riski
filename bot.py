@@ -580,36 +580,6 @@ def multi_to_text(step_key, nums):
     }
     return "; ".join(labels[step_key][n-1] for n in nums)
 
-def export_to_table(admin_id):
-    conn = get_db()
-    c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("SELECT * FROM answers")
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        send_message(admin_id, MESSAGES["no_data"])
-        return
-    out = io.StringIO()
-    cols = list(rows[0].keys())
-    writer = csv.DictWriter(out, fieldnames=cols)
-    writer.writeheader()
-    for r in rows:
-        writer.writerow(dict(r))
-    fname = "survey_export.csv"
-    with open(fname, "w", encoding="utf-8-sig") as f:
-        f.write(out.getvalue())
-    out.close()
-    try:
-        upload = vk_api.VkUpload(vk_session)
-        doc = upload.document_message(fname, title="Выгрузка анкет")
-        att = f"doc{doc['owner_id']}_{doc['id']}"
-        send_message(admin_id, "Вот выгрузка собранных анкет:", attachment=att)
-    except Exception as e:
-        send_message(admin_id, f"Ошибка при загрузке файла: {e}")
-    finally:
-        if os.path.exists(fname):
-            os.remove(fname)
-
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 def ask_step(user_id, step_key, uni_page=0):

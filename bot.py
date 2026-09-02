@@ -335,7 +335,7 @@ def kb_university(page):
 
 def validate_contact(text):
     text = text.strip()
-    phone_re = r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$'
+    phone_re = r'^\+?[78]?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$'
     email_re = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
     if re.match(phone_re, text):
         digits = re.sub(r'\D', '', text)

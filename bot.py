@@ -23,7 +23,7 @@ if not VK_TOKEN or not DATABASE_URL:
 
 # ----------------- БАЗА ДАННЫХ -----------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DATABASE_URL)
     c = conn.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS answers (
@@ -48,7 +48,7 @@ def init_db():
     conn.close()
 
 def get_progress(user_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DATABASE_URL)
     c = conn.cursor()
     c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -56,7 +56,7 @@ def get_progress(user_id):
     return (row[0], row[1], row[2]) if row else (0, 0, 0)
 
 def set_progress(user_id, step_index, uni_page=0, started=1):
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DATABASE_URL)
     c = conn.cursor()
     c.execute("INSERT OR REPLACE INTO progress VALUES (?,?,?,?)",
               (user_id, step_index, uni_page, started))

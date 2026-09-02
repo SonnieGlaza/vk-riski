@@ -20,36 +20,61 @@ if not VK_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
 # =====================================================
 
-# ----------------- НАСТРОЙКА БАЗЫ ДАННЫХ -----------------
-Base = declarative_base()
+# ----------------- БАЗА ДАННЫХ -----------------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS answers (
+            user_id INTEGER PRIMARY KEY,
+            fio TEXT, institution TEXT, specialty TEXT, study_group TEXT,
+            course TEXT, form_of_study TEXT, contacts TEXT,
+            employment_status TEXT, target_contract TEXT, experience TEXT,
+            practice_eval TEXT, events TEXT, resume_status TEXT,
+            interview_training TEXT, special_status TEXT, military TEXT,
+            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS progress (
+            user_id INTEGER PRIMARY KEY,
+            step_index INTEGER DEFAULT 0,
+            uni_page INTEGER DEFAULT 0,
+            started INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-class SurveyResponse(Base):
-    __tablename__ = "survey_responses"
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(Integer, nullable=False, index=True)
-    fio = Column(String(255))
-    birth_date = Column(String(50))
-    phone = Column(String(50))
-    email = Column(String(255))
-    education_level = Column(String(100))
-    institution = Column(Text)
-    specialty = Column(Text)
-    group_name = Column(String(100))  # group - зарезервированное слово в SQL
-    course_type = Column(String(100))
-    employment_status = Column(String(100))
-    work_experience = Column(String(100))
-    post_graduation_plans = Column(String(255))
-    help_from_work_russia = Column(String(100))
-    special_status = Column(String(255))
-    career_plans = Column(String(100))
-    created_at = Column(DateTime, default=datetime.utcnow)
+def get_progress(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return (row[0], row[1], row[2]) if row else (0, 0, 0)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine)
+def set_progress(user_id, step_index, uni_page=0, started=1):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO progress VALUES (?,?,?,?)",
+              (user_id, step_index, uni_page, started))
+    conn.commit()
+    conn.close()
 
-# Создаем таблицы при старте (для Railway это безопасно: если таблицы есть, ничего не произойдет)
-Base.metadata.create_all(bind=engine)
+def save_answer(user_id, field, value):
+    cols = ["fio","institution","specialty","study_group","course","form_of_study",
+            "contacts","employment_status","target_contract","experience",
+            "practice_eval","events","resume_status","interview_training",
+            "special_status","military","maternity","graduate","post_plans","help_needed"]
+    if field not in cols:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO answers (user_id) VALUES (?)", (user_id,))
+    c.execute(f"UPDATE answers SET {field}=? WHERE user_id=?", (value, user_id))
+    conn.commit()
+    conn.close()
 
 # ----------------- ДАННЫЕ И КОНФИГУРАЦИЯ -----------------
 UNIVERSITIES = [
@@ -80,287 +105,441 @@ UNIVERSITIES = [
 ITEMS_PER_PAGE = 10
 
 STEPS = [
-    "fio", "birth_date", "phone", "email", "education_level", "institution", "specialty", "group_name",
-    "course_type", "employment_status", "work_experience", "post_graduation_plans", 
-    "help_from_work_russia", "special_status", "career_plans"
+    "fio", "institution", "specialty", "study_group",
+    "course", "form_of_study", "contacts",
+    "employment_status", "target_contract", "experience",
+    "practice_eval", "events", "resume_status",
+    "interview_training", "special_status", "military",
+    "maternity", "graduate", "post_plans", "help_needed"
 ]
 
-QUESTIONS = {
-    "fio": "Пожалуйста, укажите ваши ФИО полностью:",
-    "birth_date": "Укажите дату рождения (ДД.ММ.ГГГГ):",
-    "phone": "Введите номер телефона (например, +79991234567):",
-    "email": "Введите адрес электронной почты:",
-    "education_level": "Выберите уровень образования:",
-    "institution": "Выберите учебное заведение из списка:",
-    "specialty": "Укажите вашу специальность/направление подготовки:",
-    "group_name": "Укажите номер вашей учебной группы:",
-    "course_type": "Форма обучения:",
-    "employment_status": "Ваш текущий статус занятости:",
-    "work_experience": "Есть ли у вас опыт работы по специальности или смежной с ней?",
-    "post_graduation_plans": "Какие планы после окончания обучения?",
-    "help_from_work_russia": "Как вы в целом оцениваете результаты своих профориентационных практик/работы с работодателями по специальности обучения?",
-    "special_status": "Есть ли у вас особый статус или жизненные обстоятельства?",
-    "career_plans": "Планируете ли вы оставаться в регионе после окончания учебы?"
+# Сопоставление шагов и колонок в БД
+STEP_TO_DB = {
+    "fio": "fio", "institution": "institution", "specialty": "specialty",
+    "study_group": "study_group", "course": "course", "form_of_study": "form_of_study",
+    "contacts": "contacts", "employment_status": "employment_status",
+    "target_contract": "target_contract", "experience": "experience",
+    "practice_eval": "practice_eval", "events": "events",
+    "resume_status": "resume_status", "interview_training": "interview_training",
+    "special_status": "special_status", "military": "military",
+    "maternity": "maternity", "graduate": "graduate",
+    "post_plans": "post_plans", "help_needed": "help_needed"
 }
 
-OPTIONS = {
-    "education_level": ["СПО (Среднее профессиональное)", "ВО (Высшее образование)", "Другое"],
-    "course_type": ["Очная", "Очно-заочная", "Заочная", "Дистанционная"],
-    "employment_status": ["Работаю по специальности", "Работаю не по специальности", "Не работаю", "Нахожусь в декрете", "Другое"],
-    "work_experience": ["Да, есть опыт", "Нет, опыта нет", "Есть стажировки"],
-    "post_graduation_plans": ["Планирую работать по специальности", "Планирую продолжить обучение", "Планирую открыть свое дело", "Другое"],
-    "help_from_work_russia": ["Отлично", "Хорошо", "Удовлетворительно", "Плохо", "Не участвовал"],
-    "special_status": ["Инвалидность", "Сирота", "Многодетная семья", "Нет особых статусов"],
-    "career_plans": ["Да, планирую остаться", "Нет, планирую уехать", "Пока не решил(а)"]
+QUESTIONS = {
+    "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
+    "institution": "Выберите ваше учебное заведение из списка (используйте «Далее →» для пролистывания):",
+    "specialty": "Укажите вашу специальность обучения:",
+    "study_group": "Укажите номер вашей учебной группы:",
+    "course": "Выберите ваш курс обучения:",
+    "form_of_study": "Выберите форму обучения:",
+    "contacts": "Укажите контактные данные — телефон или e-mail (например: +79991234567 или student@mail.ru):",
+    "employment_status": (
+        "Ваш статус занятости прямо сейчас.\n"
+        "Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):\n\n"
+        "1 — Работаю по трудовому договору (в том числе по совместительству)\n"
+        "2 — Работаю по гражданско-правовому договору (договор подряда, услуг и т.п.)\n"
+        "3 — Являюсь самозанятым / ИП / учредителем юрлица\n"
+        "4 — Прохожу оплачиваемую стажировку / практику у работодателя\n"
+        "5 — Работаю временно (разовые подработки), не по специальности обучения\n"
+        "6 — Ничего из вышеперечисленного"
+    ),
+    "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
+    "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
+    "practice_eval": "Как вы в целом оцениваете результаты своих производственных практик у работодателей по специальности обучения?",
+    "events": (
+        "Участвовали ли вы в течение обучения в мероприятиях, которые помогают познакомиться с работодателями "
+        "(ярмарки вакансий, дни карьеры, профтуры на предприятия, встречи с работодателями и т.д.)?"
+    ),
+    "resume_status": "Наличие резюме для поиска работы:",
+    "interview_training": "Проходили ли вы занятия или тренинги по навыкам прохождения собеседования?",
+    "special_status": "Есть ли у вас особый статус или жизненные обстоятельства?",
+    "military": (
+        "Планируется ли в отношении вас призыв на военную службу в ближайшее время "
+        "(после окончания текущего года обучения)?"
+    ),
+    "maternity": (
+        "Планируете ли вы уходить в отпуск по уходу за ребёнком "
+        "в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?"
+    ),
+    "graduate": "Являетесь ли вы студентом выпускного курса (оканчиваете программу в текущем учебном году)?",
+    "post_plans": (
+        "Ваши планы после выпуска.\n"
+        "Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):\n\n"
+        "1 — У меня есть подписанный трудовой договор (или договор на целевое обучение)\n"
+        "2 — Есть устная договорённость с работодателем, но без подписанных документов\n"
+        "3 — Прохожу стажировку\n"
+        "4 — Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)\n"
+        "5 — Планирую продолжить обучение (магистратура / аспирантура и пр.)\n"
+        "6 — Сейчас ищу работу\n"
+        "7 — Пока нет планов"
+    ),
+    "help_needed": (
+        "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной?\n"
+        "Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):\n\n"
+        "1 — Подбор актуальных вакансий с учётом специальности\n"
+        "2 — Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем\n"
+        "3 — Профтур-экскурсии на предприятия\n"
+        "4 — Подбор оплачиваемой стажировки\n"
+        "5 — Подбор работодателя для практики\n"
+        "6 — Заключение договора с работодателем на целевое обучение\n"
+        "7 — Помощь с ЕЦП «Работа России»\n"
+        "8 — Другое (укажите)"
+    )
 }
+
+
+# Одиночный выбор (кнопки)
+OPTIONS = {
+    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
+    "form_of_study": ["очная", "очно-заочная", "заочная"],
+    "target_contract": [
+        "да, договор о целевом обучении заключён",
+        "нет, договора о целевом обучении нет"
+    ],
+    "experience": [
+        "да, есть опыт работы / оплачиваемой стажировки по основной или близкой специальности",
+        "есть опыт работы только вне специальности обучения",
+        "нет, опыта работы и оплачиваемых стажировок пока не было"
+    ],
+    "practice_eval": [
+        "скорее доволен(льна) или полностью доволен(льна)",
+        "скорее не доволен(льна) / совсем не доволен(льна) результатами практик"
+    ],
+    "events": [
+        "да, за последний год участвовал(а) хотя бы в одном таком мероприятии",
+        "участвовал(а), но более года назад",
+        "нет, ещё ни разу не участвовал(а)"
+    ],
+    "resume_status": [
+        "есть актуальное резюме, которым я пользуюсь или готов(а) пользоваться",
+        "резюме есть, но оно устарело / резюме нет, я его не составлял(а)"
+    ],
+    "interview_training": [
+        "да, проходил(а) одно или несколько таких мероприятий",
+        "пока не проходил(а)"
+    ],
+    "special_status": [
+        "да, имею группу инвалидности",
+        "отношусь к категории детей-сирот и детей, оставшихся без попечения родителей",
+        "планирую переезд в другой регион / страну после окончания обучения",
+        "ничего из вышеперечисленного"
+    ],
+    "military": [
+        "да, планируется призыв",
+        "нет / не подлежу призыву / вопрос уже решён (служба пройдена и др.)"
+    ],
+    "maternity": ["да, планирую", "пока не планирую"],
+    "graduate": [
+        "да, я учусь на выпускном курсе",
+        "нет, я не на выпускном курсе"
+    ]
+}
+
+# Множественный выбор (номера через запятую)
+MULTI_STEPS = ["employment_status", "post_plans", "help_needed"]
 
 MESSAGES = {
-    "invalid_contact": "Не удалось распознать контакт. Пожалуйста, введите:\n"
-                        "• Номер телефона в формате +79991234567 или 89991234567\n"
-                        "или\n"
-                        "• Адрес электронной почты в формате example@mail.ru",
-    "invalid_choice": "Пожалуйста, выберите вариант из кнопок ниже, чтобы избежать ошибок.",
+    "welcome": (
+        "👋 Здравствуйте! Я бот для оценки рисков нетрудоустройства студентов.\n\n"
+        "Я задам несколько коротких вопросов о вашем обучении и занятости. "
+        "Это займёт примерно 5–7 минут. Ответы помогут подобрать для вас "
+        "подходящие вакансии, стажировки и поддержку от центра занятости.\n\n"
+        "Нажмите кнопку «Начать анкету», чтобы приступить."
+    ),
+    "invalid_contact": (
+        "Не удалось распознать контакт. Пожалуйста, введите:\n\n"
+        "• Номер телефона в формате +79991234567 или 89991234567\n"
+        "или\n"
+        "• Адрес электронной почты в формате example@mail.ru"
+    ),
+    "invalid_choice": "Пожалуйста, выберите один из вариантов, нажав на кнопку ниже.",
+    "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
-    "admin_only": "Эта команда доступна только администраторам."
+    "admin_only": "Эта команда доступна только администраторам.",
+    "finished": (
+        "✅ Спасибо! Анкета заполнена.\n\n"
+        "Если у вас возникнут вопросы, вы всегда можете написать сюда ещё раз."
+    )
 }
-
 # ----------------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ -----------------
 
-def get_db():
-    db = SessionLocal()
+def send_message(user_id, message, keyboard=None, attachment=None):
     try:
-        yield db
-    finally:
-        db.close()
-
-def init_user_state(user_id, db):
-    # В памяти храним только текущее состояние шага и страницу ВУЗа
-    # Данные анкеты сохраняются в БД только по завершении
-    if user_id not in user_states:
-        user_states[user_id] = {"step_index": 0, "university_page": 0}
-
-def send_message(user_id, message, keyboard=None):
-    try:
-        vk.messages.send(
-            user_id=user_id,
-            message=message,
-            random_id=get_random_id(),
-            keyboard=keyboard
-        )
+        params = {
+            "user_id": user_id,
+            "message": message,
+            "random_id": get_random_id()
+        }
+        if keyboard:
+            params["keyboard"] = keyboard
+        if attachment:
+            params["attachment"] = attachment
+        vk.messages.send(**params)
     except Exception as e:
-        print(f"Ошибка отправки сообщения: {e}")
+        print(f"Ошибка отправки: {e}")
 
-def get_keyboard(step_key, page=0):
-    if step_key == "institution":
-        start = page * ITEMS_PER_PAGE
-        end = start + ITEMS_PER_PAGE
-        items = UNIVERSITIES[start:end]
-        
-        keyboard = {"one_time": False, "buttons": []}
-        for i in range(0, len(items), 2):
-            row = []
-            row.append({"action": {"type": "text", "label": items[i]}, "color": "primary"})
-            if i + 1 < len(items):
-                row.append({"action": {"type": "text", "label": items[i+1]}, "color": "primary"})
-            keyboard["buttons"].append(row)
-        
-        nav_row = []
-        if page > 0:
-            nav_row.append({"action": {"type": "text", "label": "← Назад"}, "color": "secondary"})
-        if end < len(UNIVERSITIES):
-            nav_row.append({"action": {"type": "text", "label": "Далее →"}, "color": "secondary"})
-        
-        if nav_row:
-            keyboard["buttons"].append(nav_row)
-        return keyboard
+def kb_start():
+    return '{"one_time":false,"buttons":[[{"action":{"type":"text","label":"Начать анкету"},"color":"positive"}]]}'
 
-    if step_key in OPTIONS:
-        keyboard = {"one_time": False, "buttons": []}
-        options = OPTIONS[step_key]
-        for i in range(0, len(options), 2):
-            row = []
-            row.append({"action": {"type": "text", "label": options[i]}, "color": "primary"})
-            if i + 1 < len(options):
-                row.append({"action": {"type": "text", "label": options[i+1]}, "color": "primary"})
-            keyboard["buttons"].append(row)
-        return keyboard
-    
-    return None
+def kb_options(step_key):
+    opts = OPTIONS[step_key]
+    rows = []
+    for i in range(0, len(opts), 2):
+        row = []
+        row.append({"action": {"type": "text", "label": opts[i]}, "color": "primary"})
+        if i + 1 < len(opts):
+            row.append({"action": {"type": "text", "label": opts[i+1]}, "color": "primary"})
+        rows.append(row)
+    import json
+    return json.dumps({"one_time": False, "buttons": rows})
 
-def validate_contact(text, field_type):
+def kb_university(page):
+    start = page * ITEMS_PER_PAGE
+    end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
+    items = UNIVERSITIES[start:end]
+    rows = []
+    for i in range(0, len(items), 2):
+        row = []
+        row.append({"action": {"type": "text", "label": items[i]}, "color": "primary"})
+        if i + 1 < len(items):
+            row.append({"action": {"type": "text", "label": items[i+1]}, "color": "primary"})
+        rows.append(row)
+    nav = []
+    if page > 0:
+        nav.append({"action": {"type": "text", "label": "← Назад"}, "color": "secondary"})
+    if end < len(UNIVERSITIES):
+        nav.append({"action": {"type": "text", "label": "Далее →"}, "color": "secondary"})
+    if nav:
+        rows.append(nav)
+    import json
+    return json.dumps({"one_time": False, "buttons": rows})
+
+def validate_contact(text):
     text = text.strip()
-    if field_type == 'phone':
-        pattern = r'^\+??[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\$'
-        if re.match(pattern, text):
-            digits = re.sub(r'\D', '', text)
-            if len(digits) == 11 and digits.startswith('8'):
-                digits = '7' + digits[1:]
-            elif len(digits) == 10:
-                digits = '7' + digits
-            return True, '+7' + digits[-10:]
-        return False, None
-    elif field_type == 'email':
-        pattern = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+\$'
-        if re.match(pattern, text):
-            return True, text.lower()
+    phone_re = r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$'
+    email_re = r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    if re.match(phone_re, text):
+        digits = re.sub(r'\D', '', text)
+        if len(digits) == 11 and digits.startswith('8'):
+            digits = '7' + digits[1:]
+        elif len(digits) == 10:
+            digits = '7' + digits
+        return True, '+7' + digits[-10:]
+    if re.match(email_re, text):
+        return True, text.lower()
     return False, None
 
-def save_response_to_db(user_id, answers):
-    db = SessionLocal()
+def parse_multi_choice(text, max_opt):
     try:
-        # Проверяем, нет ли уже ответа от этого пользователя (опционально)
-        existing = db.query(SurveyResponse).filter_by(user_id=user_id).first()
-        if existing:
-            # Обновляем поля
-            for key, value in answers.items():
-                setattr(existing, key, value)
-            existing.created_at = datetime.utcnow()
-        else:
-            # Создаем новую запись
-            new_entry = SurveyResponse(user_id=user_id, **answers)
-            db.add(new_entry)
-        db.commit()
-        return True
-    except Exception as e:
-        print(f"Ошибка сохранения в БД: {e}")
-        db.rollback()
-        return False
-    finally:
-        db.close()
-
-def export_to_csv():
-    db = SessionLocal()
-    try:
-        rows = db.query(SurveyResponse).all()
-        if not rows:
+        parts = [p.strip() for p in text.split(',') if p.strip()]
+        nums = [int(p) for p in parts]
+        if any(n < 1 or n > max_opt for n in nums):
             return None
-        
-        output = io.StringIO()
-        fieldnames = [c.name for c in SurveyResponse.__table__.columns]
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        
-        for row in rows:
-            writer.writerow({c.name: getattr(row, c.name) for c in SurveyResponse.__table__.columns})
-        
-        return output.getvalue()
-    except Exception as e:
-        print(f"Ошибка экспорта: {e}")
+        return nums
+    except ValueError:
         return None
+
+def multi_to_text(step_key, nums):
+    labels = {
+        "employment_status": [
+            "работаю по трудовому договору (в т.ч. по совместительству)",
+            "работаю по гражданско-правовому договору",
+            "самозанятый / ИП / учредитель юрлица",
+            "прохожу оплачиваемую стажировку / практику",
+            "работаю временно, не по специальности",
+            "ничего из вышеперечисленного"
+        ],
+        "post_plans": [
+            "есть подписанный трудовой договор / целевое обучение",
+            "есть устная договорённость с работодателем",
+            "прохожу стажировку",
+            "планирую организовать своё дело",
+            "планирую продолжить обучение",
+            "сейчас ищу работу",
+            "пока нет планов"
+        ],
+        "help_needed": [
+            "подбор актуальных вакансий",
+            "тренинги по резюме и собеседованиям",
+            "профтур-экскурсии на предприятия",
+            "подбор оплачиваемой стажировки",
+            "подбор работодателя для практики",
+            "заключение договора на целевое обучение",
+            "помощь с ЕЦП «Работа России»",
+            "другое"
+        ]
+    }
+    return "; ".join(labels[step_key][n-1] for n in nums)
+
+def export_to_table(admin_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM answers")
+    rows = c.fetchall()
+    cols = [d[0] for d in c.description]
+    conn.close()
+    if not rows:
+        send_message(admin_id, MESSAGES["no_data"])
+        return
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=cols)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow(dict(zip(cols, r)))
+    fname = "survey_export.csv"
+    with open(fname, "w", encoding="utf-8-sig") as f:
+        f.write(out.getvalue())
+    out.close()
+    try:
+        upload = vk_api.VkUpload(vk_session)
+        doc = upload.document_message(fname, title="Выгрузка анкет")
+        att = f"doc{doc['owner_id']}_{doc['id']}"
+        send_message(admin_id, "Вот выгрузка собранных анкет:", attachment=att)
+    except Exception as e:
+        send_message(admin_id, f"Ошибка при загрузке файла: {e}")
     finally:
-        db.close()
+        if os.path.exists(fname):
+            os.remove(fname)
 
-# Глобальное состояние в памяти (сбрасывается при рестарте, но данные в БД остаются)
-user_states = {}
+# ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
-# ----------------- ИНИЦИАЛИЗАЦИЯ VK API -----------------
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+def ask_step(user_id, step_key, uni_page=0):
+    if step_key == "institution":
+        send_message(user_id, QUESTIONS[step_key], kb_university(uni_page))
+    elif step_key in OPTIONS:
+        send_message(user_id, QUESTIONS[step_key], kb_options(step_key))
+    else:
+        send_message(user_id, QUESTIONS[step_key])
 
-# ----------------- ОСНОВНОЙ ЦИКЛ -----------------
-print("Бот запущен и ожидает сообщения...")
+def handle_message(event):
+    user_id = event.user_id
+    text = event.text.strip()
 
-for event in longpoll.listen():
-    if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-        user_id = event.user_id
-        text = event.text.strip()
-        
-        # Инициализация состояния пользователя
-        init_user_state(user_id, None)
-        state = user_states[user_id]
-        
-        # Обработка команды админа
-        if text == "/export":
-            if user_id not in ADMIN_IDS:
-                send_message(user_id, MESSAGES["admin_only"])
-                continue
-            
-            csv_data = export_to_csv()
-            if not csv_data:
-                send_message(user_id, MESSAGES["no_data"])
-                continue
-            
-            filename = "survey_export.csv"
-            with open(filename, "w", encoding="utf-8-sig") as f:
-                f.write(csv_data)
-            
-            upload = vk_api.VkUpload(vk_session)
-            doc = upload.document_message(file_path=filename, title="Выгрузка анкет", tags=[])
-            
-            owner_id = doc["owner_id"]
-            media_id = doc["id"]
-            
-            vk.messages.send(
-                user_id=user_id,
-                message="Вот выгрузка собранных анкет:",
-                random_id=get_random_id(),
-                attachment=f"doc{owner_id}_{media_id}"
-            )
-            os.remove(filename)
-            continue
-        
-        # Логика анкеты
-        current_step_key = STEPS[state["step_index"]]
-        
-        # Обработка навигации по ВУЗам
-        if current_step_key == "institution":
-            if text == "← Назад":
-                if state["university_page"] > 0:
-                    state["university_page"] -= 1
-                send_message(user_id, QUESTIONS["institution"], get_keyboard("institution", state["university_page"]))
-                continue
-            elif text == "Далее →":
-                if state["university_page"] * ITEMS_PER_PAGE < len(UNIVERSITIES):
-                    state["university_page"] += 1
-                send_message(user_id, QUESTIONS["institution"], get_keyboard("institution", state["university_page"]))
-                continue
-        
-        # Валидация и сохранение ответа
-        answer_value = None
-        
-        if current_step_key in ["phone", "email"]:
-            is_valid, normalized = validate_contact(text, current_step_key)
-            if not is_valid:
-                send_message(user_id, MESSAGES["invalid_contact"], get_keyboard(current_step_key))
-                continue
-            answer_value = normalized
-        elif current_step_key == "institution":
-            if text not in UNIVERSITIES:
-                send_message(user_id, MESSAGES["invalid_choice"], get_keyboard("institution", state["university_page"]))
-                continue
-            answer_value = text
-        elif current_step_key in OPTIONS:
-            if text not in OPTIONS[current_step_key]:
-                send_message(user_id, MESSAGES["invalid_choice"], get_keyboard(current_step_key))
-                continue
-            answer_value = text
+    # --- Команды админа ---
+    if text.lower() in ["/export", "/выгрузить"]:
+        if user_id in ADMIN_IDS:
+            export_to_table(user_id)
         else:
-            # Текстовые поля (ФИО, специальность и т.д.)
-            if not text:
-                send_message(user_id, "Пожалуйста, введите значение.")
-                continue
-            answer_value = text
-        
-        # Сохраняем ответ во временное состояние
-        if "temp_answers" not in state:
-            state["temp_answers"] = {}
-        state["temp_answers"][current_step_key] = answer_value
-        
-        # Переход к следующему шагу
-        next_index = state["step_index"] + 1
-        if next_index >= len(STEPS):
-            # Анкета завершена
-            success = save_response_to_db(user_id, state["temp_answers"])
-            if success:
-                send_message(user_id, "Спасибо! Ваша анкета успешно сохранена в базе данных.")
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    # --- Получаем прогресс ---
+    step_index, uni_page, started = get_progress(user_id)
+
+    # --- Если анкета ещё не начата — показываем приветствие ---
+    if started == 0:
+        if text == "Начать анкету":
+            set_progress(user_id, 0, 0, 1)
+            ask_step(user_id, STEPS[0])
+        else:
+            send_message(user_id, MESSAGES["welcome"], kb_start())
+        return
+
+    # --- Анкета уже начата ---
+    step_key = STEPS[step_index]
+
+    # 1. Выбор ВУЗа (с навигацией)
+    if step_key == "institution":
+        if text == "← Назад":
+            if uni_page > 0:
+                set_progress(user_id, step_index, uni_page - 1, 1)
+                ask_step(user_id, step_key, uni_page - 1)
             else:
-                send_message(user_id, "Произошла ошибка при сохранении. Попробуйте позже.")
-            
-            # Сброс состояния
-            del user_states[user_id]
+                send_message(user_id, "Это первая страница. Выберите учебное заведение.")
+            return
+        elif text == "Далее →":
+            max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
+            if uni_page < max_page:
+                set_progress(user_id, step_index, uni_page + 1, 1)
+                ask_step(user_id, step_key, uni_page + 1)
+            else:
+                send_message(user_id, "Это последняя страница. Выберите учебное заведение.")
+            return
+        elif text in UNIVERSITIES:
+            save_answer(user_id, "institution", text)
+            next_idx = step_index + 1
+            set_progress(user_id, next_idx, 0, 1)
+            ask_step(user_id, STEPS[next_idx])
+            return
         else:
-            state["step_index"] = next_index
-            next_step_key = STEPS[state["step_index"]]
-            keyboard = get_keyboard(next_step_key, state.get("university_page", 0))
-            send_message(user_id, QUESTIONS[next_step_key], keyboard)
+            send_message(user_id, "Пожалуйста, выберите учебное заведение из кнопок или используйте «← Назад» / «Далее →».")
+            return
+
+    # 2. Валидация контактов
+    if step_key == "contacts":
+        ok, value = validate_contact(text)
+        if ok:
+            save_answer(user_id, "contacts", value)
+            next_idx = step_index + 1
+            set_progress(user_id, next_idx, 0, 1)
+            ask_step(user_id, STEPS[next_idx])
+            return
+        else:
+            send_message(user_id, MESSAGES["invalid_contact"])
+            return
+
+    # 3. Множественный выбор (номера через запятую)
+    if step_key in MULTI_STEPS:
+        max_opt = {"employment_status": 6, "post_plans": 7, "help_needed": 8}[step_key]
+        nums = parse_multi_choice(text, max_opt)
+        if nums is None:
+            send_message(user_id, MESSAGES["invalid_multi"].format(max_opt))
+            return
+        label = multi_to_text(step_key, nums)
+        save_answer(user_id, STEP_TO_DB[step_key], label)
+        next_idx = step_index + 1
+        set_progress(user_id, next_idx, 0, 1)
+        if next_idx >= len(STEPS):
+            send_message(user_id, MESSAGES["finished"])
+        else:
+            ask_step(user_id, STEPS[next_idx])
+        return
+
+    # 4. Одиночный выбор (кнопки)
+    if step_key in OPTIONS:
+        opts_lower = [o.lower() for o in OPTIONS[step_key]]
+        if text.lower() not in opts_lower:
+            send_message(user_id, MESSAGES["invalid_choice"])
+            return
+        for o in OPTIONS[step_key]:
+            if o.lower() == text.lower():
+                save_answer(user_id, STEP_TO_DB[step_key], o)
+                break
+        next_idx = step_index + 1
+        set_progress(user_id, next_idx, 0, 1)
+        if next_idx >= len(STEPS):
+            send_message(user_id, MESSAGES["finished"])
+        else:
+            ask_step(user_id, STEPS[next_idx])
+        return
+
+    # 5. Свободный ввод
+    if len(text) < 2:
+        send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
+        return
+    save_answer(user_id, STEP_TO_DB[step_key], text)
+    next_idx = step_index + 1
+    set_progress(user_id, next_idx, 0, 1)
+    if next_idx >= len(STEPS):
+        send_message(user_id, MESSAGES["finished"])
+    else:
+        ask_step(user_id, STEPS[next_idx])
+
+# ----------------- ЗАПУСК -----------------
+
+def main():
+    init_db()
+    print("Бот запущен...")
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type == VkEventType.MESSAGE_NEW and event.to_me:
+                    handle_message(event)
+        except Exception as e:
+            print(f"Ошибка в цикле: {e}")
+            import time
+            time.sleep(3)
+
+if __name__ == "__main__":
+    main()

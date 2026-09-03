@@ -757,25 +757,89 @@ async def main():
     log.info("Токен: %s...%s", MAX_TOKEN[:8], MAX_TOKEN[-4:])
     log.info("Base URL: %s", BASE_URL)
 
-    # <-- ГЛАВНОЕ ИСПРАВЛЕНИЕ: SSL-контекст с сертификатами -->
-    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    # <-- СКАЧИВАЕМ СЕРТИФИКАТЫ МИНЦИФРЫ И ОБЪЕДИНЯЕМ С CERTIFI -->
+    import urllib.request
+
+    RU_ROOT_CA = "https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt"
+    RU_SUB_CA = "https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt"
+
+    combined_certs = certifi.where()  # путь к стандартному cacert.pem
+
+    try:
+        log.info("Скачиваю сертификаты Минцифры...")
+        root_ca_path = "/tmp/russian_trusted_root_ca.pem"
+        sub_ca_path = "/tmp/russian_trusted_sub_ca.pem"
+
+        urllib.request.urlretrieve(RU_ROOT_CA, root_ca_path)
+        urllib.request.urlretrieve(RU_SUB_CA, sub_ca_path)
+
+        # Объединяем certifi + Минцифры в один файл
+        combined_path = "/tmp/combined_cacert.pem"
+        with open(combined_path, "wb") as out:
+            with open(certifi.where(), "rb") as f:
+                out.write(f.read())
+            with open(root_ca_path, "rb") as f:
+                out.write(f.read())
+            with open(sub_ca_path, "rb") as f:
+                out.write(f.read())
+
+        ssl_context = ssl.create_default_context(cafile=combined_path)
+        log.info("Сертификаты Минцифры загружены и объединены с certifi")
+    except Exception as e:
+        log.warning("Не удалось скачать сертификаты Минцифры: %s. Использую только certifi.", e)
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+
     connector = aiohttp.TCPConnector(ssl=ssl_context)
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        await api_delete_webhook(session)
+        # Удаляем webhook с подробным логированием
+        log.info("Удаляю webhook (DELETE /subscriptions)...")
+        try:
+            async with session.delete(
+                f"{BASE_URL}/subscriptions",
+                headers={"Authorization": MAX_TOKEN}
+            ) as resp:
+                log.info("DELETE /subscriptions -> статус %s", resp.status)
+                resp_text = await resp.text()
+                log.info("Ответ: %s", resp_text)
+        except Exception as e:
+            log.error("Ошибка при удалении webhook: %s", e)
+
         await asyncio.sleep(1)
+
+        # Проверяем соединение запросом /me
+        log.info("Проверяю соединение (GET /me)...")
+        try:
+            async with session.get(
+                f"{BASE_URL}/me",
+                headers={"Authorization": MAX_TOKEN}
+            ) as resp:
+                log.info("GET /me -> статус %s", resp.status)
+                resp_text = await resp.text()
+                log.info("Ответ /me: %s", resp_text[:500])
+        except Exception as e:
+            log.error("Ошибка GET /me: %s", e)
 
         log.info("=== Polling запущен. Ожидание сообщений... ===")
 
         marker = None
+        poll_count = 0
         while True:
             try:
+                poll_count += 1
                 data = await api_get_updates(session, marker)
+
                 new_marker = data.get("marker")
                 if new_marker is not None:
                     marker = new_marker
 
                 updates = data.get("updates", [])
+
+                # Логируем каждый 10-й poll, даже если пусто
+                if poll_count % 10 == 0:
+                    log.info("Poll #%d: получено %d обновлений, marker=%s",
+                             poll_count, len(updates), marker)
+
                 if updates:
                     log.info("Получено %d обновлений", len(updates))
 

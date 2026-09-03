@@ -637,18 +637,18 @@ def handle_message(event):
 
         # ОБЫЧНАЯ ЛОГИКА (для остальных вопросов)
     if step_key in MULTI_STEPS:
-            nums = parse_multi_numbers(text, len(opts))
-            if nums is None:
-                send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
-                return
-            label = "; ".join(opts[n - 1] for n in nums)
-            save_answer(user_id, STEP_TO_DB[step_key], label)
-        else:
-            n = parse_single_number(text, len(opts))
-            if n is None:
-                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
-                return
-            save_answer(user_id, STEP_TO_DB[step_key], opts[n - 1])
+        nums = parse_multi_numbers(text, len(opts))
+        if nums is None:
+            send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
+            return
+        label = "; ".join(opts[n - 1] for n in nums)
+        save_answer(user_id, STEP_TO_DB[step_key], label)
+    else:
+        n = parse_single_number(text, len(opts))
+        if n is None:
+            send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
+            return
+        save_answer(user_id, STEP_TO_DB[step_key], opts[n - 1])
 
         advance_step(user_id, step_index)
         return

@@ -604,55 +604,7 @@ def handle_message(event):
     user_id = event.user_id
     text = event.text.strip()
 
-    # Команды
-        # --- Вопросы с вариантами (все через нумерованный список) ---
-    if step_key in OPTIONS:
-        opts = OPTIONS[step_key]
-
-        # ОСОБАЯ ЛОГИКА ДЛЯ СОГЛАСИЯ
-        if step_key == "consent":
-            n = parse_single_number(text, len(opts))
-            if n is None:
-                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
-                return
-            
-            is_consent = (n == 1) # 1 - Да, 2 - Нет
-            
-            # Сохраняем в БД как булево значение
-            conn = get_db()
-            c = conn.cursor()
-            # Вставляем или обновляем запись
-            c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-            c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, user_id))
-            conn.commit()
-            conn.close()
-
-            if not is_consent:
-                # Если пользователь отказался, можно завершить анкету или продолжить. 
-                # Здесь мы просто переходим дальше, но в базе будет False.
-                advance_step(user_id, step_index)
-            else:
-                advance_step(user_id, step_index)
-            return
-
-        # ОБЫЧНАЯ ЛОГИКА (для остальных вопросов)
-    if step_key in MULTI_STEPS:
-        nums = parse_multi_numbers(text, len(opts))
-        if nums is None:
-            send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
-            return
-        label = "; ".join(opts[n - 1] for n in nums)
-        save_answer(user_id, STEP_TO_DB[step_key], label)
-    else:
-        n = parse_single_number(text, len(opts))
-        if n is None:
-            send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
-            return
-        save_answer(user_id, STEP_TO_DB[step_key], opts[n - 1])
-
-        advance_step(user_id, step_index)
-        return
-
+    # --- Команды ---
     if text.lower() in ["/export", "/выгрузить"]:
         if user_id in ADMIN_IDS:
             export_to_table(user_id)
@@ -671,6 +623,7 @@ def handle_message(event):
         send_message(user_id, MESSAGES["welcome"], kb_start())
         return
 
+    # --- Получаем прогресс ---
     step_index, uni_page, started = get_progress(user_id)
 
     # Анкета не начата
@@ -687,6 +640,7 @@ def handle_message(event):
         send_message(user_id, MESSAGES["already_finished"], kb_restart())
         return
 
+    # --- Определяем текущий шаг (теперь step_key гарантированно существует) ---
     step_key = STEPS[step_index]
 
     # --- Выбор вуза ---
@@ -730,12 +684,32 @@ def handle_message(event):
             send_message(user_id, MESSAGES["invalid_contact"])
         return
 
-    # --- Вопросы с вариантами (все через нумерованный список) ---
+    # --- Вопросы с вариантами (включая согласие) ---
     if step_key in OPTIONS:
         opts = OPTIONS[step_key]
 
+        # ОСОБАЯ ЛОГИКА ДЛЯ СОГЛАСИЯ
+        if step_key == "consent":
+            n = parse_single_number(text, len(opts))
+            if n is None:
+                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
+                return
+
+            is_consent = (n == 1)  # 1 — Да, 2 — Нет
+
+            # Сохраняем в БД как булево значение
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+            c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, user_id))
+            conn.commit()
+            conn.close()
+
+            advance_step(user_id, step_index)
+            return
+
+        # ОБЫЧНАЯ ЛОГИКА — множественный выбор
         if step_key in MULTI_STEPS:
-            # Множественный выбор — сохраняем ТЕКСТЫ вариантов
             nums = parse_multi_numbers(text, len(opts))
             if nums is None:
                 send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
@@ -743,7 +717,7 @@ def handle_message(event):
             label = "; ".join(opts[n - 1] for n in nums)
             save_answer(user_id, STEP_TO_DB[step_key], label)
         else:
-            # Одиночный выбор — сохраняем ТЕКСТ варианта
+            # Одиночный выбор
             n = parse_single_number(text, len(opts))
             if n is None:
                 send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
@@ -761,6 +735,7 @@ def handle_message(event):
 
     save_answer(user_id, STEP_TO_DB[step_key], text)
     advance_step(user_id, step_index)
+
 
 # ----------------- ЗАПУСК -----------------
 

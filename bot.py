@@ -19,10 +19,15 @@ except re.error as e:
     raise
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
-def format_numbered_list(items, start_from=1):
+def format_numbered_list(items, start_from=1, truncate=True):
+    """
+    items: список строк
+    start_from: с какого номера начинать нумерацию
+    truncate: если True — обрезает длинные строки (для вузов), если False — полный текст (для вариантов ответов)
+    """
     lines = []
     for i, item in enumerate(items, start=start_from):
-        if len(item) > 80:
+        if truncate and len(item) > 80:
             item = item[:77] + "…"
         lines.append(f"{i} — {item}")
     return "\n".join(lines)

@@ -47,6 +47,7 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
+    # Добавляем колонку consent_status (по умолчанию NULL или False)
     c.execute('''
         CREATE TABLE IF NOT EXISTS answers (
             user_id BIGINT PRIMARY KEY,
@@ -55,7 +56,8 @@ def init_db():
             employment_status TEXT, target_contract TEXT, experience TEXT,
             practice_eval TEXT, events TEXT, resume_status TEXT,
             interview_training TEXT, special_status TEXT, military TEXT,
-            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
+            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT,
+            consent_status BOOLEAN DEFAULT FALSE
         )
     ''')
     c.execute('''
@@ -157,7 +159,7 @@ ITEMS_PER_PAGE = 10
 
 # ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
-    "fio", "institution", "specialty", "study_group",
+    "fio", "consent", "institution", "specialty", "study_group",
     "course", "form_of_study", "contacts",
     "employment_status", "target_contract", "experience",
     "practice_eval", "events", "resume_status",
@@ -169,6 +171,17 @@ STEP_TO_DB = {s: s for s in STEPS}
 
 QUESTIONS = {
     "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
+    "consent": (
+        "Я, {fio}, на основании статей 9, 11 Федерального закона от 27 июля 2006 г. N 152-ФЗ "
+        "\"О персональных данных\" в целях моей профессиональной ориентации даю свое согласие "
+        "казенному учреждению Удмуртской Республики «Республиканский центр занятости населения» "
+        "на автоматизированную, а также без использования средств автоматизации обработку своих "
+        "персональных данных, включая сбор, систематизацию, накопление, хранение, уточнение "
+        "(обновление, изменение), использование, обезличивание, блокирование, уничтожение "
+        "персональных данных о моих фамилии, имени, отчестве, номере телефона, адресе электронной почты.\n\n"
+        "Настоящее согласие действует в течение 1 года с даты анкетирования.\n\n"
+        "Пожалуйста, подтвердите согласие, нажав кнопку ниже:"
+    ),
     "institution": "Выберите ваше учебное заведение из списка (используйте «далее» / «назад» для пролистывания):",
     "specialty": "Укажите вашу специальность обучения:",
     "study_group": "Укажите номер вашей учебной группы:",
@@ -200,6 +213,7 @@ QUESTIONS = {
 }
 
 OPTIONS = {
+    "consent": ["Да, я согласен(на)", "Нет, я не согласен(на)"],
     "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
     "form_of_study": ["очная", "очно-заочная", "заочная"],
     "employment_status": [
@@ -366,8 +380,29 @@ def ask_step(user_id, step_key, uni_page=0):
     if step_key == "institution":
         ask_university_page(user_id, uni_page)
     elif step_key in OPTIONS:
-        # Все варианты — нумерованным списком, без кнопок
         opts = OPTIONS[step_key]
+        
+        # Специальная обработка для шага согласия: подставляем ФИО
+        if step_key == "consent":
+            # Получаем сохраненное ФИО из БД
+            conn = get_db()
+            c = conn.cursor()
+            c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            fio_text = row[0] if row and row[0] else "[ФИО не указано]"
+            
+            # Формируем сообщение с подставленным ФИО
+            message_base = QUESTIONS["consent"]
+            message = message_base.format(fio=fio_text)
+            
+            list_text = format_numbered_list(opts)
+            hint = "Нажмите номер варианта (1 или 2)."
+            message += f"\n\n{list_text}\n\n{hint}"
+            send_message(user_id, message)
+            return
+
+        # Обычная логика для других списков
         list_text = format_numbered_list(opts)
         if step_key in MULTI_STEPS:
             hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."

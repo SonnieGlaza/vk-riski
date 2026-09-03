@@ -3,3 +3,5 @@ psycopg2-binary
 SQLAlchemy
 python-dotenv
 openpyxl
+maxapi 
+aiohttp

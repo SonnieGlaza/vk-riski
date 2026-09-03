@@ -1,17 +1,6 @@
-"""MAX Bot — анкета для опроса студентов.
-Использует ту же базу PostgreSQL, что и VK-бот.
-VK user_id > 0, MAX chat_id хранится как отрицательное число.
-
-УСТАНОВКА (важно — ставить из GitHub, а не из PyPI):
-    pip install git+https://github.com/max-messenger/max-botapi-python.git
-    pip install aiohttp psycopg2-binary openpyxl
-
-ЗАПУСК:
-    MAX_TOKEN=токен DATABASE_URL=url ADMIN_IDS=123,456 python max_bot.py
-"""
-
 import os
 import re
+import json
 import asyncio
 import logging
 import io
@@ -20,8 +9,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 import aiohttp
-from maxapi import Bot, Dispatcher, F
-from maxapi.types import MessageCreated, BotStarted, Command
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [MAX] %(levelname)s %(message)s")
 log = logging.getLogger("max_bot")
@@ -30,7 +17,7 @@ log = logging.getLogger("max_bot")
 MAX_TOKEN = os.getenv("MAX_TOKEN", "")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-MAX_API_BASE = "https://platform-api2.max.ru"
+BASE_URL = "https://platform-api2.max.ru"
 
 if not MAX_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы MAX_TOKEN или DATABASE_URL")
@@ -47,7 +34,6 @@ def format_numbered_list(items, start_from=1, truncate=True):
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
 
-# --- ИДЕНТИФИКАТОР В БД ---
 def to_db_id(chat_id):
     return -abs(int(chat_id))
 
@@ -162,7 +148,7 @@ UNIVERSITIES = [
     "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
     "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
     "БПОУ УР «Ижевский автотранспортный техникум»",
-    "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»",
+    "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Корененко»",
     "Сарапульский техникум машиностроения и информационных технологий"
 ]
 ITEMS_PER_PAGE = 10
@@ -306,7 +292,8 @@ MESSAGES = {
     "admin_only": "Эта команда доступна только администраторам.",
     "finished": (
         "✅ Спасибо! Анкета заполнена.\n\n"
-        "Предоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\n"
+        "Предоставленная вами информация позволит нам детально проанализировать ситуацию "
+        "и предложить оптимальное решение.\n\n"
         "Если хотите пройти анкету заново — нажмите кнопку ниже."
     ),
     "already_finished": (
@@ -328,65 +315,107 @@ EXPORT_HEADERS = {
 
 # ----------------- КЛАВИАТУРЫ -----------------
 def make_keyboard(kb_type):
-    """Возвращает список attachments для MAX Bot API или None"""
     if kb_type == "start":
         return [{"type": "inline_keyboard", "payload": {"buttons": [[{"type": "message", "text": "Начать анкету"}]]}}]
     if kb_type == "restart":
         return [{"type": "inline_keyboard", "payload": {"buttons": [[{"type": "message", "text": "🔄 Пройти заново"}]]}}]
     return None
 
-# ----------------- ОТПРАВКА ЧЕРЕЗ БИБЛИОТЕКУ -----------------
-async def send_message(target_id, message, keyboard_type=None, use_user_id=False):
-    """
-    Отправляет сообщение через bot.send_message() из библиотеки maxapi.
-    target_id: chat_id (для групп) или user_id (для личных диалогов)
-    use_user_id: если True — отправляет как user_id, иначе как chat_id
-    """
-    attachments = make_keyboard(keyboard_type)
+# ----------------- HTTP КЛИЕНТ MAX API -----------------
+async def api_send_message(session, chat_id, text, attachments=None, user_id=None):
+    """Отправка сообщения через POST /messages"""
+    url = f"{BASE_URL}/messages"
+    params = {}
+    if user_id:
+        params["user_id"] = user_id
+    else:
+        params["chat_id"] = chat_id
+    body = {"text": text}
+    if attachments:
+        body["attachments"] = attachments
+    headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
+
     MAX_TEXT = 4000
-
-    async def _send(text, atts=None):
-        kwargs = {"text": text}
-        if atts:
-            kwargs["attachments"] = atts
-        if use_user_id:
-            kwargs["user_id"] = int(target_id)
-        else:
-            kwargs["chat_id"] = int(target_id)
-        try:
-            await bot.send_message(**kwargs)
-        except Exception as e:
-            log.error("send_message ошибка: %s (target=%s, use_user_id=%s)", e, target_id, use_user_id)
-            # Если chat_id не сработал — пробуем user_id
-            if not use_user_id:
-                try:
-                    kwargs.pop("chat_id")
-                    kwargs["user_id"] = int(target_id)
-                    await bot.send_message(**kwargs)
-                    log.info("Отправлено через user_id вместо chat_id")
-                except Exception as e2:
-                    log.error("user_id тоже не сработал: %s", e2)
-
-    if len(message) > MAX_TEXT:
+    chunks = [text]
+    if len(text) > MAX_TEXT:
         chunks = []
-        while message:
-            if len(message) <= MAX_TEXT:
-                chunks.append(message)
+        remaining = text
+        while remaining:
+            if len(remaining) <= MAX_TEXT:
+                chunks.append(remaining)
                 break
-            split_pos = message.rfind("\n", 0, MAX_TEXT)
+            split_pos = remaining.rfind("\n", 0, MAX_TEXT)
             if split_pos == -1:
                 split_pos = MAX_TEXT
-            chunks.append(message[:split_pos])
-            message = message[split_pos:].lstrip("\n")
-        for i, chunk in enumerate(chunks):
-            atts = attachments if i == len(chunks) - 1 else None
-            await _send(chunk, atts)
-            await asyncio.sleep(0.6)
-    else:
-        await _send(message, attachments)
+            chunks.append(remaining[:split_pos])
+            remaining = remaining[split_pos:].lstrip("\n")
+
+    for i, chunk in enumerate(chunks):
+        body = {"text": chunk}
+        if attachments and i == len(chunks) - 1:
+            body["attachments"] = attachments
+        try:
+            async with session.post(url, params=params, headers=headers, json=body) as resp:
+                resp_text = await resp.text()
+                if resp.status != 200:
+                    log.error("POST /messages -> %s: %s", resp.status, resp_text)
+                    # Если chat_id не сработал, пробуем user_id
+                    if not user_id and "chat_id" in params:
+                        log.info("Пробую отправить через user_id=%s", chat_id)
+                        params2 = {"user_id": chat_id}
+                        async with session.post(url, params=params2, headers=headers, json=body) as resp2:
+                            resp2_text = await resp2.text()
+                            if resp2.status != 200:
+                                log.error("POST /messages (user_id) -> %s: %s", resp2.status, resp2_text)
+                            else:
+                                log.debug("Отправлено через user_id")
+                else:
+                    log.debug("Сообщение отправлено, status=%s", resp.status)
+        except Exception as e:
+            log.error("Ошибка отправки: %s", e)
+        if len(chunks) > 1:
+            await asyncio.sleep(0.5)
+
+async def api_get_updates(session, marker=None):
+    """Получение обновлений через GET /updates (long polling)"""
+    params = {"limit": 100, "timeout": 30}
+    if marker is not None:
+        params["marker"] = marker
+    headers = {"Authorization": MAX_TOKEN}
+    async with session.get(f"{BASE_URL}/updates", params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=95)) as resp:
+        resp_text = await resp.text()
+        if resp.status != 200:
+            log.error("GET /updates -> %s: %s", resp.status, resp_text)
+            return {"updates": [], "marker": marker}
+        return json.loads(resp_text)
+
+async def api_delete_webhook(session):
+    """Удаление webhook-подписки, чтобы работал long polling"""
+    headers = {"Authorization": MAX_TOKEN}
+    try:
+        async with session.delete(f"{BASE_URL}/subscriptions", headers=headers) as resp:
+            log.info("DELETE /subscriptions -> %s", resp.status)
+    except Exception as e:
+        log.warning("delete_webhook: %s", e)
+
+async def api_upload_file(session, file_path, filename):
+    """Загрузка файла через POST /uploads"""
+    headers = {"Authorization": MAX_TOKEN}
+    with open(file_path, "rb") as f:
+        data = aiohttp.FormData()
+        data.add_field("file", f, filename=filename)
+        async with session.post(f"{BASE_URL}/uploads?type=file", headers=headers, data=data) as resp:
+            result = await resp.json()
+            log.info("Upload result: %s", result)
+            return result
+
+# ----------------- ОТПРАВКА СООБЩЕНИЙ -----------------
+async def send_message(session, chat_id, message, keyboard_type=None, user_id=None):
+    attachments = make_keyboard(keyboard_type)
+    await api_send_message(session, chat_id, message, attachments, user_id)
 
 # ----------------- ВОПРОСЫ -----------------
-async def ask_university_page(target_id, db_id, page, use_user_id):
+async def ask_university_page(session, chat_id, db_id, page, user_id=None):
     start = page * ITEMS_PER_PAGE
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
     items = UNIVERSITIES[start:end]
@@ -401,11 +430,11 @@ async def ask_university_page(target_id, db_id, page, use_user_id):
     if nav_text:
         message += f"\n\n{nav_text}"
     message += "\n\nВведите номер вашего учебного заведения."
-    await send_message(target_id, message, use_user_id=use_user_id)
+    await send_message(session, chat_id, message, user_id=user_id)
 
-async def ask_step(target_id, db_id, step_key, uni_page=0, use_user_id=False):
+async def ask_step(session, chat_id, db_id, step_key, uni_page=0, user_id=None):
     if step_key == "institution":
-        await ask_university_page(target_id, db_id, uni_page, use_user_id)
+        await ask_university_page(session, chat_id, db_id, uni_page, user_id)
     elif step_key == "consent":
         conn = get_db()
         c = conn.cursor()
@@ -417,7 +446,7 @@ async def ask_step(target_id, db_id, step_key, uni_page=0, use_user_id=False):
         opts = OPTIONS["consent"]
         list_text = format_numbered_list(opts, truncate=False)
         hint = "Напишите номер выбранного варианта (1 или 2)."
-        await send_message(target_id, f"{message}\n\n{list_text}\n\n{hint}", use_user_id=use_user_id)
+        await send_message(session, chat_id, f"{message}\n\n{list_text}\n\n{hint}", user_id=user_id)
     elif step_key in OPTIONS:
         opts = OPTIONS[step_key]
         list_text = format_numbered_list(opts, truncate=False)
@@ -426,18 +455,18 @@ async def ask_step(target_id, db_id, step_key, uni_page=0, use_user_id=False):
         else:
             hint = "Напишите номер выбранного варианта (например: 1)."
         message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
-        await send_message(target_id, message, use_user_id=use_user_id)
+        await send_message(session, chat_id, message, user_id=user_id)
     else:
-        await send_message(target_id, QUESTIONS[step_key], use_user_id=use_user_id)
+        await send_message(session, chat_id, QUESTIONS[step_key], user_id=user_id)
 
-async def advance_step(target_id, db_id, step_index, use_user_id=False):
+async def advance_step(session, chat_id, db_id, step_index, user_id=None):
     next_idx = step_index + 1
     if next_idx >= len(STEPS):
         set_progress(db_id, next_idx, 0, 2)
-        await send_message(target_id, MESSAGES["finished"], keyboard_type="restart", use_user_id=use_user_id)
+        await send_message(session, chat_id, MESSAGES["finished"], keyboard_type="restart", user_id=user_id)
     else:
         set_progress(db_id, next_idx, 0, 1)
-        await ask_step(target_id, db_id, STEPS[next_idx], use_user_id=use_user_id)
+        await ask_step(session, chat_id, db_id, STEPS[next_idx], user_id=user_id)
 
 # ----------------- ПАРСИНГ -----------------
 def validate_contact(text):
@@ -506,41 +535,20 @@ def generate_xlsx():
     wb.save(fname)
     return fname, rows
 
-async def export_to_max(target_id, use_user_id=False):
+async def export_to_max(session, chat_id, user_id=None):
     fname, rows = generate_xlsx()
     if not rows:
-        await send_message(target_id, MESSAGES["no_data"], use_user_id=use_user_id)
+        await send_message(session, chat_id, MESSAGES["no_data"], user_id=user_id)
         return
     try:
-        headers = {"Authorization": MAX_TOKEN}
-        with open(fname, "rb") as f:
-            file_data = f.read()
-        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
-            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
-        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{MAX_API_BASE}/uploads?type=file",
-                headers={**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
-                data=body
-            ) as resp:
-                result = await resp.json()
-                log.info("Upload response: %s", result)
-                if "token" not in result:
-                    raise Exception(f"Нет token в ответе: {result}")
-            file_token = result["token"]
-            # Отправляем файл через библиотеку
-            await bot.send_message(
-                **({"user_id": int(target_id)} if use_user_id else {"chat_id": int(target_id)}),
-                text="📊 Вот выгрузка анкет в Excel:",
-                attachments=[{"type": "file", "payload": {"token": file_token}}]
-            )
+        result = await api_upload_file(session, fname, "survey_export.xlsx")
+        if "token" not in result:
+            raise Exception(f"Нет token в ответе: {result}")
+        file_token = result["token"]
+        attachments = [{"type": "file", "payload": {"token": file_token}}]
+        await api_send_message(session, chat_id, "📊 Вот выгрузка анкет в Excel:", attachments, user_id)
     except Exception as e:
         log.error("Ошибка загрузки .xlsx: %s", e)
-        # Fallback — CSV текстом
         try:
             out = io.StringIO()
             writer = csv.DictWriter(out, fieldnames=list(rows[0].keys()))
@@ -563,34 +571,34 @@ async def export_to_max(target_id, use_user_id=False):
                     chunks.append(current)
                 for i, chunk in enumerate(chunks):
                     header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
-                    await send_message(target_id, header + chunk, use_user_id=use_user_id)
+                    await send_message(session, chat_id, header + chunk, user_id=user_id)
             else:
-                await send_message(target_id, "📊 Выгрузка анкет (CSV):\n\n" + csv_text, use_user_id=use_user_id)
+                await send_message(session, chat_id, "📊 Выгрузка анкет (CSV):\n\n" + csv_text, user_id=user_id)
         except Exception as e2:
-            await send_message(target_id, f"Не удалось выгрузить данные: {e2}", use_user_id=use_user_id)
+            await send_message(session, chat_id, f"Не удалось выгрузить данные: {e2}", user_id=user_id)
     finally:
         if os.path.exists(fname):
             os.remove(fname)
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
-async def handle_message(target_id, db_id, text, use_user_id=False):
-    log.info("handle_message: target=%s, db_id=%s, text=%r, use_user_id=%s", target_id, db_id, text[:50], use_user_id)
+async def handle_message(session, chat_id, db_id, text, user_id=None):
+    log.info("handle_message: chat_id=%s, db_id=%s, text=%r", chat_id, db_id, text[:50])
 
     if text.lower() in ["/export", "/выгрузить"]:
         if abs(db_id) in ADMIN_IDS:
-            await export_to_max(target_id, use_user_id)
+            await export_to_max(session, chat_id, user_id)
         else:
-            await send_message(target_id, MESSAGES["admin_only"], use_user_id=use_user_id)
+            await send_message(session, chat_id, MESSAGES["admin_only"], user_id=user_id)
         return
 
     if text.lower() == "/restart":
         set_progress(db_id, 0, 0, 0)
-        await send_message(target_id, "Анкета сброшена. Нажмите «Начать анкету».", keyboard_type="start", use_user_id=use_user_id)
+        await send_message(session, chat_id, "Анкета сброшена. Нажмите «Начать анкету».", keyboard_type="start", user_id=user_id)
         return
 
     if text == "🔄 Пройти заново":
         set_progress(db_id, 0, 0, 0)
-        await send_message(target_id, MESSAGES["welcome"], keyboard_type="start", use_user_id=use_user_id)
+        await send_message(session, chat_id, MESSAGES["welcome"], keyboard_type="start", user_id=user_id)
         return
 
     step_index, uni_page, started = get_progress(db_id)
@@ -598,13 +606,13 @@ async def handle_message(target_id, db_id, text, use_user_id=False):
     if started == 0:
         if text == "Начать анкету":
             set_progress(db_id, 0, 0, 1)
-            await ask_step(target_id, db_id, STEPS[0], use_user_id=use_user_id)
+            await ask_step(session, chat_id, db_id, STEPS[0], user_id=user_id)
         else:
-            await send_message(target_id, MESSAGES["welcome"], keyboard_type="start", use_user_id=use_user_id)
+            await send_message(session, chat_id, MESSAGES["welcome"], keyboard_type="start", user_id=user_id)
         return
 
     if started == 2 or step_index >= len(STEPS):
-        await send_message(target_id, MESSAGES["already_finished"], keyboard_type="restart", use_user_id=use_user_id)
+        await send_message(session, chat_id, MESSAGES["already_finished"], keyboard_type="restart", user_id=user_id)
         return
 
     step_key = STEPS[step_index]
@@ -614,36 +622,36 @@ async def handle_message(target_id, db_id, text, use_user_id=False):
             max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
             if uni_page < max_page:
                 set_progress(db_id, step_index, uni_page + 1, 1)
-                await ask_university_page(target_id, db_id, uni_page + 1, use_user_id)
+                await ask_university_page(session, chat_id, db_id, uni_page + 1, user_id)
             else:
-                await send_message(target_id, "Это последняя страница.", use_user_id=use_user_id)
-                await ask_university_page(target_id, db_id, uni_page, use_user_id)
+                await send_message(session, chat_id, "Это последняя страница.", user_id=user_id)
+                await ask_university_page(session, chat_id, db_id, uni_page, user_id)
             return
         elif text.lower() in ["назад", "<", "←"]:
             if uni_page > 0:
                 set_progress(db_id, step_index, uni_page - 1, 1)
-                await ask_university_page(target_id, db_id, uni_page - 1, use_user_id)
+                await ask_university_page(session, chat_id, db_id, uni_page - 1, user_id)
             else:
-                await send_message(target_id, "Это первая страница.", use_user_id=use_user_id)
-                await ask_university_page(target_id, db_id, uni_page, use_user_id)
+                await send_message(session, chat_id, "Это первая страница.", user_id=user_id)
+                await ask_university_page(session, chat_id, db_id, uni_page, user_id)
             return
         if text.isdigit():
             idx = int(text) - 1
             if 0 <= idx < len(UNIVERSITIES):
                 save_answer(db_id, "institution", UNIVERSITIES[idx])
-                await advance_step(target_id, db_id, step_index, use_user_id)
+                await advance_step(session, chat_id, db_id, step_index, user_id)
                 return
-        await send_message(target_id, "Пожалуйста, введите номер учебного заведения из списка или используйте «далее» / «назад».", use_user_id=use_user_id)
-        await ask_university_page(target_id, db_id, uni_page, use_user_id)
+        await send_message(session, chat_id, "Пожалуйста, введите номер учебного заведения из списка или используйте «далее» / «назад».", user_id=user_id)
+        await ask_university_page(session, chat_id, db_id, uni_page, user_id)
         return
 
     if step_key == "contacts":
         ok, value = validate_contact(text)
         if ok:
             save_answer(db_id, "contacts", value)
-            await advance_step(target_id, db_id, step_index, use_user_id)
+            await advance_step(session, chat_id, db_id, step_index, user_id)
         else:
-            await send_message(target_id, MESSAGES["invalid_contact"], use_user_id=use_user_id)
+            await send_message(session, chat_id, MESSAGES["invalid_contact"], user_id=user_id)
         return
 
     if step_key in OPTIONS:
@@ -651,7 +659,7 @@ async def handle_message(target_id, db_id, text, use_user_id=False):
         if step_key == "consent":
             n = parse_single_number(text, len(opts))
             if n is None:
-                await send_message(target_id, MESSAGES["invalid_number"].format(len(opts)), use_user_id=use_user_id)
+                await send_message(session, chat_id, MESSAGES["invalid_number"].format(len(opts)), user_id=user_id)
                 return
             is_consent = (n == 1)
             conn = get_db()
@@ -660,170 +668,143 @@ async def handle_message(target_id, db_id, text, use_user_id=False):
             c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, db_id))
             conn.commit()
             conn.close()
-            await advance_step(target_id, db_id, step_index, use_user_id)
+            await advance_step(session, chat_id, db_id, step_index, user_id)
             return
         if step_key in MULTI_STEPS:
             nums = parse_multi_numbers(text, len(opts))
             if nums is None:
-                await send_message(target_id, MESSAGES["invalid_multi"].format(len(opts)), use_user_id=use_user_id)
+                await send_message(session, chat_id, MESSAGES["invalid_multi"].format(len(opts)), user_id=user_id)
                 return
             label = "; ".join(opts[n - 1] for n in nums)
             save_answer(db_id, STEP_TO_DB[step_key], label)
         else:
             n = parse_single_number(text, len(opts))
             if n is None:
-                await send_message(target_id, MESSAGES["invalid_number"].format(len(opts)), use_user_id=use_user_id)
+                await send_message(session, chat_id, MESSAGES["invalid_number"].format(len(opts)), user_id=user_id)
                 return
             save_answer(db_id, STEP_TO_DB[step_key], opts[n - 1])
-        await advance_step(target_id, db_id, step_index, use_user_id)
+        await advance_step(session, chat_id, db_id, step_index, user_id)
         return
 
     if step_key not in ["post_plans", "help_needed"]:
         if len(text) < 2:
-            await send_message(target_id, "Пожалуйста, введите более развёрнутый ответ.", use_user_id=use_user_id)
+            await send_message(session, chat_id, "Пожалуйста, введите более развёрнутый ответ.", user_id=user_id)
             return
 
     save_answer(db_id, STEP_TO_DB[step_key], text)
-    await advance_step(target_id, db_id, step_index, use_user_id)
+    await advance_step(session, chat_id, db_id, step_index, user_id)
 
-# ----------------- ИНИЦИАЛИЗАЦИЯ БОТА -----------------
-# ВАЖНО: токен передаём позиционным аргументом
-bot = Bot(MAX_TOKEN)
-dp = Dispatcher()
+# ----------------- ОБРАБОТКА СОБЫТИЙ -----------------
+async def handle_update(session, update):
+    """Обработка одного обновления от MAX API"""
+    update_type = update.get("update_type", "")
+    log.info("=== Получено событие: %s ===", update_type)
+    log.debug("Полное событие: %s", json.dumps(update, ensure_ascii=False, indent=2))
 
-@dp.bot_started()
-async def on_bot_started(event: BotStarted):
-    """Срабатывает, когда пользователь впервые нажимает «Начать» в MAX"""
-    chat_id = event.chat_id
-    log.info("bot_started: chat_id=%s", chat_id)
-    db_id = to_db_id(chat_id)
-    try:
-        await send_message(chat_id, MESSAGES["welcome"], keyboard_type="start")
-    except Exception as e:
-        log.error("bot_started error: %s", e)
+    if update_type == "bot_started":
+        # Пользователь нажал «Начать» в MAX
+        # Структура: {"update_type": "bot_started", "chat": {"chat_id": ...}, "user": {"user_id": ...}}
+        chat_id = None
+        user_id = None
 
-@dp.message_created()
-async def on_message(event: MessageCreated):
-    """Срабатывает на любое входящее сообщение"""
-    log.info("message_created получено")
+        chat = update.get("chat", {})
+        if chat:
+            chat_id = chat.get("chat_id")
+            chat_type = chat.get("type", "")
+            log.info("bot_started: chat_id=%s, chat_type=%s", chat_id, chat_type)
 
-    # Извлекаем текст
-    text = ""
-    try:
-        if event.message and event.message.body:
-            text = event.message.body.text or ""
-    except Exception:
-        log.warning("Не удалось получить text из event.message.body")
-    
-    # Пробуем другие пути
-    if not text:
-        try:
-            text = event.message.text or ""
-        except Exception:
-            pass
-    
-    text = text.strip()
-    if not text:
-        log.warning("Пустой текст сообщения, пропускаем")
-        return
+        user = update.get("user", {})
+        if user:
+            user_id = user.get("user_id")
+            log.info("bot_started: user_id=%s", user_id)
 
-    log.info("Текст: %r", text[:100])
-
-    # Извлекаем chat_id и user_id из события
-    chat_id = None
-    user_id = None
-
-    # Пробуем event.message.recipient.chat_id
-    try:
-        if event.message and event.message.recipient:
-            chat_id = event.message.recipient.chat_id
-            log.info("recipient.chat_id=%s", chat_id)
-    except Exception:
-        pass
-
-    # Пробуем event.from_user.user_id
-    try:
-        if hasattr(event, 'from_user') and event.from_user:
-            user_id = event.from_user.user_id
-            log.info("from_user.user_id=%s", user_id)
-    except Exception:
-        pass
-
-    # Пробуем event.message.sender.user_id
-    if not user_id:
-        try:
-            if event.message and event.message.sender:
-                user_id = event.message.sender.user_id
-                log.info("sender.user_id=%s", user_id)
-        except Exception:
-            pass
-
-    # Определяем, что использовать для отправки
-    # Для личных диалогов — user_id, для групп — chat_id
-    target_id = None
-    use_user_id = False
-
-    if chat_id and not user_id:
-        # Только chat_id — групповой чат
-        target_id = chat_id
-        use_user_id = False
-    elif user_id and not chat_id:
-        # Только user_id — личный диалог
-        target_id = user_id
-        use_user_id = True
-    elif user_id and chat_id:
-        # Есть оба — проверяем тип чата
-        chat_type = None
-        try:
-            chat_type = event.message.recipient.chat_type
-            log.info("chat_type=%s", chat_type)
-        except Exception:
-            pass
-        
-        if chat_type and chat_type in ("chat", "channel"):
-            target_id = chat_id
-            use_user_id = False
-        else:
-            # dialog или неизвестно — используем user_id
-            target_id = user_id
-            use_user_id = True
-    else:
-        # Нет ни chat_id, ни user_id — пробуем event.chat_id
-        try:
-            target_id = event.chat_id
-            use_user_id = False
-            log.info("Использован event.chat_id=%s", target_id)
-        except Exception:
-            log.error("Не удалось получить ни chat_id, ни user_id из события!")
+        # Для отправки: если есть chat_id — используем его
+        # Если chat_type == "dialog" — это личка, можно юзать user_id
+        target = chat_id if chat_id else user_id
+        if not target:
+            log.error("bot_started: не найден ни chat_id, ни user_id!")
             return
 
-    if not target_id:
-        log.error("target_id пустой!")
+        db_id = to_db_id(target)
+        await send_message(session, target, MESSAGES["welcome"], keyboard_type="start", user_id=user_id if not chat_id else None)
         return
 
-    db_id = to_db_id(target_id)
-    log.info("Итого: target_id=%s, use_user_id=%s, db_id=%s", target_id, use_user_id, db_id)
+    if update_type == "message_created":
+        # Новое сообщение от пользователя
+        message = update.get("message", {})
+        body = message.get("body", {})
+        text = body.get("text", "").strip()
 
-    try:
-        await handle_message(target_id, db_id, text, use_user_id=use_user_id)
-    except Exception as e:
-        log.error("Ошибка обработки: %s", e, exc_info=True)
+        if not text:
+            log.warning("message_created: пустой текст")
+            return
+
+        recipient = message.get("recipient", {})
+        chat_id = recipient.get("chat_id")
+        chat_type = recipient.get("chat_type", "")
+
+        sender = message.get("sender", {})
+        user_id = sender.get("user_id")
+
+        log.info("message_created: text=%r, chat_id=%s, chat_type=%s, user_id=%s", text[:80], chat_id, chat_type, user_id)
+
+        # Для отправки: используем chat_id (работает и для личок, и для групп)
+        # Если chat_id нет — используем user_id
+        target = chat_id if chat_id else user_id
+        if not target:
+            log.error("message_created: не найден ни chat_id, ни user_id!")
+            return
+
+        # user_id передаём только если chat_id не определён
+        send_user_id = user_id if not chat_id else None
+
+        db_id = to_db_id(target)
+        try:
+            await handle_message(session, target, db_id, text, user_id=send_user_id)
+        except Exception as e:
+            log.error("Ошибка обработки сообщения: %s", e, exc_info=True)
+        return
+
+    log.info("Неизвестный тип события: %s", update_type)
 
 # ----------------- ЗАПУСК -----------------
 async def main():
     init_db()
     log.info("=== MAX бот запускается ===")
     log.info("Токен: %s...%s", MAX_TOKEN[:8], MAX_TOKEN[-4:])
-    
-    # Удаляем webhook-подписки, если есть (иначе polling не работает)
-    try:
-        await bot.delete_webhook()
-        log.info("Webhook удалён (или не был установлен)")
-    except Exception as e:
-        log.warning("delete_webhook: %s", e)
-    
-    log.info("=== MAX бот запущен. Ожидание сообщений... ===")
-    await dp.start_polling(bot)
+    log.info("Base URL: %s", BASE_URL)
+
+    async with aiohttp.ClientSession() as session:
+        # Удаляем webhook, если был — иначе polling не работает
+        await api_delete_webhook(session)
+        await asyncio.sleep(1)
+
+        log.info("=== Polling запущен. Ожидание сообщений... ===")
+
+        marker = None
+        while True:
+            try:
+                data = await api_get_updates(session, marker)
+                new_marker = data.get("marker")
+                if new_marker is not None:
+                    marker = new_marker
+
+                updates = data.get("updates", [])
+                if updates:
+                    log.info("Получено %d обновлений", len(updates))
+
+                for update in updates:
+                    try:
+                        await handle_update(session, update)
+                    except Exception as e:
+                        log.error("Ошибка обработки update: %s", e, exc_info=True)
+
+            except asyncio.TimeoutError:
+                # Нормальная ситуация — нет новых событий за timeout
+                continue
+            except Exception as e:
+                log.error("Ошибка polling: %s", e)
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())

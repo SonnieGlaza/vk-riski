@@ -367,7 +367,7 @@ def ask_university_page(user_id, page):
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
     items = UNIVERSITIES[start:end]
 
-    list_text = format_numbered_list(items, start_from=start + 1)
+    list_text = format_numbered_list(items, start_from=start + 1, truncate=True)
 
     nav = []
     if page > 0:

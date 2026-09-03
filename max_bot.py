@@ -7,8 +7,9 @@ import io
 import csv
 import psycopg2
 from psycopg2.extras import RealDictCursor
-
 import aiohttp
+import ssl
+import certifi  # <-- добавлено
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [MAX] %(levelname)s %(message)s")
 log = logging.getLogger("max_bot")
@@ -22,8 +23,7 @@ BASE_URL = "https://platform-api2.max.ru"
 if not MAX_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы MAX_TOKEN или DATABASE_URL")
 
-# --- РЕГЕКСЫ ---
-PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 def format_numbered_list(items, start_from=1, truncate=True):
@@ -323,16 +323,12 @@ def make_keyboard(kb_type):
 
 # ----------------- HTTP КЛИЕНТ MAX API -----------------
 async def api_send_message(session, chat_id, text, attachments=None, user_id=None):
-    """Отправка сообщения через POST /messages"""
     url = f"{BASE_URL}/messages"
     params = {}
     if user_id:
         params["user_id"] = user_id
     else:
         params["chat_id"] = chat_id
-    body = {"text": text}
-    if attachments:
-        body["attachments"] = attachments
     headers = {"Authorization": MAX_TOKEN, "Content-Type": "application/json"}
 
     MAX_TEXT = 4000
@@ -359,7 +355,6 @@ async def api_send_message(session, chat_id, text, attachments=None, user_id=Non
                 resp_text = await resp.text()
                 if resp.status != 200:
                     log.error("POST /messages -> %s: %s", resp.status, resp_text)
-                    # Если chat_id не сработал, пробуем user_id
                     if not user_id and "chat_id" in params:
                         log.info("Пробую отправить через user_id=%s", chat_id)
                         params2 = {"user_id": chat_id}
@@ -377,7 +372,6 @@ async def api_send_message(session, chat_id, text, attachments=None, user_id=Non
             await asyncio.sleep(0.5)
 
 async def api_get_updates(session, marker=None):
-    """Получение обновлений через GET /updates (long polling)"""
     params = {"limit": 100, "timeout": 30}
     if marker is not None:
         params["marker"] = marker
@@ -390,7 +384,6 @@ async def api_get_updates(session, marker=None):
         return json.loads(resp_text)
 
 async def api_delete_webhook(session):
-    """Удаление webhook-подписки, чтобы работал long polling"""
     headers = {"Authorization": MAX_TOKEN}
     try:
         async with session.delete(f"{BASE_URL}/subscriptions", headers=headers) as resp:
@@ -399,7 +392,6 @@ async def api_delete_webhook(session):
         log.warning("delete_webhook: %s", e)
 
 async def api_upload_file(session, file_path, filename):
-    """Загрузка файла через POST /uploads"""
     headers = {"Authorization": MAX_TOKEN}
     with open(file_path, "rb") as f:
         data = aiohttp.FormData()
@@ -696,14 +688,11 @@ async def handle_message(session, chat_id, db_id, text, user_id=None):
 
 # ----------------- ОБРАБОТКА СОБЫТИЙ -----------------
 async def handle_update(session, update):
-    """Обработка одного обновления от MAX API"""
     update_type = update.get("update_type", "")
     log.info("=== Получено событие: %s ===", update_type)
     log.debug("Полное событие: %s", json.dumps(update, ensure_ascii=False, indent=2))
 
     if update_type == "bot_started":
-        # Пользователь нажал «Начать» в MAX
-        # Структура: {"update_type": "bot_started", "chat": {"chat_id": ...}, "user": {"user_id": ...}}
         chat_id = None
         user_id = None
 
@@ -718,8 +707,6 @@ async def handle_update(session, update):
             user_id = user.get("user_id")
             log.info("bot_started: user_id=%s", user_id)
 
-        # Для отправки: если есть chat_id — используем его
-        # Если chat_type == "dialog" — это личка, можно юзать user_id
         target = chat_id if chat_id else user_id
         if not target:
             log.error("bot_started: не найден ни chat_id, ни user_id!")
@@ -730,7 +717,6 @@ async def handle_update(session, update):
         return
 
     if update_type == "message_created":
-        # Новое сообщение от пользователя
         message = update.get("message", {})
         body = message.get("body", {})
         text = body.get("text", "").strip()
@@ -748,14 +734,11 @@ async def handle_update(session, update):
 
         log.info("message_created: text=%r, chat_id=%s, chat_type=%s, user_id=%s", text[:80], chat_id, chat_type, user_id)
 
-        # Для отправки: используем chat_id (работает и для личок, и для групп)
-        # Если chat_id нет — используем user_id
         target = chat_id if chat_id else user_id
         if not target:
             log.error("message_created: не найден ни chat_id, ни user_id!")
             return
 
-        # user_id передаём только если chat_id не определён
         send_user_id = user_id if not chat_id else None
 
         db_id = to_db_id(target)
@@ -774,8 +757,11 @@ async def main():
     log.info("Токен: %s...%s", MAX_TOKEN[:8], MAX_TOKEN[-4:])
     log.info("Base URL: %s", BASE_URL)
 
-    async with aiohttp.ClientSession() as session:
-        # Удаляем webhook, если был — иначе polling не работает
+    # <-- ГЛАВНОЕ ИСПРАВЛЕНИЕ: SSL-контекст с сертификатами -->
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
         await api_delete_webhook(session)
         await asyncio.sleep(1)
 
@@ -800,7 +786,6 @@ async def main():
                         log.error("Ошибка обработки update: %s", e, exc_info=True)
 
             except asyncio.TimeoutError:
-                # Нормальная ситуация — нет новых событий за timeout
                 continue
             except Exception as e:
                 log.error("Ошибка polling: %s", e)
@@ -808,3 +793,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+

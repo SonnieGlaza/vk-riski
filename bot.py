@@ -47,7 +47,6 @@ def get_db():
 def init_db():
     conn = get_db()
     c = conn.cursor()
-    # Добавляем колонку consent_status (по умолчанию NULL или False)
     c.execute('''
         CREATE TABLE IF NOT EXISTS answers (
             user_id BIGINT PRIMARY KEY,
@@ -56,10 +55,12 @@ def init_db():
             employment_status TEXT, target_contract TEXT, experience TEXT,
             practice_eval TEXT, events TEXT, resume_status TEXT,
             interview_training TEXT, special_status TEXT, military TEXT,
-            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT,
-            consent_status BOOLEAN DEFAULT FALSE
+            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
         )
     ''')
+    # Добавляем колонку, если таблица уже существовала без неё
+    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN DEFAULT FALSE")
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
             user_id BIGINT PRIMARY KEY,
@@ -379,30 +380,23 @@ def ask_university_page(user_id, page):
 def ask_step(user_id, step_key, uni_page=0):
     if step_key == "institution":
         ask_university_page(user_id, uni_page)
+    elif step_key == "consent":
+        # Получаем сохранённое ФИО из БД
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        fio_text = row[0] if row and row[0] else "[ФИО не указано]"
+
+        # Формируем сообщение с подставленным ФИО
+        message = QUESTIONS["consent"].format(fio=fio_text)
+        opts = OPTIONS["consent"]
+        list_text = format_numbered_list(opts)
+        hint = "Напишите номер выбранного варианта (1 или 2)."
+        send_message(user_id, f"{message}\n\n{list_text}\n\n{hint}")
     elif step_key in OPTIONS:
         opts = OPTIONS[step_key]
-        
-        # Специальная обработка для шага согласия: подставляем ФИО
-        if step_key == "consent":
-            # Получаем сохраненное ФИО из БД
-            conn = get_db()
-            c = conn.cursor()
-            c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
-            row = c.fetchone()
-            conn.close()
-            fio_text = row[0] if row and row[0] else "[ФИО не указано]"
-            
-            # Формируем сообщение с подставленным ФИО
-            message_base = QUESTIONS["consent"]
-            message = message_base.format(fio=fio_text)
-            
-            list_text = format_numbered_list(opts)
-            hint = "Нажмите номер варианта (1 или 2)."
-            message += f"\n\n{list_text}\n\n{hint}"
-            send_message(user_id, message)
-            return
-
-        # Обычная логика для других списков
         list_text = format_numbered_list(opts)
         if step_key in MULTI_STEPS:
             hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
@@ -411,7 +405,6 @@ def ask_step(user_id, step_key, uni_page=0):
         message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
         send_message(user_id, message)
     else:
-        # Свободный ввод
         send_message(user_id, QUESTIONS[step_key])
 
 def advance_step(user_id, step_index):

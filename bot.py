@@ -12,7 +12,7 @@ from psycopg2.extras import RealDictCursor
 
 # --- РЕГЕКСЫ (скомпилированы один раз) ---
 try:
-    PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+    PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
     EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 except re.error as e:
     print("ОШИБКА В REGEX:", e)
@@ -20,11 +20,6 @@ except re.error as e:
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
-    """
-    items: список строк
-    start_from: с какого номера начинать нумерацию
-    truncate: если True — обрезает длинные строки (для вузов), если False — полный текст (для вариантов ответов)
-    """
     lines = []
     for i, item in enumerate(items, start=start_from):
         if truncate and len(item) > 80:
@@ -63,7 +58,6 @@ def init_db():
             maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
         )
     ''')
-    # Добавляем колонку, если таблица уже существовала без неё
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN DEFAULT FALSE")
 
     c.execute('''
@@ -162,6 +156,75 @@ UNIVERSITIES = [
     "Сарапульский техникум машиностроения и информационных технологий"
 ]
 ITEMS_PER_PAGE = 10
+
+# ----------------- РАЙОНЫ УДМУРТИИ -----------------
+DISTRICTS_UNIVERSITIES = {
+    "Ижевск": [
+        "БПОУ УР «Ижевский торгово-экономический техникум»",
+        "БПОУ УР «Ижевский монтажный техникум»",
+        "БПОУ «Ижевский агростроительный техникум»",
+        "ЧПОО «Нефтяной техникум»",
+        "БПОУ УР «Ижевский политехнический колледж»",
+        "БПОУ УР «Ижевский промышленно-экономический колледж»",
+        "БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»",
+        "БПОУ УР «Радиомеханический техникум имени В.А. Шутова»",
+        "АПОУ УР «Экономико-технологический колледж»",
+        "АПОУ УР «Топливно-энергетический колледж»",
+        "БПОУ УР «Ижевский техникум индустрии питания»",
+        "КПОУ УР «Удмуртский республиканский колледж культуры»",
+        "АНПОО «Международный Восточно-Европейский колледж»",
+        "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+        "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+        "АНПОО СПО «Ижевский финансово-юридический колледж»",
+        "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+        "АПОУ УР «Строительный техникум»",
+        "ФГБОУ ВО «Ижевская государственная медицинская академия»",
+        "КПОУ УР «Республиканский музыкальный колледж»",
+        "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
+        "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+        "Министерство юстиции Российской Федерации",
+        "ФГБОУ ВО «Удмуртский государственный университет»",
+        "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+        "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
+        "БПОУ УР «Ижевский автотранспортный техникум»",
+    ],
+    "Воткинск": [
+        "БПОУ УР «Воткинский промышленный техникум»",
+        "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
+        "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",
+    ],
+    "Глазов": [
+        "АПОУ УР «Глазовский аграрно-промышленный техникум»",
+        "БПОУ УР «Глазовский технический колледж»",
+        "БПОУ УР «Глазовский политехнический колледж»",
+        "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»",
+    ],
+    "Можга": [
+        "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+        "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",
+        "БПОУ УР «Можгинский агропромышленный колледж»",
+    ],
+    "Сарапул": [
+        "БПОУ УР «Сарапульский политехнический техникум»",
+        "БПОУ УР «Сарапульский многопрофильный колледж»",
+        "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+        "Сарапульский техникум машиностроения и информационных технологий",
+    ],
+    "Районы Удмуртии": [
+        "БПОУ УР «Асановский аграрно-технический техникум»",
+        "БПОУ «Дебесский политехникум»",
+        "БПОУР «Игринский политехнический техникум»",
+        "БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»",
+        "БПОУ УР «Увинский профессиональный колледж»",
+        "БПОУ УР «Ярский политехникум»",
+    ],
+}
+
+INSTITUTION_TO_DISTRICT = {}
+for _district, _unis in DISTRICTS_UNIVERSITIES.items():
+    for _uni in _unis:
+        INSTITUTION_TO_DISTRICT[_uni] = _district
 
 # ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
@@ -292,7 +355,6 @@ OPTIONS = {
     ]
 }
 
-# Только эти шаги — множественный выбор через запятую
 MULTI_STEPS = ["post_plans", "help_needed"]
 
 MESSAGES = {
@@ -325,7 +387,7 @@ MESSAGES = {
     )
 }
 
-# ----------------- КЛАВИАТУРЫ (только старт/рестарт) -----------------
+# ----------------- КЛАВИАТУРЫ -----------------
 
 def kb_start():
     return json.dumps({
@@ -387,7 +449,6 @@ def ask_step(user_id, step_key, uni_page=0):
         ask_university_page(user_id, uni_page)
 
     elif step_key == "consent":
-        # Получаем сохранённое ФИО из БД
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
@@ -395,28 +456,25 @@ def ask_step(user_id, step_key, uni_page=0):
         conn.close()
         fio_text = row[0] if row and row[0] else "[ФИО не указано]"
 
-        # Формируем сообщение с подставленным ФИО
         message = QUESTIONS["consent"].format(fio=fio_text)
         opts = OPTIONS["consent"]
-        list_text = format_numbered_list(opts, truncate=False)  # Полный текст
+        list_text = format_numbered_list(opts, truncate=False)
         hint = "Напишите номер выбранного варианта (1 или 2)."
         send_message(user_id, f"{message}\n\n{list_text}\n\n{hint}")
 
     elif step_key in OPTIONS:
         opts = OPTIONS[step_key]
-        # Для вариантов ответов передаем truncate=False, чтобы текст был полным
         list_text = format_numbered_list(opts, truncate=False)
-        
+
         if step_key in MULTI_STEPS:
             hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
         else:
             hint = "Напишите номер выбранного варианта (например: 1)."
-        
+
         message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
         send_message(user_id, message)
 
     else:
-        # Свободный ввод (без списка вариантов)
         send_message(user_id, QUESTIONS[step_key])
 
 def advance_step(user_id, step_index):
@@ -462,218 +520,11 @@ def parse_multi_numbers(text, max_val):
     except ValueError:
         return None
 
-# ----------------- ВЫГРУЗКА -----------------
-
-EXPORT_HEADERS = {
-    "user_id": "ID пользователя",
-    "fio": "ФИО",
-    "institution": "Учебное заведение",
-    "specialty": "Специальность",
-    "study_group": "Учебная группа",
-    "course": "Курс",
-    "form_of_study": "Форма обучения",
-    "contacts": "Контакты",
-    "employment_status": "Статус занятости",
-    "target_contract": "Целевой договор",
-    "experience": "Опыт работы",
-    "practice_eval": "Оценка практик",
-    "events": "Участие в мероприятиях",
-    "resume_status": "Наличие резюме",
-    "interview_training": "Тренинги по собеседованию",
-    "special_status": "Особый статус",
-    "military": "Призыв на военную службу",
-    "maternity": "Отпуск по уходу за ребёнком",
-    "graduate": "Выпускной курс",
-    "post_plans": "Планы после выпуска",
-    "help_needed": "Нужная помощь"
-}
-
-def export_to_table(admin_id):
-    conn = get_db()
-    c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("SELECT * FROM answers")
-    rows = c.fetchall()
-    conn.close()
-
-    if not rows:
-        send_message(admin_id, MESSAGES["no_data"])
-        return
-
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill
-
-    wb = Workbook()
-
-    # ===== ЛИСТ 1: "Анкеты" — то, что было раньше =====
-    ws1 = wb.active
-    ws1.title = "Анкеты"
-
-    cols = list(rows[0].keys())
-    header_font = Font(bold=True)
-
-    for col_idx, col_name in enumerate(cols, start=1):
-        cell = ws1.cell(row=1, column=col_idx,
-                        value=EXPORT_HEADERS.get(col_name, col_name))
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
-
-    for row_idx, r in enumerate(rows, start=2):
-        for col_idx, col_name in enumerate(cols, start=1):
-            val = r[col_name]
-            ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
-
-    for col_idx, col_name in enumerate(cols, start=1):
-        display_name = EXPORT_HEADERS.get(col_name, col_name)
-        max_len = max(len(str(display_name)),
-                      max((len(str(r[col_name])) if r[col_name] else 0) for r in rows))
-        ws1.column_dimensions[ws1.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
-
-    # ===== ЛИСТ 2: "Баллы" — скоринг + контакты + сумма =====
-    ws2 = wb.create_sheet("Баллы")
-
-    score_headers = [
-        "ФИО",
-        "Учебное заведение",
-        "Контакты",
-        "Статус занятости",
-        "Целевой договор",
-        "Опыт работы",
-        "Оценка практик",
-        "Мероприятия",
-        "Резюме",
-        "Собеседование",
-        "Особый статус",
-        "Военный призыв",
-        "Сумма баллов",
-    ]
-
-
-    bold_font = Font(bold=True)
-    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-
-    for col_idx, h in enumerate(score_headers, start=1):
-        cell = ws2.cell(row=1, column=col_idx, value=h)
-        cell.font = bold_font
-        cell.alignment = Alignment(horizontal="center")
-
-    for row_idx, r in enumerate(rows, start=2):
-        scores, total = calculate_scores(dict(r))
-
-        ws2.cell(row=row_idx, column=1, value=r.get("fio") or "")
-        ws2.cell(row=row_idx, column=2, value=r.get("institution") or "")
-        ws2.cell(row=row_idx, column=3, value=r.get("contacts") or "")
-
-        score_keys = ["employment", "target_contract", "experience",
-                      "practice_eval", "events", "resume",
-                      "interview", "special_status", "military"]
-
-        for i, key in enumerate(score_keys, start=4):
-            val = scores.get(key)
-            ws2.cell(row=row_idx, column=i, value=val if val is not None else "")
-
-        total_cell = ws2.cell(row=row_idx, column=13, value=total)
-        total_cell.font = bold_font
-        total_cell.fill = total_fill
-
-
-    # Автоширина для второго листа
-    for col_idx in range(1, len(score_headers) + 1):
-        col_letter = ws2.cell(row=1, column=col_idx).column_letter
-        max_len = len(score_headers[col_idx - 1])
-        for row_idx in range(2, len(rows) + 2):
-            val = ws2.cell(row=row_idx, column=col_idx).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        ws2.column_dimensions[col_letter].width = min(max_len + 2, 35)
-
-    # ===== Сохранение и отправка =====
-    fname = "survey_export.xlsx"
-    wb.save(fname)
-
-    try:
-        upload_server = vk.docs.getMessagesUploadServer(type="doc", peer_id=admin_id)
-        upload_url = upload_server["upload_url"]
-
-        import urllib.request
-
-        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
-        with open(fname, "rb") as f:
-            file_data = f.read()
-
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
-            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
-        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-        req = urllib.request.Request(
-            upload_url,
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
-        )
-        resp = urllib.request.urlopen(req)
-        result = json.loads(resp.read().decode("utf-8"))
-
-        if "file" not in result or not result["file"]:
-            raise Exception("Сервер ВК не принял файл")
-
-        doc = vk.docs.save(file=result["file"], title="Выгрузка анкет.xlsx")
-
-        if isinstance(doc, dict) and "doc" in doc:
-            d = doc["doc"]
-        elif isinstance(doc, dict) and "docs" in doc:
-            d = doc["docs"][0]
-        else:
-            raise Exception(f"Неожиданный ответ docs.save: {doc}")
-
-        att = f"doc{d['owner_id']}_{d['id']}"
-        send_message(admin_id,
-            "📊 Вот выгрузка анкет:\n\n"
-            "• Лист «Анкеты» — полные ответы анкеты\n"
-            "• Лист «Баллы» — балльная оценка + контакты + сумма баллов",
-            attachment=att)
-
-    except Exception as e:
-        print(f"Ошибка загрузки .xlsx в ВК: {e}")
-        try:
-            out = io.StringIO()
-            writer = csv.DictWriter(out, fieldnames=cols)
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(dict(r))
-            csv_text = out.getvalue()
-            out.close()
-
-            if len(csv_text) > 4000:
-                chunks = []
-                lines = csv_text.split("\n")
-                current = ""
-                for line in lines:
-                    if len(current) + len(line) + 1 > 4000:
-                        chunks.append(current)
-                        current = line + "\n"
-                    else:
-                        current += line + "\n"
-                if current:
-                    chunks.append(current)
-
-                for i, chunk in enumerate(chunks):
-                    header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
-                    send_message(admin_id, header + chunk)
-            else:
-                send_message(admin_id, "📊 Выгрузка анкет (CSV, откроется в Excel):\n\n" + csv_text)
-        except Exception as e2:
-            send_message(admin_id, f"Не удалось выгрузить данные: {e2}")
-    finally:
-        if os.path.exists(fname):
-            os.remove(fname)
-
 # ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
 
 def calculate_scores(row):
     """
-    Преобразует текстовые ответы анкеты в числовые баллы
-    по той же логике, что в скрипте ТаблицаA → ТаблицаB.
+    Преобразует текстовые ответы анкеты в числовые баллы.
     Возвращает словарь баллов и общую сумму.
     """
     scores = {}
@@ -748,6 +599,242 @@ def calculate_scores(row):
     total = sum(v for v in scores.values())
     return scores, total
 
+# ----------------- ВЫГРУЗКА -----------------
+
+EXPORT_HEADERS = {
+    "user_id": "ID пользователя",
+    "fio": "ФИО",
+    "institution": "Учебное заведение",
+    "specialty": "Специальность",
+    "study_group": "Учебная группа",
+    "course": "Курс",
+    "form_of_study": "Форма обучения",
+    "contacts": "Контакты",
+    "employment_status": "Статус занятости",
+    "target_contract": "Целевой договор",
+    "experience": "Опыт работы",
+    "practice_eval": "Оценка практик",
+    "events": "Участие в мероприятиях",
+    "resume_status": "Наличие резюме",
+    "interview_training": "Тренинги по собеседованию",
+    "special_status": "Особый статус",
+    "military": "Призыв на военную службу",
+    "maternity": "Отпуск по уходу за ребёнком",
+    "graduate": "Выпускной курс",
+    "post_plans": "Планы после выпуска",
+    "help_needed": "Нужная помощь"
+}
+
+def export_to_table(admin_id):
+    conn = get_db()
+    c = conn.cursor(cursor_factory=RealDictCursor)
+    c.execute("SELECT * FROM answers")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        send_message(admin_id, MESSAGES["no_data"])
+        return
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+
+    wb = Workbook()
+
+    # ===== ЛИСТ 1: "Анкеты" — все данные =====
+    ws1 = wb.active
+    ws1.title = "Анкеты"
+
+    cols = list(rows[0].keys())
+    header_font = Font(bold=True)
+
+    for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws1.cell(row=1, column=col_idx,
+                        value=EXPORT_HEADERS.get(col_name, col_name))
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, r in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(cols, start=1):
+            val = r[col_name]
+            ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+
+    for col_idx, col_name in enumerate(cols, start=1):
+        display_name = EXPORT_HEADERS.get(col_name, col_name)
+        max_len = max(len(str(display_name)),
+                      max((len(str(r[col_name])) if r[col_name] else 0) for r in rows))
+        ws1.column_dimensions[ws1.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+
+    # ===== ЛИСТЫ ПО РАЙОНАМ: скоринг + контакты + сумма =====
+    bold_font = Font(bold=True)
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    score_headers = [
+        "ФИО",
+        "Учебное заведение",
+        "Контакты",
+        "Статус занятости",
+        "Целевой договор",
+        "Опыт работы",
+        "Оценка практик",
+        "Мероприятия",
+        "Резюме",
+        "Собеседование",
+        "Особый статус",
+        "Военный призыв",
+        "Сумма баллов",
+    ]
+
+    score_keys = ["employment", "target_contract", "experience",
+                  "practice_eval", "events", "resume",
+                  "interview", "special_status", "military"]
+
+    def write_district_sheet(workbook, district_name, district_rows):
+        """Создаёт лист с балльной оценкой для одного района."""
+        ws = workbook.create_sheet(district_name)
+
+        for col_idx, h in enumerate(score_headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = bold_font
+            cell.alignment = Alignment(horizontal="center")
+
+        for row_idx, r in enumerate(district_rows, start=2):
+            scores, total = calculate_scores(dict(r))
+
+            ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
+            ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
+            ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
+
+            for i, key in enumerate(score_keys, start=4):
+                val = scores.get(key)
+                ws.cell(row=row_idx, column=i, value=val if val is not None else "")
+
+            total_cell = ws.cell(row=row_idx, column=13, value=total)
+            total_cell.font = bold_font
+            total_cell.fill = total_fill
+
+        for col_idx in range(1, len(score_headers) + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_len = len(score_headers[col_idx - 1])
+            for row_idx in range(2, len(district_rows) + 2):
+                val = ws.cell(row=row_idx, column=col_idx).value
+                if val is not None:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+    # Создаём листы по районам
+    for district_name in DISTRICTS_UNIVERSITIES:
+        district_rows = [
+            r for r in rows
+            if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
+        ]
+        if district_rows:
+            write_district_sheet(wb, district_name, district_rows)
+
+    # Студенты, чей вуз не попал в маппинг
+    other_rows = [
+        r for r in rows
+        if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
+    ]
+    if other_rows:
+        write_district_sheet(wb, "Прочие", other_rows)
+
+    # ===== Сохранение и отправка =====
+    fname = "survey_export.xlsx"
+    wb.save(fname)
+
+    try:
+        upload_server = vk.docs.getMessagesUploadServer(type="doc", peer_id=admin_id)
+        upload_url = upload_server["upload_url"]
+
+        import urllib.request
+
+        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
+        with open(fname, "rb") as f:
+            file_data = f.read()
+
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
+            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
+        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            upload_url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        )
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read().decode("utf-8"))
+
+        if "file" not in result or not result["file"]:
+            raise Exception("Сервер ВК не принял файл")
+
+        doc = vk.docs.save(file=result["file"], title="Выгрузка анкет.xlsx")
+
+        if isinstance(doc, dict) and "doc" in doc:
+            d = doc["doc"]
+        elif isinstance(doc, dict) and "docs" in doc:
+            d = doc["docs"][0]
+        else:
+            raise Exception(f"Неожиданный ответ docs.save: {doc}")
+
+        att = f"doc{d['owner_id']}_{d['id']}"
+
+        sheet_list = []
+        for district_name in DISTRICTS_UNIVERSITIES:
+            district_rows = [
+                r for r in rows
+                if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
+            ]
+            if district_rows:
+                sheet_list.append(f"  • «{district_name}» — {len(district_rows)} чел.")
+        if other_rows:
+            sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
+
+        sheets_text = "\n".join(sheet_list) if sheet_list else ""
+
+        send_message(admin_id,
+            "📊 Вот выгрузка анкет:\n\n"
+            "• Лист «Анкеты» — полные ответы всех анкет\n"
+            "• Листы по районам — балльная оценка + контакты + сумма баллов:\n\n"
+            f"{sheets_text}",
+            attachment=att)
+
+    except Exception as e:
+        print(f"Ошибка загрузки .xlsx в ВК: {e}")
+        try:
+            out = io.StringIO()
+            writer = csv.DictWriter(out, fieldnames=cols)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(dict(r))
+            csv_text = out.getvalue()
+            out.close()
+
+            if len(csv_text) > 4000:
+                chunks = []
+                lines = csv_text.split("\n")
+                current = ""
+                for line in lines:
+                    if len(current) + len(line) + 1 > 4000:
+                        chunks.append(current)
+                        current = line + "\n"
+                    else:
+                        current += line + "\n"
+                if current:
+                    chunks.append(current)
+
+                for i, chunk in enumerate(chunks):
+                    header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
+                    send_message(admin_id, header + chunk)
+            else:
+                send_message(admin_id, "📊 Выгрузка анкет (CSV, откроется в Excel):\n\n" + csv_text)
+        except Exception as e2:
+            send_message(admin_id, f"Не удалось выгрузить данные: {e2}")
+    finally:
+        if os.path.exists(fname):
+            os.remove(fname)
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
@@ -791,7 +878,7 @@ def handle_message(event):
         send_message(user_id, MESSAGES["already_finished"], kb_restart())
         return
 
-    # --- Определяем текущий шаг (теперь step_key гарантированно существует) ---
+    # --- Определяем текущий шаг ---
     step_key = STEPS[step_index]
 
     # --- Выбор вуза ---
@@ -846,9 +933,8 @@ def handle_message(event):
                 send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
                 return
 
-            is_consent = (n == 1)  # 1 — Да, 2 — Нет
+            is_consent = (n == 1)
 
-            # Сохраняем в БД как булево значение
             conn = get_db()
             c = conn.cursor()
             c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
@@ -859,7 +945,7 @@ def handle_message(event):
             advance_step(user_id, step_index)
             return
 
-        # ОБЫЧНАЯ ЛОГИКА — множественный выбор
+        # Множественный выбор
         if step_key in MULTI_STEPS:
             nums = parse_multi_numbers(text, len(opts))
             if nums is None:

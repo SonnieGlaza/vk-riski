@@ -633,7 +633,7 @@ def export_to_table(admin_id):
         return
 
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.styles import Font, Alignment
 
     wb = Workbook()
 
@@ -645,8 +645,7 @@ def export_to_table(admin_id):
     header_font = Font(bold=True)
 
     for col_idx, col_name in enumerate(cols, start=1):
-        cell = ws1.cell(row=1, column=col_idx,
-                        value=EXPORT_HEADERS.get(col_name, col_name))
+        cell = ws1.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
@@ -655,35 +654,118 @@ def export_to_table(admin_id):
             val = r[col_name]
             ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
-    for col_idx, col_name in enumerate(cols, start=1):
-        display_name = EXPORT_HEADERS.get(col_name, col_name)
-        max_len = max(len(str(display_name)),
-                      max((len(str(r[col_name])) if r[col_name] else 0) for r in rows))
-        ws1.column_dimensions[ws1.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+    # Автоширина колонок (простая эвристика)
+    for col in ws1.columns:
+        max_length = 0
+        column_letter = col[0].column_letter
+        for cell in col:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except Exception:
+                pass
+        adjusted_width = min(max_length + 2, 50)
+        ws1.column_dimensions[column_letter].width = adjusted_width
 
-    # ===== ЛИСТЫ ПО РАЙОНАМ: скоринг + контакты + сумма =====
-    bold_font = Font(bold=True)
-    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    # ===== ЛИСТЫ ПО РАЙОНАМ =====
+    for district, unis in DISTRICTS_UNIVERSITIES.items():
+        ws = wb.create_sheet(title=district)
+        # Заголовки
+        header_row = ["ФИО", "Учебное заведение", "Контакты", "Статус занятости", "Целевой договор",
+                      "Опыт работы", "Оценка практик", "Участие в мероприятиях", "Резюме",
+                      "Тренинги по собеседованию", "Особый статус", "Призыв",
+                      "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
+                      "Нужная помощь", "employment", "target_contract", "experience",
+                      "practice_eval", "events", "resume", "interview", "special_status",
+                      "military", "total_score"]
+        for idx, h in enumerate(header_row, start=1):
+            cell = ws.cell(row=1, column=idx, value=h)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
 
-    score_headers = [
-        "ФИО",
-        "Учебное заведение",
-        "Контакты",
-        "Статус занятости",
-        "Целевой договор",
-        "Опыт работы",
-        "Оценка практик",
-        "Мероприятия",
-        "Резюме",
-        "Собеседование",
-        "Особый статус",
-        "Военный призыв",
-        "Сумма баллов",
-    ]
+        row_idx = 2
+        for r in rows:
+            inst = r.get("institution")
+            if inst not in INSTITUTION_TO_DISTRICT:
+                continue
+            if INSTITUTION_TO_DISTRICT[inst] != district:
+                continue
 
-    score_keys = ["employment", "target_contract", "experience",
-                  "practice_eval", "events", "resume",
-                  "interview", "special_status", "military"]
+            scores, total = calculate_scores(r)
+
+            ws.cell(row=row_idx, column=1, value=r.get("fio"))
+            ws.cell(row=row_idx, column=2, value=inst)
+            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
+            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
+            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
+            ws.cell(row=row_idx, column=6, value=r.get("experience"))
+            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
+            ws.cell(row=row_idx, column=8, value=r.get("events"))
+            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
+            ws.cell(row_row_idx, column=10, value=r.get("interview_training"))
+            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
+            ws.cell(row=row_idx, column=12, value=r.get("military"))
+            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
+            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
+            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
+            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+
+            # Баллы
+            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
+            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
+            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
+            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
+            ws.cell(row=row_idx, column=21, value=scores.get("events"))
+            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
+            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
+            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
+            ws.cell(row=row_idx, column=25, value=scores.get("military"))
+            ws.cell(row=row_idx, column=26, value=total)
+
+            row_idx += 1
+
+    fname = "survey_export.xlsx"
+    wb.save(fname)
+
+    # ===== ЗАГРУЗКА В VK (через requests, без urllib) =====
+    import requests
+
+    try:
+        # 1. Получаем адрес загрузки
+        upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
+        upload_url = upload_server['upload_url']
+
+        # 2. Загружаем файл POST-запросом
+        with open(fname, "rb") as f:
+            resp = requests.post(
+                upload_url,
+                files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+            )
+        result = resp.json()
+
+        if "file" not in result:
+            raise RuntimeError("VK не вернул файл в ответе загрузки")
+
+        file_data = result["file"]
+
+        # 3. Сохраняем документ
+        saved = vk.docs.save(file=file_data, title="Выгрузка анкет")
+        doc_id = saved["id"]
+        owner_id = saved["owner_id"]
+
+        # 4. Отправляем сообщение с документом
+        attachment = f"doc{owner_id}_{doc_id}"
+        send_message(admin_id, "📄 Выгрузка анкет готова:", attachment=attachment)
+
+    except Exception as e:
+        print("Ошибка при загрузке файла в VK:", e)
+        send_message(admin_id, f"❌ Ошибка при формировании или отправке выгрузки: {e}")
+
+    finally:
+        # Удаляем временный файл
+        import os
+        if os.path.exists(fname):
+            os.remove(fname)
 
     def write_district_sheet(workbook, district_name, district_rows):
         """Создаёт лист с балльной оценкой для одного района."""

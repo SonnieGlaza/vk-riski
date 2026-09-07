@@ -2,16 +2,15 @@ import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.utils import get_random_id
 import re
-import csv
-import io
 import os
 import json
 import time
+import tempfile
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-# --- РЕГЕКСЫ (скомпилированы один раз) ---
-PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+# --- РЕГЕКСЫ ---
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
@@ -519,13 +518,8 @@ def parse_multi_numbers(text, max_val):
 # ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
 
 def calculate_scores(row):
-    """
-    Преобразует текстовые ответы анкеты в числовые баллы.
-    Возвращает словарь баллов и общую сумму.
-    """
     scores = {}
 
-    # Статус занятости → 0 / 2 / 3
     emp = (row.get("employment_status") or "").lower()
     if "трудовому договору" in emp:
         scores["employment"] = 0
@@ -534,14 +528,12 @@ def calculate_scores(row):
     elif "ничего из вышеперечисленного" in emp:
         scores["employment"] = 3
 
-    # Целевой договор → 0 / 2
     tc = (row.get("target_contract") or "").lower()
     if "да" in tc and "нет" not in tc:
         scores["target_contract"] = 0
     elif "нет" in tc:
         scores["target_contract"] = 2
 
-    # Опыт работы → 0 / 1 / 2
     exp = (row.get("experience") or "").lower()
     if "да, есть опыт" in exp:
         scores["experience"] = 0
@@ -550,42 +542,36 @@ def calculate_scores(row):
     elif "нет, опыта" in exp:
         scores["experience"] = 2
 
-    # Оценка практик → 0 / 1
     pe = (row.get("practice_eval") or "").lower()
     if "не доволен" in pe or "недоволен" in pe:
         scores["practice_eval"] = 1
     elif "доволен" in pe:
         scores["practice_eval"] = 0
 
-    # Участие в мероприятиях → 0 / 1
     ev = (row.get("events") or "").lower()
     if "за последний год" in ev:
         scores["events"] = 0
     elif "более года назад" in ev or "ни разу" in ev:
         scores["events"] = 1
 
-    # Наличие резюме → 1 / 0
     rs = (row.get("resume_status") or "").lower()
     if "актуальное" in rs:
         scores["resume"] = 1
     elif "устарело" in rs or "не составлял" in rs:
         scores["resume"] = 0
 
-    # Тренинги по собеседованию → 1 / 0
     it = (row.get("interview_training") or "").lower()
     if "да" in it and "не проходил" not in it:
         scores["interview"] = 1
     elif "не проходил" in it:
         scores["interview"] = 0
 
-    # Особый статус → 1 / 0
     ss = (row.get("special_status") or "").lower()
     if "ничего из вышеперечисленного" in ss:
         scores["special_status"] = 0
     elif ss:
         scores["special_status"] = 1
 
-    # Военный призыв → 1 / 0
     mil = (row.get("military") or "").lower()
     if "да, планируется" in mil:
         scores["military"] = 1
@@ -634,6 +620,7 @@ def export_to_table(admin_id):
 
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
+    import requests
 
     wb = Workbook()
 
@@ -654,7 +641,6 @@ def export_to_table(admin_id):
             val = r[col_name]
             ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
-    # Автоширина колонок для листа "Анкеты"
     for col in ws1.columns:
         max_length = 0
         column_letter = col[0].column_letter
@@ -667,11 +653,10 @@ def export_to_table(admin_id):
         adjusted_width = min(max_length + 2, 50)
         ws1.column_dimensions[column_letter].width = adjusted_width
 
-    # ===== ЛИСТЫ ПО РАЙОНАМ (только ФИО, вуз, контакты, баллы) =====
+    # ===== ЛИСТЫ ПО РАЙОНАМ (ФИО, вуз, контакты, баллы) =====
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
-    # Заголовки для районных листов
     district_headers = [
         "ФИО",
         "Учебное заведение",
@@ -688,7 +673,6 @@ def export_to_table(admin_id):
         "Сумма баллов",
     ]
 
-    # Ключи баллов (в том же порядке, что и заголовки 4-12)
     score_keys = [
         "employment", "target_contract", "experience",
         "practice_eval", "events", "resume",
@@ -696,16 +680,13 @@ def export_to_table(admin_id):
     ]
 
     def write_score_sheet(workbook, sheet_name, sheet_rows):
-        """Создаёт лист с балльной оценкой: ФИО, вуз, контакты, баллы, сумма."""
         ws = workbook.create_sheet(title=sheet_name)
 
-        # Заголовки
         for col_idx, h in enumerate(district_headers, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
-        # Данные
         row_idx = 2
         for r in sheet_rows:
             scores, total = calculate_scores(dict(r))
@@ -724,7 +705,6 @@ def export_to_table(admin_id):
 
             row_idx += 1
 
-        # Автоширина
         for col_idx in range(1, len(district_headers) + 1):
             col_letter = ws.cell(row=1, column=col_idx).column_letter
             max_len = len(district_headers[col_idx - 1])
@@ -734,7 +714,6 @@ def export_to_table(admin_id):
                     max_len = max(max_len, len(str(val)))
             ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
 
-    # Создаём листы по районам (только если там есть студенты)
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [
             r for r in rows
@@ -743,7 +722,6 @@ def export_to_table(admin_id):
         if district_rows:
             write_score_sheet(wb, district_name, district_rows)
 
-    # Студенты, чей вуз не попал в маппинг
     other_rows = [
         r for r in rows
         if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
@@ -751,13 +729,19 @@ def export_to_table(admin_id):
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)
 
-    # ===== Сохранение =====
-    fname = "survey_export.xlsx"
+    # ===== СОХРАНЕНИЕ ВО ВРЕМЕННЫЙ ФАЙЛ =====
+    fname = tempfile.mktemp(suffix=".xlsx")
     wb.save(fname)
 
-    # ===== ЗАГРУЗКА В VK =====
-    import requests
+    if not os.path.exists(fname) or os.path.getsize(fname) == 0:
+        send_message(admin_id, "❌ Не удалось создать файл выгрузки. Проверьте свободное место на сервере.")
+        try:
+            os.remove(fname)
+        except Exception:
+            pass
+        return
 
+    # ===== ЗАГРУЗКА В VK =====
     try:
         upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
@@ -768,14 +752,16 @@ def export_to_table(admin_id):
                 files={"file": ("survey_export.xlsx", f,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
             )
-        resp.raise_for_status()
+
+        if not resp.content:
+            raise RuntimeError("VK вернул пустой ответ. Проверьте права токена: нужны «Документы» и «Сообщения сообщества».")
+
         result = resp.json()
 
-        if "file" not in result:
-            raise RuntimeError(f"VK не вернул поле 'file'. Ответ сервера: {result}")
+        if "file" not in result or not result["file"]:
+            raise RuntimeError(f"VK не принял файл. Ответ: {result}")
 
         file_data = result["file"]
-
         saved = vk.docs.save(file=file_data, title="Выгрузка анкет")
 
         if isinstance(saved, dict) and "doc" in saved:
@@ -783,11 +769,10 @@ def export_to_table(admin_id):
         elif isinstance(saved, dict) and "docs" in saved and len(saved["docs"]) > 0:
             d = saved["docs"][0]
         else:
-            raise RuntimeError(f"Неожиданный формат ответа docs.save: {saved}")
+            raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
 
         attachment = f"doc{d['owner_id']}_{d['id']}"
 
-        # Формируем список листов для сообщения
         sheet_list = []
         for district_name in DISTRICTS_UNIVERSITIES:
             count = sum(
@@ -809,38 +794,15 @@ def export_to_table(admin_id):
 
     except Exception as e:
         print(f"Ошибка загрузки .xlsx в ВК: {e}")
-        try:
-            out = io.StringIO()
-            writer = csv.DictWriter(out, fieldnames=cols)
-            writer.writeheader()
-            for r in rows:
-                writer.writerow(dict(r))
-            csv_text = out.getvalue()
-            out.close()
-
-            if len(csv_text) > 4000:
-                chunks = []
-                lines = csv_text.split("\n")
-                current = ""
-                for line in lines:
-                    if len(current) + len(line) + 1 > 4000:
-                        chunks.append(current)
-                        current = line + "\n"
-                    else:
-                        current += line + "\n"
-                if current:
-                    chunks.append(current)
-
-                for i, chunk in enumerate(chunks):
-                    header = f"📊 Выгрузка анкет (часть {i+1}/{len(chunks)}):\n\n"
-                    send_message(admin_id, header + chunk)
-            else:
-                send_message(admin_id, "📊 Выгрузка анкет (CSV, откроется в Excel):\n\n" + csv_text)
-        except Exception as e2:
-            send_message(admin_id, f"Не удалось выгрузить данные: {e2}")
+        send_message(admin_id,
+            f"❌ Не удалось отправить Excel: {e}\n\n"
+            "Проверьте права токена: нужны «Документы», «Сообщения сообщества», «Управление сообществом»."
+        )
     finally:
-        if os.path.exists(fname):
+        try:
             os.remove(fname)
+        except Exception:
+            pass
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
@@ -848,7 +810,6 @@ def handle_message(event):
     user_id = event.user_id
     text = event.text.strip()
 
-    # --- Команды ---
     if text.lower() in ["/export", "/выгрузить"]:
         if user_id in ADMIN_IDS:
             export_to_table(user_id)
@@ -861,16 +822,13 @@ def handle_message(event):
         send_message(user_id, "Анкета сброшена. Нажмите «Начать анкету».", kb_start())
         return
 
-    # Кнопка «Пройти заново»
     if text == "🔄 Пройти заново":
         set_progress(user_id, 0, 0, 0)
         send_message(user_id, MESSAGES["welcome"], kb_start())
         return
 
-    # --- Получаем прогресс ---
     step_index, uni_page, started = get_progress(user_id)
 
-    # Анкета не начата
     if started == 0:
         if text == "Начать анкету":
             set_progress(user_id, 0, 0, 1)
@@ -879,15 +837,12 @@ def handle_message(event):
             send_message(user_id, MESSAGES["welcome"], kb_start())
         return
 
-    # Анкета уже завершена
     if started == 2 or step_index >= len(STEPS):
         send_message(user_id, MESSAGES["already_finished"], kb_restart())
         return
 
-    # --- Определяем текущий шаг ---
     step_key = STEPS[step_index]
 
-    # --- Выбор вуза ---
     if step_key == "institution":
         if text.lower() in ["далее", ">", "следующий"]:
             max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
@@ -918,7 +873,6 @@ def handle_message(event):
         ask_university_page(user_id, uni_page)
         return
 
-    # --- Контакты ---
     if step_key == "contacts":
         ok, value = validate_contact(text)
         if ok:
@@ -928,11 +882,9 @@ def handle_message(event):
             send_message(user_id, MESSAGES["invalid_contact"])
         return
 
-    # --- Вопросы с вариантами (включая согласие) ---
     if step_key in OPTIONS:
         opts = OPTIONS[step_key]
 
-        # ОСОБАЯ ЛОГИКА ДЛЯ СОГЛАСИЯ
         if step_key == "consent":
             n = parse_single_number(text, len(opts))
             if n is None:
@@ -951,7 +903,6 @@ def handle_message(event):
             advance_step(user_id, step_index)
             return
 
-        # Множественный выбор
         if step_key in MULTI_STEPS:
             nums = parse_multi_numbers(text, len(opts))
             if nums is None:
@@ -960,7 +911,6 @@ def handle_message(event):
             label = "; ".join(opts[n - 1] for n in nums)
             save_answer(user_id, STEP_TO_DB[step_key], label)
         else:
-            # Одиночный выбор
             n = parse_single_number(text, len(opts))
             if n is None:
                 send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
@@ -970,7 +920,6 @@ def handle_message(event):
         advance_step(user_id, step_index)
         return
 
-    # --- Свободный ввод ---
     if step_key not in ["post_plans", "help_needed"]:
         if len(text) < 2:
             send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
@@ -978,7 +927,6 @@ def handle_message(event):
 
     save_answer(user_id, STEP_TO_DB[step_key], text)
     advance_step(user_id, step_index)
-
 
 # ----------------- ЗАПУСК -----------------
 

@@ -667,149 +667,89 @@ def export_to_table(admin_id):
         adjusted_width = min(max_length + 2, 50)
         ws1.column_dimensions[column_letter].width = adjusted_width
 
-    # ===== ЛИСТЫ ПО РАЙОНАМ =====
+    # ===== ЛИСТЫ ПО РАЙОНАМ (только ФИО, вуз, контакты, баллы) =====
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
-    for district, _ in DISTRICTS_UNIVERSITIES.items():
-        ws = wb.create_sheet(title=district)
+    # Заголовки для районных листов
+    district_headers = [
+        "ФИО",
+        "Учебное заведение",
+        "Контакты",
+        "Статус занятости",
+        "Целевой договор",
+        "Опыт работы",
+        "Оценка практик",
+        "Мероприятия",
+        "Резюме",
+        "Собеседование",
+        "Особый статус",
+        "Военный призыв",
+        "Сумма баллов",
+    ]
+
+    # Ключи баллов (в том же порядке, что и заголовки 4-12)
+    score_keys = [
+        "employment", "target_contract", "experience",
+        "practice_eval", "events", "resume",
+        "interview", "special_status", "military",
+    ]
+
+    def write_score_sheet(workbook, sheet_name, sheet_rows):
+        """Создаёт лист с балльной оценкой: ФИО, вуз, контакты, баллы, сумма."""
+        ws = workbook.create_sheet(title=sheet_name)
 
         # Заголовки
-        header_row = [
-            "ФИО", "Учебное заведение", "Контакты",
-            "Статус занятости", "Целевой договор", "Опыт работы",
-            "Оценка практик", "Участие в мероприятиях", "Резюме",
-            "Тренинги по собеседованию", "Особый статус", "Призыв",
-            "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
-            "Нужная помощь",
-            # Баллы по категориям
-            "employment", "target_contract", "experience",
-            "practice_eval", "events", "resume", "interview",
-            "special_status", "military", "total_score"
-        ]
-
-        for idx, h in enumerate(header_row, start=1):
-            cell = ws.cell(row=1, column=idx, value=h)
+        for col_idx, h in enumerate(district_headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
+        # Данные
         row_idx = 2
-        for r in rows:
-            inst = r.get("institution")
-            if inst not in INSTITUTION_TO_DISTRICT:
-                continue
-            if INSTITUTION_TO_DISTRICT[inst] != district:
-                continue
+        for r in sheet_rows:
+            scores, total = calculate_scores(dict(r))
 
-            scores, total = calculate_scores(r)
+            ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
+            ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
+            ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
 
-            ws.cell(row=row_idx, column=1, value=r.get("fio"))
-            ws.cell(row=row_idx, column=2, value=inst)
-            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
-            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
-            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
-            ws.cell(row=row_idx, column=6, value=r.get("experience"))
-            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
-            ws.cell(row=row_idx, column=8, value=r.get("events"))
-            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
-            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
-            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
-            ws.cell(row=row_idx, column=12, value=r.get("military"))
-            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
-            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
-            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
-            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+            for i, key in enumerate(score_keys, start=4):
+                val = scores.get(key)
+                ws.cell(row=row_idx, column=i, value=val if val is not None else "")
 
-            # Баллы
-            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
-            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
-            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
-            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
-            ws.cell(row=row_idx, column=21, value=scores.get("events"))
-            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
-            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
-            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
-            ws.cell(row=row_idx, column=25, value=scores.get("military"))
-            total_cell = ws.cell(row=row_idx, column=26, value=total)
+            total_cell = ws.cell(row=row_idx, column=13, value=total)
             total_cell.font = bold_font
             total_cell.fill = total_fill
 
             row_idx += 1
 
-        # Автоширина для районного листа
-        for col_idx in range(1, len(header_row) + 1):
+        # Автоширина
+        for col_idx in range(1, len(district_headers) + 1):
             col_letter = ws.cell(row=1, column=col_idx).column_letter
-            max_len = len(header_row[col_idx - 1])
+            max_len = len(district_headers[col_idx - 1])
             for r_idx in range(2, row_idx):
                 val = ws.cell(row=r_idx, column=col_idx).value
                 if val is not None:
                     max_len = max(max_len, len(str(val)))
             ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
 
-    # ===== ЛИСТ "Прочие" (если есть студенты с нераспознанным вузом) =====
+    # Создаём листы по районам (только если там есть студенты)
+    for district_name in DISTRICTS_UNIVERSITIES:
+        district_rows = [
+            r for r in rows
+            if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
+        ]
+        if district_rows:
+            write_score_sheet(wb, district_name, district_rows)
+
+    # Студенты, чей вуз не попал в маппинг
     other_rows = [
         r for r in rows
         if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
     ]
     if other_rows:
-        ws = wb.create_sheet(title="Прочие")
-        header_row = [
-            "ФИО", "Учебное заведение", "Контакты",
-            "Статус занятости", "Целевой договор", "Опыт работы",
-            "Оценка практик", "Участие в мероприятиях", "Резюме",
-            "Тренинги по собеседованию", "Особый статус", "Призыв",
-            "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
-            "Нужная помощь",
-            "employment", "target_contract", "experience",
-            "practice_eval", "events", "resume", "interview",
-            "special_status", "military", "total_score"
-        ]
-        for idx, h in enumerate(header_row, start=1):
-            cell = ws.cell(row=1, column=idx, value=h)
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
-
-        row_idx = 2
-        for r in other_rows:
-            scores, total = calculate_scores(r)
-            ws.cell(row=row_idx, column=1, value=r.get("fio"))
-            ws.cell(row=row_idx, column=2, value=r.get("institution"))
-            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
-            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
-            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
-            ws.cell(row=row_idx, column=6, value=r.get("experience"))
-            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
-            ws.cell(row=row_idx, column=8, value=r.get("events"))
-            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
-            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
-            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
-            ws.cell(row=row_idx, column=12, value=r.get("military"))
-            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
-            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
-            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
-            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
-            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
-            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
-            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
-            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
-            ws.cell(row=row_idx, column=21, value=scores.get("events"))
-            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
-            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
-            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
-            ws.cell(row=row_idx, column=25, value=scores.get("military"))
-            total_cell = ws.cell(row=row_idx, column=26, value=total)
-            total_cell.font = bold_font
-            total_cell.fill = total_fill
-            row_idx += 1
-
-        for col_idx in range(1, len(header_row) + 1):
-            col_letter = ws.cell(row=1, column=col_idx).column_letter
-            max_len = len(header_row[col_idx - 1])
-            for r_idx in range(2, row_idx):
-                val = ws.cell(row=r_idx, column=col_idx).value
-                if val is not None:
-                    max_len = max(max_len, len(str(val)))
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+        write_score_sheet(wb, "Прочие", other_rows)
 
     # ===== Сохранение =====
     fname = "survey_export.xlsx"
@@ -819,11 +759,9 @@ def export_to_table(admin_id):
     import requests
 
     try:
-        # 1. Получаем адрес загрузки
         upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
 
-        # 2. Загружаем файл POST-запросом
         with open(fname, "rb") as f:
             resp = requests.post(
                 upload_url,
@@ -838,7 +776,6 @@ def export_to_table(admin_id):
 
         file_data = result["file"]
 
-        # 3. Сохраняем документ
         saved = vk.docs.save(file=file_data, title="Выгрузка анкет")
 
         if isinstance(saved, dict) and "doc" in saved:
@@ -850,7 +787,7 @@ def export_to_table(admin_id):
 
         attachment = f"doc{d['owner_id']}_{d['id']}"
 
-        # 4. Формируем список листов для сообщения
+        # Формируем список листов для сообщения
         sheet_list = []
         for district_name in DISTRICTS_UNIVERSITIES:
             count = sum(
@@ -866,7 +803,7 @@ def export_to_table(admin_id):
         send_message(admin_id,
             "📊 Вот выгрузка анкет:\n\n"
             "• Лист «Анкеты» — полные ответы всех анкет\n"
-            "• Листы по районам — балльная оценка + контакты + сумма баллов:\n\n"
+            "• Листы по районам — ФИО, учебное заведение, контакты, баллы и сумма:\n\n"
             f"{sheets_text}",
             attachment=attachment)
 

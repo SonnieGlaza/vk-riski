@@ -702,7 +702,7 @@ def export_to_table(admin_id):
             ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
             ws.cell(row=row_idx, column=8, value=r.get("events"))
             ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
-            ws.cell(row_row_idx, column=10, value=r.get("interview_training"))
+            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
             ws.cell(row=row_idx, column=11, value=r.get("special_status"))
             ws.cell(row=row_idx, column=12, value=r.get("military"))
             ws.cell(row=row_idx, column=13, value=r.get("maternity"))

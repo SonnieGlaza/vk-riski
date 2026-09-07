@@ -500,32 +500,89 @@ def export_to_table(admin_id):
         return
 
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
+    from openpyxl.styles import Font, Alignment, PatternFill
 
     wb = Workbook()
-    ws = wb.active
-    ws.title = "Анкеты"
+
+    # ===== ЛИСТ 1: "Анкеты" — то, что было раньше =====
+    ws1 = wb.active
+    ws1.title = "Анкеты"
 
     cols = list(rows[0].keys())
-
     header_font = Font(bold=True)
+
     for col_idx, col_name in enumerate(cols, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
+        cell = ws1.cell(row=1, column=col_idx,
+                        value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
 
     for row_idx, r in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(cols, start=1):
             val = r[col_name]
-            ws.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+            ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
     for col_idx, col_name in enumerate(cols, start=1):
         display_name = EXPORT_HEADERS.get(col_name, col_name)
-        max_len = max(len(str(display_name)), max(
-            (len(str(r[col_name])) if r[col_name] else 0) for r in rows
-        ))
-        ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
+        max_len = max(len(str(display_name)),
+                      max((len(str(r[col_name])) if r[col_name] else 0) for r in rows))
+        ws1.column_dimensions[ws1.cell(row=1, column=col_idx).column_letter].width = min(max_len + 2, 50)
 
+    # ===== ЛИСТ 2: "Баллы" — скоринг + контакты + сумма =====
+    ws2 = wb.create_sheet("Баллы")
+
+    score_headers = [
+        "ФИО",
+        "Контакты",
+        "Статус занятости",
+        "Целевой договор",
+        "Опыт работы",
+        "Оценка практик",
+        "Мероприятия",
+        "Резюме",
+        "Собеседование",
+        "Особый статус",
+        "Военный призыв",
+        "Сумма баллов",
+    ]
+
+    bold_font = Font(bold=True)
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    for col_idx, h in enumerate(score_headers, start=1):
+        cell = ws2.cell(row=1, column=col_idx, value=h)
+        cell.font = bold_font
+        cell.alignment = Alignment(horizontal="center")
+
+    for row_idx, r in enumerate(rows, start=2):
+        scores, total = calculate_scores(dict(r))
+
+        ws2.cell(row=row_idx, column=1, value=r.get("fio") or "")
+        ws2.cell(row=row_idx, column=2, value=r.get("contacts") or "")
+
+        score_keys = ["employment", "target_contract", "experience",
+                      "practice_eval", "events", "resume",
+                      "interview", "special_status", "military"]
+
+        for i, key in enumerate(score_keys, start=3):
+            val = scores.get(key)
+            ws2.cell(row=row_idx, column=i, value=val if val is not None else "")
+
+        total_cell = ws2.cell(row=row_idx, column=12, value=total)
+        total_cell.font = bold_font
+        total_cell.fill = total_fill
+
+    # Автоширина для второго листа
+    for col_idx in range(1, len(score_headers) + 1):
+        col_letter = ws2.cell(row=1, column=col_idx).column_letter
+        max_len = len(score_headers[col_idx - 1])
+        for row_idx in range(2, len(rows) + 2):
+            val = ws2.cell(row=row_idx, column=col_idx).value
+            if val is not None:
+                max_len = max(max_len, len(str(val)))
+        ws2.column_dimensions[col_letter].width = min(max_len + 2, 35)
+
+    # ===== Сохранение и отправка =====
     fname = "survey_export.xlsx"
     wb.save(fname)
 
@@ -566,7 +623,11 @@ def export_to_table(admin_id):
             raise Exception(f"Неожиданный ответ docs.save: {doc}")
 
         att = f"doc{d['owner_id']}_{d['id']}"
-        send_message(admin_id, "📊 Вот выгрузка анкет в Excel:", attachment=att)
+        send_message(admin_id,
+            "📊 Вот выгрузка анкет:\n\n"
+            "• Лист «Анкеты» — полные ответы анкеты\n"
+            "• Лист «Баллы» — балльная оценка + контакты + сумма баллов",
+            attachment=att)
 
     except Exception as e:
         print(f"Ошибка загрузки .xlsx в ВК: {e}")
@@ -602,6 +663,87 @@ def export_to_table(admin_id):
     finally:
         if os.path.exists(fname):
             os.remove(fname)
+
+# ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
+
+def calculate_scores(row):
+    """
+    Преобразует текстовые ответы анкеты в числовые баллы
+    по той же логике, что в скрипте ТаблицаA → ТаблицаB.
+    Возвращает словарь баллов и общую сумму.
+    """
+    scores = {}
+
+    # Статус занятости → 0 / 2 / 3
+    emp = (row.get("employment_status") or "").lower()
+    if "трудовому договору" in emp:
+        scores["employment"] = 0
+    elif any(k in emp for k in ["гражданско-правовому", "самозанят", "стажировк", "временно"]):
+        scores["employment"] = 2
+    elif "ничего из вышеперечисленного" in emp:
+        scores["employment"] = 3
+
+    # Целевой договор → 0 / 2
+    tc = (row.get("target_contract") or "").lower()
+    if "да" in tc and "нет" not in tc:
+        scores["target_contract"] = 0
+    elif "нет" in tc:
+        scores["target_contract"] = 2
+
+    # Опыт работы → 0 / 1 / 2
+    exp = (row.get("experience") or "").lower()
+    if "да, есть опыт" in exp:
+        scores["experience"] = 0
+    elif "вне специальности" in exp:
+        scores["experience"] = 1
+    elif "нет, опыта" in exp:
+        scores["experience"] = 2
+
+    # Оценка практик → 0 / 1
+    pe = (row.get("practice_eval") or "").lower()
+    if "не доволен" in pe or "недоволен" in pe:
+        scores["practice_eval"] = 1
+    elif "доволен" in pe:
+        scores["practice_eval"] = 0
+
+    # Участие в мероприятиях → 0 / 1
+    ev = (row.get("events") or "").lower()
+    if "за последний год" in ev:
+        scores["events"] = 0
+    elif "более года назад" in ev or "ни разу" in ev:
+        scores["events"] = 1
+
+    # Наличие резюме → 1 / 0
+    rs = (row.get("resume_status") or "").lower()
+    if "актуальное" in rs:
+        scores["resume"] = 1
+    elif "устарело" in rs or "не составлял" in rs:
+        scores["resume"] = 0
+
+    # Тренинги по собеседованию → 1 / 0
+    it = (row.get("interview_training") or "").lower()
+    if "да" in it and "не проходил" not in it:
+        scores["interview"] = 1
+    elif "не проходил" in it:
+        scores["interview"] = 0
+
+    # Особый статус → 1 / 0
+    ss = (row.get("special_status") or "").lower()
+    if "ничего из вышеперечисленного" in ss:
+        scores["special_status"] = 0
+    elif ss:
+        scores["special_status"] = 1
+
+    # Военный призыв → 1 / 0
+    mil = (row.get("military") or "").lower()
+    if "да, планируется" in mil:
+        scores["military"] = 1
+    elif "нет" in mil or "не подлежу" in mil:
+        scores["military"] = 0
+
+    total = sum(v for v in scores.values())
+    return scores, total
+
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 

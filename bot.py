@@ -533,6 +533,7 @@ def export_to_table(admin_id):
 
     score_headers = [
         "ФИО",
+        "Учебное заведение",
         "Контакты",
         "Статус занятости",
         "Целевой договор",
@@ -546,6 +547,7 @@ def export_to_table(admin_id):
         "Сумма баллов",
     ]
 
+
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
@@ -558,19 +560,21 @@ def export_to_table(admin_id):
         scores, total = calculate_scores(dict(r))
 
         ws2.cell(row=row_idx, column=1, value=r.get("fio") or "")
-        ws2.cell(row=row_idx, column=2, value=r.get("contacts") or "")
+        ws2.cell(row=row_idx, column=2, value=r.get("institution") or "")
+        ws2.cell(row=row_idx, column=3, value=r.get("contacts") or "")
 
         score_keys = ["employment", "target_contract", "experience",
                       "practice_eval", "events", "resume",
                       "interview", "special_status", "military"]
 
-        for i, key in enumerate(score_keys, start=3):
+        for i, key in enumerate(score_keys, start=4):
             val = scores.get(key)
             ws2.cell(row=row_idx, column=i, value=val if val is not None else "")
 
-        total_cell = ws2.cell(row=row_idx, column=12, value=total)
+        total_cell = ws2.cell(row=row_idx, column=13, value=total)
         total_cell.font = bold_font
         total_cell.fill = total_fill
+
 
     # Автоширина для второго листа
     for col_idx in range(1, len(score_headers) + 1):

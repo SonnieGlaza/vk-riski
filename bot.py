@@ -743,17 +743,15 @@ def export_to_table(admin_id):
         upload_server = vk.docs.getMessagesUploadServer(type="doc", peer_id=admin_id)
         upload_url = upload_server["upload_url"]
 
-        import urllib.request
+        import requests
 
-        boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW"
         with open(fname, "rb") as f:
-            file_data = f.read()
-
-        body = (
-            f"--{boundary}\r\n"
-            f'Content-Disposition: form-data; name="file"; filename="survey_export.xlsx"\r\n'
-            f"Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet\r\n\r\n"
-        ).encode("utf-8") + file_data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+            resp = requests.post(
+                upload_url,
+                files={"file": ("survey_export.xlsx", f,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+            )
+        result = resp.json()
 
         req = urllib.request.Request(
             upload_url,

@@ -11,12 +11,8 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # --- РЕГЕКСЫ (скомпилированы один раз) ---
-try:
-    PHONE_PATTERN = re.compile(r'^\+?[78]?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
-    EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
-except re.error as e:
-    print("ОШИБКА В REGEX:", e)
-    raise
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):

@@ -11,7 +11,7 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 # --- РЕГЕКСЫ (скомпилированы один раз) ---
-PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
@@ -633,7 +633,7 @@ def export_to_table(admin_id):
         return
 
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment
+    from openpyxl.styles import Font, Alignment, PatternFill
 
     wb = Workbook()
 
@@ -654,7 +654,7 @@ def export_to_table(admin_id):
             val = r[col_name]
             ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
-    # Автоширина колонок (простая эвристика)
+    # Автоширина колонок для листа "Анкеты"
     for col in ws1.columns:
         max_length = 0
         column_letter = col[0].column_letter
@@ -668,74 +668,154 @@ def export_to_table(admin_id):
         ws1.column_dimensions[column_letter].width = adjusted_width
 
     # ===== ЛИСТЫ ПО РАЙОНАМ =====
-        # ===== ЛИСТЫ ПО РАЙОНАМ =====
-        for district, _ in DISTRICTS_UNIVERSITIES.items():
-            ws = wb.create_sheet(title=district)
+    bold_font = Font(bold=True)
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
-            # Заголовки (вставляем прямо здесь, без score_headers)
-            header_row = [
-                "ФИО", "Учебное заведение", "Контакты",
-                "Статус занятости", "Целевой договор", "Опыт работы",
-                "Оценка практик", "Участие в мероприятиях", "Резюме",
-                "Тренинги по собеседованию", "Особый статус", "Призыв",
-                "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
-                "Нужная помощь",
-                # Баллы по категориям
-                "employment", "target_contract", "experience",
-                "practice_eval", "events", "resume", "interview",
-                "special_status", "military", "total_score"
-            ]
+    for district, _ in DISTRICTS_UNIVERSITIES.items():
+        ws = wb.create_sheet(title=district)
 
-            for idx, h in enumerate(header_row, start=1):
-                cell = ws.cell(row=1, column=idx, value=h)
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center")
+        # Заголовки
+        header_row = [
+            "ФИО", "Учебное заведение", "Контакты",
+            "Статус занятости", "Целевой договор", "Опыт работы",
+            "Оценка практик", "Участие в мероприятиях", "Резюме",
+            "Тренинги по собеседованию", "Особый статус", "Призыв",
+            "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
+            "Нужная помощь",
+            # Баллы по категориям
+            "employment", "target_contract", "experience",
+            "practice_eval", "events", "resume", "interview",
+            "special_status", "military", "total_score"
+        ]
 
-            row_idx = 2
-            for r in rows:
-                inst = r.get("institution")
-                if inst not in INSTITUTION_TO_DISTRICT:
-                    continue
-                if INSTITUTION_TO_DISTRICT[inst] != district:
-                    continue
+        for idx, h in enumerate(header_row, start=1):
+            cell = ws.cell(row=1, column=idx, value=h)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
 
-                scores, total = calculate_scores(r)
+        row_idx = 2
+        for r in rows:
+            inst = r.get("institution")
+            if inst not in INSTITUTION_TO_DISTRICT:
+                continue
+            if INSTITUTION_TO_DISTRICT[inst] != district:
+                continue
 
-                ws.cell(row=row_idx, column=1, value=r.get("fio"))
-                ws.cell(row=row_idx, column=2, value=inst)
-                ws.cell(row=row_idx, column=3, value=r.get("contacts"))
-                ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
-                ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
-                ws.cell(row=row_idx, column=6, value=r.get("experience"))
-                ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
-                ws.cell(row=row_idx, column=8, value=r.get("events"))
-                ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
-                ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
-                ws.cell(row=row_idx, column=11, value=r.get("special_status"))
-                ws.cell(row=row_idx, column=12, value=r.get("military"))
-                ws.cell(row=row_idx, column=13, value=r.get("maternity"))
-                ws.cell(row=row_idx, column=14, value=r.get("graduate"))
-                ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
-                ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+            scores, total = calculate_scores(r)
 
-                # Баллы
-                ws.cell(row=row_idx, column=17, value=scores.get("employment"))
-                ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
-                ws.cell(row=row_idx, column=19, value=scores.get("experience"))
-                ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
-                ws.cell(row=row_idx, column=21, value=scores.get("events"))
-                ws.cell(row=row_idx, column=22, value=scores.get("resume"))
-                ws.cell(row=row_idx, column=23, value=scores.get("interview"))
-                ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
-                ws.cell(row=row_idx, column=25, value=scores.get("military"))
-                ws.cell(row=row_idx, column=26, value=total)
+            ws.cell(row=row_idx, column=1, value=r.get("fio"))
+            ws.cell(row=row_idx, column=2, value=inst)
+            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
+            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
+            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
+            ws.cell(row=row_idx, column=6, value=r.get("experience"))
+            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
+            ws.cell(row=row_idx, column=8, value=r.get("events"))
+            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
+            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
+            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
+            ws.cell(row=row_idx, column=12, value=r.get("military"))
+            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
+            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
+            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
+            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
 
-                row_idx += 1
+            # Баллы
+            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
+            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
+            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
+            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
+            ws.cell(row=row_idx, column=21, value=scores.get("events"))
+            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
+            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
+            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
+            ws.cell(row=row_idx, column=25, value=scores.get("military"))
+            total_cell = ws.cell(row=row_idx, column=26, value=total)
+            total_cell.font = bold_font
+            total_cell.fill = total_fill
 
+            row_idx += 1
+
+        # Автоширина для районного листа
+        for col_idx in range(1, len(header_row) + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_len = len(header_row[col_idx - 1])
+            for r_idx in range(2, row_idx):
+                val = ws.cell(row=r_idx, column=col_idx).value
+                if val is not None:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+    # ===== ЛИСТ "Прочие" (если есть студенты с нераспознанным вузом) =====
+    other_rows = [
+        r for r in rows
+        if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
+    ]
+    if other_rows:
+        ws = wb.create_sheet(title="Прочие")
+        header_row = [
+            "ФИО", "Учебное заведение", "Контакты",
+            "Статус занятости", "Целевой договор", "Опыт работы",
+            "Оценка практик", "Участие в мероприятиях", "Резюме",
+            "Тренинги по собеседованию", "Особый статус", "Призыв",
+            "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
+            "Нужная помощь",
+            "employment", "target_contract", "experience",
+            "practice_eval", "events", "resume", "interview",
+            "special_status", "military", "total_score"
+        ]
+        for idx, h in enumerate(header_row, start=1):
+            cell = ws.cell(row=1, column=idx, value=h)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        row_idx = 2
+        for r in other_rows:
+            scores, total = calculate_scores(r)
+            ws.cell(row=row_idx, column=1, value=r.get("fio"))
+            ws.cell(row=row_idx, column=2, value=r.get("institution"))
+            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
+            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
+            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
+            ws.cell(row=row_idx, column=6, value=r.get("experience"))
+            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
+            ws.cell(row=row_idx, column=8, value=r.get("events"))
+            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
+            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
+            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
+            ws.cell(row=row_idx, column=12, value=r.get("military"))
+            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
+            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
+            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
+            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
+            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
+            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
+            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
+            ws.cell(row=row_idx, column=21, value=scores.get("events"))
+            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
+            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
+            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
+            ws.cell(row=row_idx, column=25, value=scores.get("military"))
+            total_cell = ws.cell(row=row_idx, column=26, value=total)
+            total_cell.font = bold_font
+            total_cell.fill = total_fill
+            row_idx += 1
+
+        for col_idx in range(1, len(header_row) + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_len = len(header_row[col_idx - 1])
+            for r_idx in range(2, row_idx):
+                val = ws.cell(row=r_idx, column=col_idx).value
+                if val is not None:
+                    max_len = max(max_len, len(str(val)))
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
+
+    # ===== Сохранение =====
     fname = "survey_export.xlsx"
     wb.save(fname)
 
-    # ===== ЗАГРУЗКА В VK (через requests, без urllib) =====
+    # ===== ЗАГРУЗКА В VK =====
     import requests
 
     try:
@@ -747,12 +827,14 @@ def export_to_table(admin_id):
         with open(fname, "rb") as f:
             resp = requests.post(
                 upload_url,
-                files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+                files={"file": ("survey_export.xlsx", f,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
             )
+        resp.raise_for_status()
         result = resp.json()
 
         if "file" not in result:
-            raise RuntimeError("VK не вернул файл в ответе загрузки")
+            raise RuntimeError(f"VK не вернул поле 'file'. Ответ сервера: {result}")
 
         file_data = result["file"]
 
@@ -761,14 +843,14 @@ def export_to_table(admin_id):
 
         if isinstance(saved, dict) and "doc" in saved:
             d = saved["doc"]
-        elif isinstance(saved, dict) and "docs" in saved:
+        elif isinstance(saved, dict) and "docs" in saved and len(saved["docs"]) > 0:
             d = saved["docs"][0]
         else:
-            raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
+            raise RuntimeError(f"Неожиданный формат ответа docs.save: {saved}")
 
         attachment = f"doc{d['owner_id']}_{d['id']}"
 
-        # Формируем список листов для сообщения
+        # 4. Формируем список листов для сообщения
         sheet_list = []
         for district_name in DISTRICTS_UNIVERSITIES:
             count = sum(
@@ -777,12 +859,8 @@ def export_to_table(admin_id):
             )
             if count:
                 sheet_list.append(f"  • «{district_name}» — {count} чел.")
-        other_count = sum(
-            1 for r in rows
-            if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
-        )
-        if other_count:
-            sheet_list.append(f"  • «Прочие» — {other_count} чел.")
+        if other_rows:
+            sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
         sheets_text = "\n".join(sheet_list) if sheet_list else ""
 
         send_message(admin_id,
@@ -791,126 +869,6 @@ def export_to_table(admin_id):
             "• Листы по районам — балльная оценка + контакты + сумма баллов:\n\n"
             f"{sheets_text}",
             attachment=attachment)
-
-    except Exception as e:
-        print("Ошибка при загрузке файла в VK:", e)
-        send_message(admin_id, f"❌ Ошибка при формировании или отправке выгрузки: {e}")
-
-    finally:
-        # Удаляем временный файл
-        import os
-        if os.path.exists(fname):
-            os.remove(fname)
-
-    def write_district_sheet(workbook, district_name, district_rows):
-        """Создаёт лист с балльной оценкой для одного района."""
-        ws = workbook.create_sheet(district_name)
-
-        for col_idx, h in enumerate(score_headers, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=h)
-            cell.font = bold_font
-            cell.alignment = Alignment(horizontal="center")
-
-        for row_idx, r in enumerate(district_rows, start=2):
-            scores, total = calculate_scores(dict(r))
-
-            ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
-            ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
-            ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
-
-            for i, key in enumerate(score_keys, start=4):
-                val = scores.get(key)
-                ws.cell(row=row_idx, column=i, value=val if val is not None else "")
-
-            total_cell = ws.cell(row=row_idx, column=13, value=total)
-            total_cell.font = bold_font
-            total_cell.fill = total_fill
-
-        for col_idx in range(1, len(score_headers) + 1):
-            col_letter = ws.cell(row=1, column=col_idx).column_letter
-            max_len = len(score_headers[col_idx - 1])
-            for row_idx in range(2, len(district_rows) + 2):
-                val = ws.cell(row=row_idx, column=col_idx).value
-                if val is not None:
-                    max_len = max(max_len, len(str(val)))
-            ws.column_dimensions[col_letter].width = min(max_len + 2, 50)
-
-    # Создаём листы по районам
-    for district_name in DISTRICTS_UNIVERSITIES:
-        district_rows = [
-            r for r in rows
-            if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
-        ]
-        if district_rows:
-            write_district_sheet(wb, district_name, district_rows)
-
-    # Студенты, чей вуз не попал в маппинг
-    other_rows = [
-        r for r in rows
-        if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
-    ]
-    if other_rows:
-        write_district_sheet(wb, "Прочие", other_rows)
-
-    # ===== Сохранение и отправка =====
-    fname = "survey_export.xlsx"
-    wb.save(fname)
-
-    try:
-        upload_server = vk.docs.getMessagesUploadServer(type="doc", peer_id=admin_id)
-        upload_url = upload_server["upload_url"]
-
-        import requests
-
-        with open(fname, "rb") as f:
-            resp = requests.post(
-                upload_url,
-                files={"file": ("survey_export.xlsx", f,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
-            )
-        result = resp.json()
-
-        req = urllib.request.Request(
-            upload_url,
-            data=body,
-            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
-        )
-        resp = urllib.request.urlopen(req)
-        result = json.loads(resp.read().decode("utf-8"))
-
-        if "file" not in result or not result["file"]:
-            raise Exception("Сервер ВК не принял файл")
-
-        doc = vk.docs.save(file=result["file"], title="Выгрузка анкет.xlsx")
-
-        if isinstance(doc, dict) and "doc" in doc:
-            d = doc["doc"]
-        elif isinstance(doc, dict) and "docs" in doc:
-            d = doc["docs"][0]
-        else:
-            raise Exception(f"Неожиданный ответ docs.save: {doc}")
-
-        att = f"doc{d['owner_id']}_{d['id']}"
-
-        sheet_list = []
-        for district_name in DISTRICTS_UNIVERSITIES:
-            district_rows = [
-                r for r in rows
-                if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
-            ]
-            if district_rows:
-                sheet_list.append(f"  • «{district_name}» — {len(district_rows)} чел.")
-        if other_rows:
-            sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
-
-        sheets_text = "\n".join(sheet_list) if sheet_list else ""
-
-        send_message(admin_id,
-            "📊 Вот выгрузка анкет:\n\n"
-            "• Лист «Анкеты» — полные ответы всех анкет\n"
-            "• Листы по районам — балльная оценка + контакты + сумма баллов:\n\n"
-            f"{sheets_text}",
-            attachment=att)
 
     except Exception as e:
         print(f"Ошибка загрузки .xlsx в ВК: {e}")

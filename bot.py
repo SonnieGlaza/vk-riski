@@ -750,12 +750,39 @@ def export_to_table(admin_id):
 
         # 3. Сохраняем документ
         saved = vk.docs.save(file=file_data, title="Выгрузка анкет")
-        doc_id = saved["id"]
-        owner_id = saved["owner_id"]
 
-        # 4. Отправляем сообщение с документом
-        attachment = f"doc{owner_id}_{doc_id}"
-        send_message(admin_id, "📄 Выгрузка анкет готова:", attachment=attachment)
+        if isinstance(saved, dict) and "doc" in saved:
+            d = saved["doc"]
+        elif isinstance(saved, dict) and "docs" in saved:
+            d = saved["docs"][0]
+        else:
+            raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
+
+        attachment = f"doc{d['owner_id']}_{d['id']}"
+
+        # Формируем список листов для сообщения
+        sheet_list = []
+        for district_name in DISTRICTS_UNIVERSITIES:
+            count = sum(
+                1 for r in rows
+                if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name
+            )
+            if count:
+                sheet_list.append(f"  • «{district_name}» — {count} чел.")
+        other_count = sum(
+            1 for r in rows
+            if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
+        )
+        if other_count:
+            sheet_list.append(f"  • «Прочие» — {other_count} чел.")
+        sheets_text = "\n".join(sheet_list) if sheet_list else ""
+
+        send_message(admin_id,
+            "📊 Вот выгрузка анкет:\n\n"
+            "• Лист «Анкеты» — полные ответы всех анкет\n"
+            "• Листы по районам — балльная оценка + контакты + сумма баллов:\n\n"
+            f"{sheets_text}",
+            attachment=attachment)
 
     except Exception as e:
         print("Ошибка при загрузке файла в VK:", e)

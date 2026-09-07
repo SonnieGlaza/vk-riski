@@ -668,61 +668,69 @@ def export_to_table(admin_id):
         ws1.column_dimensions[column_letter].width = adjusted_width
 
     # ===== ЛИСТЫ ПО РАЙОНАМ =====
-    for district, unis in DISTRICTS_UNIVERSITIES.items():
-        ws = wb.create_sheet(title=district)
-        # Заголовки
-        header_row = ["ФИО", "Учебное заведение", "Контакты", "Статус занятости", "Целевой договор",
-                      "Опыт работы", "Оценка практик", "Участие в мероприятиях", "Резюме",
-                      "Тренинги по собеседованию", "Особый статус", "Призыв",
-                      "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
-                      "Нужная помощь", "employment", "target_contract", "experience",
-                      "practice_eval", "events", "resume", "interview", "special_status",
-                      "military", "total_score"]
-        for idx, h in enumerate(header_row, start=1):
-            cell = ws.cell(row=1, column=idx, value=h)
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
+        # ===== ЛИСТЫ ПО РАЙОНАМ =====
+        for district, _ in DISTRICTS_UNIVERSITIES.items():
+            ws = wb.create_sheet(title=district)
 
-        row_idx = 2
-        for r in rows:
-            inst = r.get("institution")
-            if inst not in INSTITUTION_TO_DISTRICT:
-                continue
-            if INSTITUTION_TO_DISTRICT[inst] != district:
-                continue
+            # Заголовки (вставляем прямо здесь, без score_headers)
+            header_row = [
+                "ФИО", "Учебное заведение", "Контакты",
+                "Статус занятости", "Целевой договор", "Опыт работы",
+                "Оценка практик", "Участие в мероприятиях", "Резюме",
+                "Тренинги по собеседованию", "Особый статус", "Призыв",
+                "Отпуск по уходу", "Выпускной курс", "Планы после выпуска",
+                "Нужная помощь",
+                # Баллы по категориям
+                "employment", "target_contract", "experience",
+                "practice_eval", "events", "resume", "interview",
+                "special_status", "military", "total_score"
+            ]
 
-            scores, total = calculate_scores(r)
+            for idx, h in enumerate(header_row, start=1):
+                cell = ws.cell(row=1, column=idx, value=h)
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center")
 
-            ws.cell(row=row_idx, column=1, value=r.get("fio"))
-            ws.cell(row=row_idx, column=2, value=inst)
-            ws.cell(row=row_idx, column=3, value=r.get("contacts"))
-            ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
-            ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
-            ws.cell(row=row_idx, column=6, value=r.get("experience"))
-            ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
-            ws.cell(row=row_idx, column=8, value=r.get("events"))
-            ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
-            ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
-            ws.cell(row=row_idx, column=11, value=r.get("special_status"))
-            ws.cell(row=row_idx, column=12, value=r.get("military"))
-            ws.cell(row=row_idx, column=13, value=r.get("maternity"))
-            ws.cell(row=row_idx, column=14, value=r.get("graduate"))
-            ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
-            ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+            row_idx = 2
+            for r in rows:
+                inst = r.get("institution")
+                if inst not in INSTITUTION_TO_DISTRICT:
+                    continue
+                if INSTITUTION_TO_DISTRICT[inst] != district:
+                    continue
 
-            # Баллы
-            ws.cell(row=row_idx, column=17, value=scores.get("employment"))
-            ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
-            ws.cell(row=row_idx, column=19, value=scores.get("experience"))
-            ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
-            ws.cell(row=row_idx, column=21, value=scores.get("events"))
-            ws.cell(row=row_idx, column=22, value=scores.get("resume"))
-            ws.cell(row=row_idx, column=23, value=scores.get("interview"))
-            ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
-            ws.cell(row=row_idx, column=25, value=scores.get("military"))
-            ws.cell(row=row_idx, column=26, value=total)
+                scores, total = calculate_scores(r)
 
-            row_idx += 1
+                ws.cell(row=row_idx, column=1, value=r.get("fio"))
+                ws.cell(row=row_idx, column=2, value=inst)
+                ws.cell(row=row_idx, column=3, value=r.get("contacts"))
+                ws.cell(row=row_idx, column=4, value=r.get("employment_status"))
+                ws.cell(row=row_idx, column=5, value=r.get("target_contract"))
+                ws.cell(row=row_idx, column=6, value=r.get("experience"))
+                ws.cell(row=row_idx, column=7, value=r.get("practice_eval"))
+                ws.cell(row=row_idx, column=8, value=r.get("events"))
+                ws.cell(row=row_idx, column=9, value=r.get("resume_status"))
+                ws.cell(row=row_idx, column=10, value=r.get("interview_training"))
+                ws.cell(row=row_idx, column=11, value=r.get("special_status"))
+                ws.cell(row=row_idx, column=12, value=r.get("military"))
+                ws.cell(row=row_idx, column=13, value=r.get("maternity"))
+                ws.cell(row=row_idx, column=14, value=r.get("graduate"))
+                ws.cell(row=row_idx, column=15, value=r.get("post_plans"))
+                ws.cell(row=row_idx, column=16, value=r.get("help_needed"))
+
+                # Баллы
+                ws.cell(row=row_idx, column=17, value=scores.get("employment"))
+                ws.cell(row=row_idx, column=18, value=scores.get("target_contract"))
+                ws.cell(row=row_idx, column=19, value=scores.get("experience"))
+                ws.cell(row=row_idx, column=20, value=scores.get("practice_eval"))
+                ws.cell(row=row_idx, column=21, value=scores.get("events"))
+                ws.cell(row=row_idx, column=22, value=scores.get("resume"))
+                ws.cell(row=row_idx, column=23, value=scores.get("interview"))
+                ws.cell(row=row_idx, column=24, value=scores.get("special_status"))
+                ws.cell(row=row_idx, column=25, value=scores.get("military"))
+                ws.cell(row=row_idx, column=26, value=total)
+
+                row_idx += 1
 
     fname = "survey_export.xlsx"
     wb.save(fname)

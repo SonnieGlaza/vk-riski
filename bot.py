@@ -983,13 +983,9 @@ def recover_interrupted_users():
         # Проверяем, ответил ли пользователь на текущий шаг
         answered = check_answered(user_id, step_key)
 
-        if answered:
-            # Бот сохранил ответ, но упал до перехода — продвигаем дальше
+                if answered:
             advance_step(user_id, step_index)
         else:
-            # Пользователь не ответил — отправляем вопрос заново
-            send_message(user_id, MESSAGES["recovered"])
-            time.sleep(0.5)
             ask_step(user_id, step_key, uni_page)
 
         recovered += 1

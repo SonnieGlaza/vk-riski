@@ -12,6 +12,7 @@ from psycopg2.extras import RealDictCursor
 # --- РЕГЕКСЫ ---
 PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+NAME_PATTERN = re.compile(r"^[а-яёА-ЯЁa-zA-Z]+(?:['\-][а-яёА-ЯЁa-zA-Z]+)*$")
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
@@ -21,6 +22,93 @@ def format_numbered_list(items, start_from=1, truncate=True):
             item = item[:77] + "…"
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
+
+
+def validate_fio(text):
+    text = text.strip()
+
+    # Защита от случайных нажатий кнопок
+    lower = text.lower()
+    if lower in ("начать анкету", "пройти заново", "🔄 пройти заново", "/restart"):
+        return False, (
+            "Кажется, вы нажали кнопку вместо ответа 🙂\n"
+            "Пожалуйста, укажите Фамилию Имя и Отчество через пробел.\n"
+            "Например: Иванов Иван Иванович\n"
+            "Если отчества нет — поставьте «-» (например: Иванов Иван -)."
+        )
+
+    parts = text.split()
+
+    if len(parts) != 3:
+        return False, (
+            "Нужно указать ровно три слова: Фамилия, Имя, Отчество — через пробел.\n"
+            "Например: Иванов Иван Иванович\n"
+            "Если отчества нет — поставьте «-» (например: Иванов Иван -)."
+        )
+
+    surname, first_name, patronymic = parts
+
+    errors = []
+
+    if not NAME_PATTERN.match(surname) or len(surname) < 2:
+        errors.append("фамилия")
+    if not NAME_PATTERN.match(first_name) or len(first_name) < 2:
+        errors.append("имя")
+    if patronymic != "-" and (not NAME_PATTERN.match(patronymic) or len(patronymic) < 2):
+        errors.append("отчество")
+
+    if errors:
+        hint = (
+            "Проверьте следующие поля: " + ", ".join(errors) + ".\n"
+            "Используйте только буквы (допускается дефис в двойных фамилиях).\n"
+            "Если отчества нет — поставьте «-» (например: Иванов Иван -)."
+        )
+        return False, hint
+
+    # Нормализуем регистр: каждое слово с большой буквы
+    def cap(s):
+        if s == "-":
+            return s
+        return "-".join(p.capitalize() for p in s.split("-"))
+
+    normalized = f"{cap(surname)} {cap(first_name)} {cap(patronymic)}"
+    return True, normalized
+
+
+def validate_contacts(text):
+    text = text.strip()
+
+    # Разбиваем по пробелам, запятым, точкам с запятой, переносам строк
+    parts = re.split(r'[\s,;]+', text)
+
+    phone = None
+    email = None
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if phone is None and PHONE_PATTERN.match(part):
+            digits = re.sub(r'\D', '', part)
+            if len(digits) == 11 and digits.startswith('8'):
+                digits = '7' + digits[1:]
+            elif len(digits) == 10:
+                digits = '7' + digits
+            if len(digits) == 11:
+                phone = '+7' + digits[-10:]
+        elif email is None and EMAIL_PATTERN.match(part):
+            email = part.lower()
+
+    if phone or email:
+        contacts = []
+        if phone:
+            contacts.append(phone)
+        if email:
+            contacts.append(email)
+        return True, "; ".join(contacts)
+
+    return False, None
+
 
 # ================= НАСТРОЙКИ ИЗ ENV =================
 VK_TOKEN = os.getenv("VK_TOKEN")
@@ -251,7 +339,7 @@ QUESTIONS = {
     "study_group": "Укажите номер вашей учебной группы:",
     "course": "Выберите ваш курс обучения:",
     "form_of_study": "Выберите форму обучения:",
-    "contacts": "Укажите контактные данные — телефон или e-mail (например: +79991234567 или student@mail.ru):",
+    "contacts": "Укажите контактные данные — телефон и/или e-mail (например: +79991234567 student@mail.ru). Можно указать оба контакта через пробел или запятую:",
     "employment_status": "Ваш статус занятости прямо сейчас. Выберите один вариант, указав его номер:",
     "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
     "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
@@ -363,10 +451,11 @@ MESSAGES = {
         "Нажмите кнопку «Начать анкету», чтобы приступить."
     ),
     "invalid_contact": (
-        "Не удалось распознать контакт. Пожалуйста, введите:\n\n"
+        "Не удалось распознать контакты. Пожалуйста, введите:\n\n"
         "• Номер телефона в формате +79991234567 или 89991234567\n"
-        "или\n"
-        "• Адрес электронной почты в формате example@mail.ru"
+        "и/или\n"
+        "• Адрес электронной почты в формате example@mail.ru\n\n"
+        "Можно указать оба контакта через пробел или запятую."
     ),
     "invalid_number": "Пожалуйста, введите номер от 1 до {}.",
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
@@ -482,20 +571,6 @@ def advance_step(user_id, step_index):
         ask_step(user_id, STEPS[next_idx])
 
 # ----------------- ПАРСИНГ -----------------
-
-def validate_contact(text):
-    text = text.strip()
-    if PHONE_PATTERN.match(text):
-        digits = re.sub(r'\D', '', text)
-        if len(digits) == 11 and digits.startswith('8'):
-            digits = '7' + digits[1:]
-        elif len(digits) == 10:
-            digits = '7' + digits
-        if len(digits) == 11:
-            return True, '+7' + digits[-10:]
-    if EMAIL_PATTERN.match(text):
-        return True, text.lower()
-    return False, None
 
 def parse_single_number(text, max_val):
     text = text.strip()
@@ -843,6 +918,17 @@ def handle_message(event):
 
     step_key = STEPS[step_index]
 
+    # --- Шаг: ФИО ---
+    if step_key == "fio":
+        ok, value = validate_fio(text)
+        if ok:
+            save_answer(user_id, "fio", value)
+            advance_step(user_id, step_index)
+        else:
+            send_message(user_id, value)
+        return
+
+    # --- Шаг: выбор учебного заведения ---
     if step_key == "institution":
         if text.lower() in ["далее", ">", "следующий"]:
             max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
@@ -873,8 +959,9 @@ def handle_message(event):
         ask_university_page(user_id, uni_page)
         return
 
+    # --- Шаг: контакты (телефон и/или e-mail) ---
     if step_key == "contacts":
-        ok, value = validate_contact(text)
+        ok, value = validate_contacts(text)
         if ok:
             save_answer(user_id, "contacts", value)
             advance_step(user_id, step_index)
@@ -882,6 +969,7 @@ def handle_message(event):
             send_message(user_id, MESSAGES["invalid_contact"])
         return
 
+    # --- Шаги с вариантами ответа ---
     if step_key in OPTIONS:
         opts = OPTIONS[step_key]
 
@@ -920,6 +1008,7 @@ def handle_message(event):
         advance_step(user_id, step_index)
         return
 
+    # --- Свободные текстовые шаги ---
     if step_key not in ["post_plans", "help_needed"]:
         if len(text) < 2:
             send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")

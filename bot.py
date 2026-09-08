@@ -24,7 +24,6 @@ def format_numbered_list(items, start_from=1, truncate=True):
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
 
-
 def validate_fio(text):
     text = text.strip()
 

@@ -24,10 +24,10 @@ def format_numbered_list(items, start_from=1, truncate=True):
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
 
+
 def validate_fio(text):
     text = text.strip()
 
-    # Защита от случайных нажатий кнопок
     lower = text.lower()
     if lower in ("начать анкету", "пройти заново", "🔄 пройти заново", "/restart"):
         return False, (
@@ -65,7 +65,6 @@ def validate_fio(text):
         )
         return False, hint
 
-    # Нормализуем регистр: каждое слово с большой буквы
     def cap(s):
         if s == "-":
             return s
@@ -78,7 +77,6 @@ def validate_fio(text):
 def validate_contacts(text):
     text = text.strip()
 
-    # Разбиваем по пробелам, запятым, точкам с запятой, переносам строк
     parts = re.split(r'[\s,;]+', text)
 
     phone = None
@@ -141,7 +139,8 @@ def init_db():
             maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
         )
     ''')
-    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN DEFAULT FALSE")
+    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
+    c.execute("ALTER TABLE answers ALTER COLUMN consent_status DROP DEFAULT")
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
@@ -161,7 +160,6 @@ def get_progress(user_id):
     row = c.fetchone()
     conn.close()
     if row:
-        # Нормализуем: None -> 0 для всех полей
         step_index = row[0] if row[0] is not None else 0
         uni_page = row[1] if row[1] is not None else 0
         started = row[2] if row[2] is not None else 0
@@ -192,6 +190,28 @@ def save_answer(user_id, field, value):
     c.execute(f'UPDATE answers SET {field}=%s WHERE user_id=%s', (value, user_id))
     conn.commit()
     conn.close()
+
+def check_answered(user_id, step_key):
+    """Проверяет, ответил ли пользователь на текущий шаг."""
+    conn = get_db()
+    c = conn.cursor()
+
+    if step_key == "consent":
+        c.execute("SELECT consent_status FROM answers WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row is not None and row[0] is True
+    elif step_key == "fio":
+        c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row is not None and row[0]
+    else:
+        field = STEP_TO_DB.get(step_key, step_key)
+        c.execute(f"SELECT {field} FROM answers WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+        conn.close()
+        return row is not None and row[0]
 
 # ----------------- ВУЗы -----------------
 UNIVERSITIES = [
@@ -484,7 +504,8 @@ MESSAGES = {
     ),
     "already_finished": (
         "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже."
-    )
+    ),
+    "recovered": "⚠️ Бот был временно недоступен. Давайте продолжим анкету с того места, где остановились!"
 }
 
 # ----------------- КЛАВИАТУРЫ -----------------
@@ -525,7 +546,6 @@ def send_message(user_id, message, keyboard=None, attachment=None):
         print(f"Ошибка отправки: {e}")
 
 def ask_university_page(user_id, page):
-    # Защита от None
     page = page if isinstance(page, int) else 0
 
     start = page * ITEMS_PER_PAGE
@@ -548,7 +568,6 @@ def ask_university_page(user_id, page):
     send_message(user_id, message)
 
 def ask_step(user_id, step_key, uni_page=0):
-    # Защита от None
     uni_page = uni_page if isinstance(uni_page, int) else 0
 
     if step_key == "institution":
@@ -908,20 +927,16 @@ def extract_event_data(event):
     Безопасно извлекает user_id и text из события.
     Работает как с VkLongPoll, так и с VkBotLongPoll.
     """
-    # VkLongPoll: event.text, event.user_id
     if hasattr(event, 'text') and hasattr(event, 'user_id'):
         return event.user_id, event.text.strip()
 
-    # VkBotLongPoll: event.object -> message
     obj = getattr(event, 'object', None)
     if obj is not None:
-        # dict-стиль (старые версии vk_api)
         if isinstance(obj, dict):
             msg = obj.get('message', obj)
             text = msg.get('text', '') or ''
             user_id = msg.get('from_id') or msg.get('user_id') or msg.get('peer_id')
             return user_id, text.strip()
-        # DotDict-стиль (новые версии vk_api)
         if hasattr(obj, 'message'):
             msg = obj.message
         elif hasattr(obj, 'text'):
@@ -937,6 +952,51 @@ def extract_event_data(event):
         return user_id, text.strip()
 
     return None, ''
+
+
+# ----------------- ВОССТАНОВЛЕНИЕ ПРЕРВАННЫХ СЕССИЙ -----------------
+
+def recover_interrupted_users():
+    """
+    Проверяет пользователей, которые начали анкету, но не закончили,
+    и отправляет им текущий вопрос заново при запуске бота.
+    """
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id, step_index, uni_page FROM progress WHERE started=1")
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        print("Прерванных сессий не найдено.")
+        return
+
+    recovered = 0
+    for user_id, step_index, uni_page in rows:
+        step_index = step_index if isinstance(step_index, int) else 0
+        uni_page = uni_page if isinstance(uni_page, int) else 0
+
+        if step_index < 0 or step_index >= len(STEPS):
+            continue
+
+        step_key = STEPS[step_index]
+
+        # Проверяем, ответил ли пользователь на текущий шаг
+        answered = check_answered(user_id, step_key)
+
+        if answered:
+            # Бот сохранил ответ, но упал до перехода — продвигаем дальше
+            advance_step(user_id, step_index)
+        else:
+            # Пользователь не ответил — отправляем вопрос заново
+            send_message(user_id, MESSAGES["recovered"])
+            time.sleep(0.5)
+            ask_step(user_id, step_key, uni_page)
+
+        recovered += 1
+        time.sleep(0.5)  # Чтобы не превысить лимиты VK API
+
+    print(f"Восстановлено прерванных сессий: {recovered}")
 
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
@@ -964,7 +1024,6 @@ def handle_message(user_id, text):
 
     step_index, uni_page, started = get_progress(user_id)
 
-    # Нормализуем: None -> 0 для всех значений
     step_index = step_index if isinstance(step_index, int) else 0
     uni_page = uni_page if isinstance(uni_page, int) else 0
     started = started if isinstance(started, int) else 0
@@ -1086,16 +1145,15 @@ def handle_message(user_id, text):
 
 def main():
     init_db()
+    recover_interrupted_users()
     print("Бот запущен...")
     while True:
         try:
             for event in longpoll.listen():
-                # VkBotLongPoll
                 if event.type == VkBotEventType.MESSAGE_NEW:
                     user_id, text = extract_event_data(event)
                     if user_id and text:
                         handle_message(user_id, text)
-                # VkLongPoll (на случай если переключитесь обратно)
                 elif event.type == VkEventType.MESSAGE_NEW and getattr(event, 'to_me', True):
                     user_id, text = extract_event_data(event)
                     if user_id and text:

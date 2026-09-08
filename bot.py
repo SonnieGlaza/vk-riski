@@ -1,5 +1,6 @@
 import vk_api
 from vk_api.longpoll import VkLongPoll, VkEventType
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.utils import get_random_id
 import re
 import os
@@ -121,7 +122,7 @@ if not VK_TOKEN or not DATABASE_URL:
 # =====================================================
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
-longpoll = VkLongPoll(vk_session)
+longpoll = VkBotLongPoll(vk_session, group_id=GROUP_ID)
 
 # ----------------- БАЗА ДАННЫХ -----------------
 def get_db():
@@ -160,7 +161,13 @@ def get_progress(user_id):
     c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=%s", (user_id,))
     row = c.fetchone()
     conn.close()
-    return (row[0], row[1], row[2]) if row else (0, 0, 0)
+    if row:
+        # Нормализуем: None -> 0 для всех полей
+        step_index = row[0] if row[0] is not None else 0
+        uni_page = row[1] if row[1] is not None else 0
+        started = row[2] if row[2] is not None else 0
+        return step_index, uni_page, started
+    return 0, 0, 0
 
 def set_progress(user_id, step_index, uni_page=0, started=1):
     conn = get_db()
@@ -296,10 +303,10 @@ DISTRICTS_UNIVERSITIES = {
     ],
     "Алнаши": [
         "БПОУ УР «Асановский аграрно-технический техникум»",
-    ],    
+    ],
     "Дебесы": [
         "БПОУ «Дебесский политехникум»",
-    ],    
+    ],
     "Игра": [
         "БПОУР «Игринский политехнический техникум»",
     ],
@@ -519,6 +526,9 @@ def send_message(user_id, message, keyboard=None, attachment=None):
         print(f"Ошибка отправки: {e}")
 
 def ask_university_page(user_id, page):
+    # Защита от None
+    page = page if isinstance(page, int) else 0
+
     start = page * ITEMS_PER_PAGE
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
     items = UNIVERSITIES[start:end]
@@ -539,6 +549,9 @@ def ask_university_page(user_id, page):
     send_message(user_id, message)
 
 def ask_step(user_id, step_key, uni_page=0):
+    # Защита от None
+    uni_page = uni_page if isinstance(uni_page, int) else 0
+
     if step_key == "institution":
         ask_university_page(user_id, uni_page)
 
@@ -889,11 +902,49 @@ def export_to_table(admin_id):
         except Exception:
             pass
 
+# ----------------- ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ СОБЫТИЯ -----------------
+
+def extract_event_data(event):
+    """
+    Безопасно извлекает user_id и text из события.
+    Работает как с VkLongPoll, так и с VkBotLongPoll.
+    """
+    # VkLongPoll: event.text, event.user_id
+    if hasattr(event, 'text') and hasattr(event, 'user_id'):
+        return event.user_id, event.text.strip()
+
+    # VkBotLongPoll: event.object -> message
+    obj = getattr(event, 'object', None)
+    if obj is not None:
+        # dict-стиль (старые версии vk_api)
+        if isinstance(obj, dict):
+            msg = obj.get('message', obj)
+            text = msg.get('text', '') or ''
+            user_id = msg.get('from_id') or msg.get('user_id') or msg.get('peer_id')
+            return user_id, text.strip()
+        # DotDict-стиль (новые версии vk_api)
+        if hasattr(obj, 'message'):
+            msg = obj.message
+        elif hasattr(obj, 'text'):
+            msg = obj
+        else:
+            return None, ''
+        text = getattr(msg, 'text', '') or ''
+        user_id = (
+            getattr(msg, 'from_id', None)
+            or getattr(msg, 'user_id', None)
+            or getattr(msg, 'peer_id', None)
+        )
+        return user_id, text.strip()
+
+    return None, ''
+
+
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
-def handle_message(event):
-    user_id = event.user_id
-    text = event.text.strip()
+def handle_message(user_id, text):
+    if not text or not user_id:
+        return
 
     if text.lower() in ["/export", "/выгрузить"]:
         if user_id in ADMIN_IDS:
@@ -913,6 +964,11 @@ def handle_message(event):
         return
 
     step_index, uni_page, started = get_progress(user_id)
+
+    # Нормализуем: None -> 0 для всех значений
+    step_index = step_index if isinstance(step_index, int) else 0
+    uni_page = uni_page if isinstance(uni_page, int) else 0
+    started = started if isinstance(started, int) else 0
 
     if started == 0:
         if text == "Начать анкету":
@@ -1035,8 +1091,16 @@ def main():
     while True:
         try:
             for event in longpoll.listen():
-                if event.type == VkEventType.MESSAGE_NEW and event.to_me:
-                    handle_message(event)
+                # VkBotLongPoll
+                if event.type == VkBotEventType.MESSAGE_NEW:
+                    user_id, text = extract_event_data(event)
+                    if user_id and text:
+                        handle_message(user_id, text)
+                # VkLongPoll (на случай если переключитесь обратно)
+                elif event.type == VkEventType.MESSAGE_NEW and getattr(event, 'to_me', True):
+                    user_id, text = extract_event_data(event)
+                    if user_id and text:
+                        handle_message(user_id, text)
         except Exception as e:
             print(f"Ошибка в цикле: {e}")
             time.sleep(3)

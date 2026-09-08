@@ -983,7 +983,7 @@ def recover_interrupted_users():
         # Проверяем, ответил ли пользователь на текущий шаг
         answered = check_answered(user_id, step_key)
 
-                if answered:
+        if answered:
             advance_step(user_id, step_index)
         else:
             ask_step(user_id, step_key, uni_page)

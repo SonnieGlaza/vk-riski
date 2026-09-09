@@ -639,9 +639,9 @@ def calculate_scores(row):
     if "трудовому договору" in emp:
         scores["employment"] = 0
     elif any(k in emp for k in ["гражданско-правовому", "самозанят", "стажировк", "временно"]):
-        scores["employment"] = 2
+        scores["employment"] = 0
     elif "ничего из вышеперечисленного" in emp:
-        scores["employment"] = 3
+        scores["employment"] = 1
 
     tc = (row.get("target_contract") or "").lower()
     if "да" in tc and "нет" not in tc:
@@ -653,13 +653,13 @@ def calculate_scores(row):
     if "да, есть опыт" in exp:
         scores["experience"] = 0
     elif "вне специальности" in exp:
-        scores["experience"] = 1
+        scores["experience"] = 3
     elif "нет, опыта" in exp:
-        scores["experience"] = 2
+        scores["experience"] = 3
 
     pe = (row.get("practice_eval") or "").lower()
     if "не доволен" in pe or "недоволен" in pe:
-        scores["practice_eval"] = 1
+        scores["practice_eval"] = 2
     elif "доволен" in pe:
         scores["practice_eval"] = 0
 
@@ -667,13 +667,13 @@ def calculate_scores(row):
     if "за последний год" in ev:
         scores["events"] = 0
     elif "более года назад" in ev or "ни разу" in ev:
-        scores["events"] = 1
+        scores["events"] = 2
 
     rs = (row.get("resume_status") or "").lower()
     if "актуальное" in rs:
-        scores["resume"] = 1
-    elif "устарело" in rs or "не составлял" in rs:
         scores["resume"] = 0
+    elif "устарело" in rs or "не составлял" in rs:
+        scores["resume"] = 1
 
     it = (row.get("interview_training") or "").lower()
     if "да" in it and "не проходил" not in it:

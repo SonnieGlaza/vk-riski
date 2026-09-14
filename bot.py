@@ -1208,12 +1208,9 @@ def main():
     bot_start_time = time.time()
     print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
 
-
     recover_interrupted_users()
 
-    # Множество peer_id, для которых уже пометили старые сообщения прочитанными
-    marked_read = set()
-
+    old_updates_buffer = []
     print("Бот listening...")
     while True:
         try:
@@ -1224,18 +1221,26 @@ def main():
                     if not user_id or not text:
                         continue
 
-                    # Пропускаем сообщения, отправленные ДО старта бота
+                    # Свежие — обрабатываем сразу, старые — в буфер
                     if msg_time and msg_time < bot_start_time:
-                        if user_id not in marked_read:
-                            try:
-                                vk.messages.markAsRead(peer_id=user_id)
-                                marked_read.add(user_id)
-                            except Exception as e:
-                                print(f"Не удалось пометить прочитанным: {e}")
+                        old_updates_buffer.append((user_id, text))
                         continue
 
-                    # Обрабатываем только свежие сообщения
                     handle_message(user_id, text)
+
+            # Когда longpoll.listen() закончит итерацию без новых событий,
+            # проверяем буфер старых
+            if old_updates_buffer:
+                print(f"Свежих нет. Обрабатываю буфер старых сообщений: {len(old_updates_buffer)} шт.")
+                buffer = old_updates_buffer[:]
+                old_updates_buffer.clear()
+                for user_id, text in buffer:
+                    try:
+                        handle_message(user_id, text)
+                    except Exception as e:
+                        print(f"Ошибка обработки старого сообщения: {e}")
+                    time.sleep(0.1)
+
         except Exception as e:
             print(f"Ошибка в цикле: {e}")
             time.sleep(3)

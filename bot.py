@@ -1261,6 +1261,65 @@ def process_unread_messages():
 
     print(f"Обработано непрочитанных сообщений: {processed}")
     return processed
+    
+def process_unread_messages():
+    """Обрабатывает только непрочитанные диалоги при запуске бота."""
+    processed = 0
+
+    try:
+        result = vk.messages.getConversations(filter='unread', count=100, extended=0)
+    except Exception as e:
+        print(f"Ошибка getConversations: {e}")
+        return 0
+
+    items = result.get('items', [])
+    if not items:
+        print("Непрочитанных сообщений нет.")
+        return 0
+
+    for conv in items:
+        conv_info = conv.get('conversation', {})
+        peer_id = conv_info.get('peer', {}).get('id')
+        unread_count = conv_info.get('unread_count', 0)
+
+        if not peer_id or unread_count == 0:
+            continue
+
+        try:
+            history = vk.messages.getHistory(
+                peer_id=peer_id,
+                count=min(unread_count + 5, 200),
+                extended=0
+            )
+        except Exception as e:
+            print(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+            continue
+
+        messages = history.get('items', [])
+
+        # Только входящие (от пользователей), в хронологическом порядке
+        incoming = [m for m in messages if m.get('from_id', 0) > 0]
+        incoming.reverse()
+
+        # Берём только последние unread_count входящих
+        if len(incoming) > unread_count:
+            incoming = incoming[-unread_count:]
+
+        for msg in incoming:
+            text = msg.get('text', '').strip()
+            if text:
+                handle_message(peer_id, text)
+                processed += 1
+
+        try:
+            vk.messages.markAsRead(peer_id=peer_id)
+        except Exception as e:
+            print(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
+
+        time.sleep(0.2)
+
+    print(f"Обработано непрочитанных сообщений: {processed}")
+    return processed
 
 
 def main():
@@ -1269,7 +1328,7 @@ def main():
     bot_start_time = time.time()
     print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
 
-    # Сначала обрабатываем непрочитанные сообщения
+    # Сначала обрабатываем только непрочитанные
     print("Проверяю непрочитанные сообщения...")
     process_unread_messages()
 
@@ -1297,6 +1356,7 @@ def main():
         except Exception as e:
             print(f"Ошибка в цикле: {e}")
             time.sleep(3)
+
 
 if __name__ == "__main__":
     main()

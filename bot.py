@@ -142,6 +142,9 @@ def init_db():
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
     c.execute("ALTER TABLE answers ALTER COLUMN consent_status DROP DEFAULT")
 
+    # Добавляем колонку created_at для отслеживания времени заполнения
+    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
             user_id BIGINT PRIMARY KEY,
@@ -497,6 +500,7 @@ MESSAGES = {
     "invalid_number": "Пожалуйста, введите номер от 1 до {}.",
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
+    "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
     "admin_only": "Эта команда доступна только администраторам.",
     "finished": (
         "✅ Спасибо! Анкета заполнена.\n\n"
@@ -605,6 +609,16 @@ def ask_step(user_id, step_key, uni_page=0):
 def advance_step(user_id, step_index):
     next_idx = step_index + 1
     if next_idx >= len(STEPS):
+        # Анкета завершена — записываем время завершения
+        conn = get_db()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE answers SET created_at=%s WHERE user_id=%s",
+            (datetime.now(), user_id)
+        )
+        conn.commit()
+        conn.close()
+
         set_progress(user_id, next_idx, 0, 2)
         send_message(user_id, MESSAGES["finished"], kb_restart())
     else:
@@ -722,18 +736,36 @@ EXPORT_HEADERS = {
     "maternity": "Отпуск по уходу за ребёнком",
     "graduate": "Выпускной курс",
     "post_plans": "Планы после выпуска",
-    "help_needed": "Нужная помощь"
+    "help_needed": "Нужная помощь",
+    "created_at": "Дата заполнения",
 }
 
-def export_to_table(admin_id):
+def export_to_table(admin_id, today_only=False):
+    """
+    Выгрузка анкет в Excel.
+    today_only=True — только анкеты, заполненные сегодня.
+    Сортировка по created_at (старые сверху, новые внизу).
+    """
     conn = get_db()
     c = conn.cursor(cursor_factory=RealDictCursor)
-    c.execute("SELECT * FROM answers")
+
+    if today_only:
+        today = date.today()
+        c.execute(
+            "SELECT * FROM answers WHERE created_at::date = %s ORDER BY created_at ASC",
+            (today,)
+        )
+    else:
+        c.execute("SELECT * FROM answers ORDER BY created_at ASC NULLS FIRST")
+
     rows = c.fetchall()
     conn.close()
 
     if not rows:
-        send_message(admin_id, MESSAGES["no_data"])
+        if today_only:
+            send_message(admin_id, MESSAGES["no_data_today"])
+        else:
+            send_message(admin_id, MESSAGES["no_data"])
         return
 
     from openpyxl import Workbook
@@ -742,7 +774,7 @@ def export_to_table(admin_id):
 
     wb = Workbook()
 
-    # ===== ЛИСТ 1: "Анкеты" — все данные =====
+    # ===== ЛИСТ 1: "Анкеты" — все данные, отсортированные по времени =====
     ws1 = wb.active
     ws1.title = "Анкеты"
 
@@ -757,6 +789,8 @@ def export_to_table(admin_id):
     for row_idx, r in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(cols, start=1):
             val = r[col_name]
+            if col_name == "created_at" and val is not None:
+                val = val.strftime("%Y-%m-%d %H:%M")
             ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
 
     for col in ws1.columns:
@@ -805,8 +839,14 @@ def export_to_table(admin_id):
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
+        # Сортируем по created_at внутри района
+        sorted_rows = sorted(
+            sheet_rows,
+            key=lambda r: r.get("created_at") or datetime.min
+        )
+
         row_idx = 2
-        for r in sheet_rows:
+        for r in sorted_rows:
             scores, total = calculate_scores(dict(r))
 
             ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
@@ -880,7 +920,14 @@ def export_to_table(admin_id):
             raise RuntimeError(f"VK не принял файл. Ответ: {result}")
 
         file_data = result["file"]
-        saved = vk.docs.save(file=file_data, title="Выгрузка анкет")
+
+        # Имя файла зависит от режима
+        if today_only:
+            file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}"
+        else:
+            file_title = "Выгрузка анкет"
+
+        saved = vk.docs.save(file=file_data, title=file_title)
 
         if isinstance(saved, dict) and "doc" in saved:
             d = saved["doc"]
@@ -903,11 +950,17 @@ def export_to_table(admin_id):
             sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
         sheets_text = "\n".join(sheet_list) if sheet_list else ""
 
+        if today_only:
+            header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n"
+        else:
+            header = "📊 Вот полная выгрузка анкет:\n\n"
+
         send_message(admin_id,
-            "📊 Вот выгрузка анкет:\n\n"
-            "• Лист «Анкеты» — полные ответы всех анкет\n"
+            f"{header}"
+            "• Лист «Анкеты» — полные ответы, отсортированы по времени (новые внизу)\n"
             "• Листы по районам — ФИО, учебное заведение, контакты, баллы и сумма:\n\n"
-            f"{sheets_text}",
+            f"{sheets_text}\n\n"
+            f"Всего анкет: {len(rows)}",
             attachment=attachment)
 
     except Exception as e:
@@ -1003,14 +1056,23 @@ def handle_message(user_id, text):
     if not text or not user_id:
         return
 
-    if text.lower() in ["/export", "/выгрузить"]:
+    text_lower = text.lower()
+
+    if text_lower in ["/export", "/выгрузить"]:
         if user_id in ADMIN_IDS:
-            export_to_table(user_id)
+            export_to_table(user_id, today_only=False)
         else:
             send_message(user_id, MESSAGES["admin_only"])
         return
 
-    if text.lower() == "/restart":
+    if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
+        if user_id in ADMIN_IDS:
+            export_to_table(user_id, today_only=True)
+        else:
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    if text_lower == "/restart":
         set_progress(user_id, 0, 0, 0)
         send_message(user_id, "Анкета сброшена. Нажмите «Начать анкету».", kb_start())
         return

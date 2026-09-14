@@ -425,7 +425,7 @@ OPTIONS = {
     ],
     "practice_eval": [
         "скорее доволен(льна) или полностью доволен(льна)",
-        "скорее не доволен(на) / совсем не доволен(льна) результатами практик"
+        "скорее не доволен(на) / совсем не доволен(льна) результатами практик",
         "не проходил(а) производственную практику"
     ],
     "events": [
@@ -1202,15 +1202,78 @@ def handle_message(user_id, text):
 
 # ----------------- ЗАПУСК -----------------
 
+def process_unread_messages():
+    """Получает и обрабатывает непрочитанные сообщения при запуске бота."""
+    processed = 0
+
+    try:
+        result = vk.messages.getConversations(filter='unread', count=100, extended=0)
+    except Exception as e:
+        print(f"Ошибка getConversations: {e}")
+        return 0
+
+    items = result.get('items', [])
+    if not items:
+        print("Непрочитанных сообщений нет.")
+        return 0
+
+    for conv in items:
+        conv_info = conv.get('conversation', {})
+        peer_id = conv_info.get('peer', {}).get('id')
+        unread_count = conv_info.get('unread_count', 0)
+
+        if not peer_id or unread_count == 0:
+            continue
+
+        try:
+            history = vk.messages.getHistory(
+                peer_id=peer_id,
+                count=min(unread_count + 5, 200),
+                extended=0
+            )
+        except Exception as e:
+            print(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+            continue
+
+        messages = history.get('items', [])
+
+        # Только входящие (от пользователей), в хронологическом порядке
+        incoming = [m for m in messages if m.get('from_id', 0) > 0]
+        incoming.reverse()
+
+        # Берём последние unread_count входящих
+        if len(incoming) > unread_count:
+            incoming = incoming[-unread_count:]
+
+        for msg in incoming:
+            text = msg.get('text', '').strip()
+            if text:
+                handle_message(peer_id, text)
+                processed += 1
+
+        try:
+            vk.messages.markAsRead(peer_id=peer_id)
+        except Exception as e:
+            print(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
+
+        time.sleep(0.2)
+
+    print(f"Обработано непрочитанных сообщений: {processed}")
+    return processed
+
+
 def main():
     init_db()
 
     bot_start_time = time.time()
     print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
 
+    # Сначала обрабатываем непрочитанные сообщения
+    print("Проверяю непрочитанные сообщения...")
+    process_unread_messages()
+
     recover_interrupted_users()
 
-    old_updates_buffer = []
     print("Бот listening...")
     while True:
         try:
@@ -1221,26 +1284,15 @@ def main():
                     if not user_id or not text:
                         continue
 
-                    # Свежие — обрабатываем сразу, старые — в буфер
+                    # Сообщения до старта бота уже обработаны через process_unread_messages — пропускаем
                     if msg_time and msg_time < bot_start_time:
-                        old_updates_buffer.append((user_id, text))
+                        try:
+                            vk.messages.markAsRead(peer_id=user_id)
+                        except Exception:
+                            pass
                         continue
 
                     handle_message(user_id, text)
-
-            # Когда longpoll.listen() закончит итерацию без новых событий,
-            # проверяем буфер старых
-            if old_updates_buffer:
-                print(f"Свежих нет. Обрабатываю буфер старых сообщений: {len(old_updates_buffer)} шт.")
-                buffer = old_updates_buffer[:]
-                old_updates_buffer.clear()
-                for user_id, text in buffer:
-                    try:
-                        handle_message(user_id, text)
-                    except Exception as e:
-                        print(f"Ошибка обработки старого сообщения: {e}")
-                    time.sleep(0.1)
-
         except Exception as e:
             print(f"Ошибка в цикле: {e}")
             time.sleep(3)

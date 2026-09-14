@@ -761,14 +761,14 @@ def export_to_table(admin_id, today_only=False):
             "SELECT a.* FROM answers a "
             "LEFT JOIN progress p ON a.user_id = p.user_id "
             "WHERE a.created_at::date = %s "
-            "ORDER BY p.started_at ASC NULLS LAST",
+            "ORDER BY p.started_at ASC NULLS FIRST",
             (today,)
         )
     else:
         c.execute(
             "SELECT a.* FROM answers a "
             "LEFT JOIN progress p ON a.user_id = p.user_id "
-            "ORDER BY p.started_at ASC NULLS LAST"
+            "ORDER BY p.started_at ASC NULLS FIRST"
         )
 
     rows = c.fetchall()

@@ -746,11 +746,15 @@ def export_to_table(admin_id, today_only=False):
     if today_only:
         today = date.today()
         c.execute(
-            "SELECT * FROM answers WHERE created_at::date = %s ORDER BY created_at ASC",
+            "SELECT * FROM answers WHERE created_at IS NOT NULL "
+            "AND created_at::date = %s ORDER BY created_at ASC",
             (today,)
         )
     else:
-        c.execute("SELECT * FROM answers ORDER BY created_at ASC NULLS FIRST")
+        c.execute(
+            "SELECT * FROM answers WHERE created_at IS NOT NULL "
+            "ORDER BY created_at ASC"
+        )
 
     rows = c.fetchall()
     conn.close()

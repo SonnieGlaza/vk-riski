@@ -142,7 +142,6 @@ def init_db():
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
     c.execute("ALTER TABLE answers ALTER COLUMN consent_status DROP DEFAULT")
 
-    # Добавляем колонку created_at для отслеживания времени заполнения
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
 
     c.execute('''
@@ -426,7 +425,7 @@ OPTIONS = {
     ],
     "practice_eval": [
         "скорее доволен(льна) или полностью доволен(льна)",
-        "скорее не доволен(льна) / совсем не доволен(льна) результатами практик"
+        "скорее не доволен(на) / совсем не доволен(льна) результатами практик"
         "не проходил(а) производственную практику"
     ],
     "events": [
@@ -609,7 +608,6 @@ def ask_step(user_id, step_key, uni_page=0):
 def advance_step(user_id, step_index):
     next_idx = step_index + 1
     if next_idx >= len(STEPS):
-        # Анкета завершена — записываем время завершения
         conn = get_db()
         c = conn.cursor()
         c.execute(
@@ -839,7 +837,6 @@ def export_to_table(admin_id, today_only=False):
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
 
-        # Сортируем по created_at внутри района
         sorted_rows = sorted(
             sheet_rows,
             key=lambda r: r.get("created_at") or datetime.min
@@ -921,7 +918,6 @@ def export_to_table(admin_id, today_only=False):
 
         file_data = result["file"]
 
-        # Имя файла зависит от режима
         if today_only:
             file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}"
         else:
@@ -979,11 +975,13 @@ def export_to_table(admin_id, today_only=False):
 
 def extract_event_data(event):
     """
-    Безопасно извлекает user_id и text из события.
+    Безопасно извлекает user_id, text и timestamp из события.
     Работает как с VkLongPoll, так и с VkBotLongPoll.
     """
+    timestamp = None
+
     if hasattr(event, 'text') and hasattr(event, 'user_id'):
-        return event.user_id, event.text.strip()
+        return event.user_id, event.text.strip(), getattr(event, 'timestamp', None)
 
     obj = getattr(event, 'object', None)
     if obj is not None:
@@ -991,22 +989,24 @@ def extract_event_data(event):
             msg = obj.get('message', obj)
             text = msg.get('text', '') or ''
             user_id = msg.get('from_id') or msg.get('user_id') or msg.get('peer_id')
-            return user_id, text.strip()
+            timestamp = msg.get('date')
+            return user_id, text.strip(), timestamp
         if hasattr(obj, 'message'):
             msg = obj.message
         elif hasattr(obj, 'text'):
             msg = obj
         else:
-            return None, ''
+            return None, '', None
         text = getattr(msg, 'text', '') or ''
         user_id = (
             getattr(msg, 'from_id', None)
             or getattr(msg, 'user_id', None)
             or getattr(msg, 'peer_id', None)
         )
-        return user_id, text.strip()
+        timestamp = getattr(msg, 'date', None)
+        return user_id, text.strip(), timestamp
 
-    return None, ''
+    return None, '', None
 
 
 # ----------------- ВОССТАНОВЛЕНИЕ ПРЕРВАННЫХ СЕССИЙ -----------------
@@ -1036,7 +1036,6 @@ def recover_interrupted_users():
 
         step_key = STEPS[step_index]
 
-        # Проверяем, ответил ли пользователь на текущий шаг
         answered = check_answered(user_id, step_key)
 
         if answered:
@@ -1045,7 +1044,7 @@ def recover_interrupted_users():
             ask_step(user_id, step_key, uni_page)
 
         recovered += 1
-        time.sleep(0.5)  # Чтобы не превысить лимиты VK API
+        time.sleep(0.5)
 
     print(f"Восстановлено прерванных сессий: {recovered}")
 
@@ -1205,22 +1204,43 @@ def handle_message(user_id, text):
 
 def main():
     init_db()
+
+    bot_start_time = time.time()
+    print(f"Бот запущен. Время старта: {datetime.fromtimestamp(bot_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+
     recover_interrupted_users()
-    print("Бот запущен...")
+
+    # Множество peer_id, для которых уже пометили старые сообщения прочитанными
+    marked_read = set()
+
+    print("Бот listening...")
     while True:
         try:
             for event in longpoll.listen():
                 if event.type == VkBotEventType.MESSAGE_NEW:
-                    user_id, text = extract_event_data(event)
-                    if user_id and text:
-                        handle_message(user_id, text)
-                elif event.type == VkEventType.MESSAGE_NEW and getattr(event, 'to_me', True):
-                    user_id, text = extract_event_data(event)
-                    if user_id and text:
-                        handle_message(user_id, text)
+                    user_id, text, msg_time = extract_event_data(event)
+
+                    if not user_id or not text:
+                        continue
+
+                    # Пропускаем сообщения, отправленные ДО старта бота
+                    if msg_time and msg_time < bot_start_time:
+                        if user_id not in marked_read:
+                            try:
+                                vk.messages.markAsRead(peer_id=user_id)
+                                marked_read.add(user_id)
+                            except Exception as e:
+                                print(f"Не удалось пометить прочитанным: {e}")
+                        continue
+
+                    # Обрабатываем только свежие сообщения
+                    handle_message(user_id, text)
         except Exception as e:
             print(f"Ошибка в цикле: {e}")
             time.sleep(3)
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

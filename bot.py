@@ -1206,7 +1206,8 @@ def main():
     init_db()
 
     bot_start_time = time.time()
-    print(f"Бот запущен. Время старта: {datetime.fromtimestamp(bot_start_time).strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
+
 
     recover_interrupted_users()
 

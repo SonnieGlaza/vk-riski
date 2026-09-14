@@ -1202,138 +1202,15 @@ def handle_message(user_id, text):
     advance_step(user_id, step_index)
 
 # ----------------- ЗАПУСК -----------------
-
-def process_unread_messages():
-    """Получает и обрабатывает непрочитанные сообщения при запуске бота."""
-    processed = 0
-
-    try:
-        result = vk.messages.getConversations(filter='unread', count=100, extended=0)
-    except Exception as e:
-        print(f"Ошибка getConversations: {e}")
-        return 0
-
-    items = result.get('items', [])
-    if not items:
-        print("Непрочитанных сообщений нет.")
-        return 0
-
-    for conv in items:
-        conv_info = conv.get('conversation', {})
-        peer_id = conv_info.get('peer', {}).get('id')
-        unread_count = conv_info.get('unread_count', 0)
-
-        if not peer_id or unread_count == 0:
-            continue
-
-        try:
-            history = vk.messages.getHistory(
-                peer_id=peer_id,
-                count=min(unread_count + 5, 200),
-                extended=0
-            )
-        except Exception as e:
-            print(f"Ошибка getHistory для peer_id={peer_id}: {e}")
-            continue
-
-        messages = history.get('items', [])
-
-        # Только входящие (от пользователей), в хронологическом порядке
-        incoming = [m for m in messages if m.get('from_id', 0) > 0]
-        incoming.reverse()
-
-        # Берём последние unread_count входящих
-        if len(incoming) > unread_count:
-            incoming = incoming[-unread_count:]
-
-        for msg in incoming:
-            text = msg.get('text', '').strip()
-            if text:
-                handle_message(peer_id, text)
-                processed += 1
-
-        try:
-            vk.messages.markAsRead(peer_id=peer_id)
-        except Exception as e:
-            print(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
-
-        time.sleep(0.2)
-
-    print(f"Обработано непрочитанных сообщений: {processed}")
-    return processed
-    
-def process_unread_messages():
-    """Обрабатывает только непрочитанные диалоги при запуске бота."""
-    processed = 0
-
-    try:
-        result = vk.messages.getConversations(filter='unread', count=100, extended=0)
-    except Exception as e:
-        print(f"Ошибка getConversations: {e}")
-        return 0
-
-    items = result.get('items', [])
-    if not items:
-        print("Непрочитанных сообщений нет.")
-        return 0
-
-    for conv in items:
-        conv_info = conv.get('conversation', {})
-        peer_id = conv_info.get('peer', {}).get('id')
-        unread_count = conv_info.get('unread_count', 0)
-
-        if not peer_id or unread_count == 0:
-            continue
-
-        try:
-            history = vk.messages.getHistory(
-                peer_id=peer_id,
-                count=min(unread_count + 5, 200),
-                extended=0
-            )
-        except Exception as e:
-            print(f"Ошибка getHistory для peer_id={peer_id}: {e}")
-            continue
-
-        messages = history.get('items', [])
-
-        # Только входящие (от пользователей), в хронологическом порядке
-        incoming = [m for m in messages if m.get('from_id', 0) > 0]
-        incoming.reverse()
-
-        # Берём только последние unread_count входящих
-        if len(incoming) > unread_count:
-            incoming = incoming[-unread_count:]
-
-        for msg in incoming:
-            text = msg.get('text', '').strip()
-            if text:
-                handle_message(peer_id, text)
-                processed += 1
-
-        try:
-            vk.messages.markAsRead(peer_id=peer_id)
-        except Exception as e:
-            print(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
-
-        time.sleep(0.2)
-
-    print(f"Обработано непрочитанных сообщений: {processed}")
-    return processed
-
-
 def main():
     init_db()
 
     bot_start_time = time.time()
     print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
 
-    # Сначала обрабатываем только непрочитанные
-    print("Проверяю непрочитанные сообщения...")
-    process_unread_messages()
-
     recover_interrupted_users()
 
+    marked_read = set()
     print("Бот listening...")
     while True:
         try:
@@ -1344,14 +1221,17 @@ def main():
                     if not user_id or not text:
                         continue
 
-                    # Сообщения до старта бота уже обработаны через process_unread_messages — пропускаем
+                    # Всё, что пришло до старта бота — помечаем прочитанным и пропускаем
                     if msg_time and msg_time < bot_start_time:
-                        try:
-                            vk.messages.markAsRead(peer_id=user_id)
-                        except Exception:
-                            pass
+                        if user_id not in marked_read:
+                            try:
+                                vk.messages.markAsRead(peer_id=user_id)
+                                marked_read.add(user_id)
+                            except Exception:
+                                pass
                         continue
 
+                    # Отвечаем только на свежие сообщения
                     handle_message(user_id, text)
         except Exception as e:
             print(f"Ошибка в цикле: {e}")

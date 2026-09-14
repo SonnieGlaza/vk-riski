@@ -740,11 +740,6 @@ EXPORT_HEADERS = {
 }
 
 def export_to_table(admin_id, today_only=False):
-    """
-    Выгрузка анкет в Excel.
-    today_only=True — только анкеты, заполненные сегодня.
-    Сортировка по created_at (старые сверху, новые внизу).
-    """
     conn = get_db()
     c = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -773,7 +768,6 @@ def export_to_table(admin_id, today_only=False):
 
     wb = Workbook()
 
-    # ===== ЛИСТ 1: "Анкеты" — все данные, отсортированные по времени =====
     ws1 = wb.active
     ws1.title = "Анкеты"
 
@@ -804,7 +798,6 @@ def export_to_table(admin_id, today_only=False):
         adjusted_width = min(max_length + 2, 50)
         ws1.column_dimensions[column_letter].width = adjusted_width
 
-    # ===== ЛИСТЫ ПО РАЙОНАМ (ФИО, вуз, контакты, баллы) =====
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
@@ -885,7 +878,6 @@ def export_to_table(admin_id, today_only=False):
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)
 
-    # ===== СОХРАНЕНИЕ ВО ВРЕМЕННЫЙ ФАЙЛ =====
     fname = tempfile.mktemp(suffix=".xlsx")
     wb.save(fname)
 
@@ -897,7 +889,6 @@ def export_to_table(admin_id, today_only=False):
             pass
         return
 
-    # ===== ЗАГРУЗКА В VK =====
     try:
         upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
@@ -975,10 +966,6 @@ def export_to_table(admin_id, today_only=False):
 # ----------------- ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ СОБЫТИЯ -----------------
 
 def extract_event_data(event):
-    """
-    Безопасно извлекает user_id, text и timestamp из события.
-    Работает как с VkLongPoll, так и с VkBotLongPoll.
-    """
     timestamp = None
 
     if hasattr(event, 'text') and hasattr(event, 'user_id'):
@@ -1010,44 +997,92 @@ def extract_event_data(event):
     return None, '', None
 
 
-# ----------------- ВОССТАНОВЛЕНИЕ ПРЕРВАННЫХ СЕССИЙ -----------------
+# ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ ПРИ ЗАПУСКЕ -----------------
 
-def recover_interrupted_users():
+def process_unread_messages():
     """
-    Проверяет пользователей, которые начали анкету, но не закончили,
-    и отправляет им текущий вопрос заново при запуске бота.
+    При запуске бота получает непрочитанные диалоги и отвечает только тем,
+    у кого последнее сообщение в переписке — от пользователя (не от бота).
     """
-    conn = get_db()
-    c = conn.cursor()
-    c.execute("SELECT user_id, step_index, uni_page FROM progress WHERE started=1")
-    rows = c.fetchall()
-    conn.close()
+    processed = 0
+    skipped = 0
 
-    if not rows:
-        print("Прерванных сессий не найдено.")
+    try:
+        result = vk.messages.getConversations(filter='unread', count=100, extended=0)
+    except Exception as e:
+        print(f"Ошибка getConversations: {e}")
         return
 
-    recovered = 0
-    for user_id, step_index, uni_page in rows:
-        step_index = step_index if isinstance(step_index, int) else 0
-        uni_page = uni_page if isinstance(uni_page, int) else 0
+    items = result.get('items', [])
+    if not items:
+        print("Непрочитанных сообщений нет.")
+        return
 
-        if step_index < 0 or step_index >= len(STEPS):
+    for conv in items:
+        conv_info = conv.get('conversation', {})
+        peer_id = conv_info.get('peer', {}).get('id')
+        unread_count = conv_info.get('unread_count', 0)
+
+        if not peer_id or unread_count == 0:
             continue
 
-        step_key = STEPS[step_index]
+        # Берём последние сообщения диалога
+        try:
+            history = vk.messages.getHistory(
+                peer_id=peer_id,
+                count=min(unread_count + 5, 200),
+                extended=0
+            )
+        except Exception as e:
+            print(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+            continue
 
-        answered = check_answered(user_id, step_key)
+        messages = history.get('items', [])
+        if not messages:
+            continue
 
-        if answered:
-            advance_step(user_id, step_index)
-        else:
-            ask_step(user_id, step_key, uni_page)
+        # Сообщения в истории идут от новых к старым.
+        # Первое в списке — самое свежее.
+        last_msg = messages[0]
 
-        recovered += 1
-        time.sleep(0.5)
+        # Проверяем: последнее сообщение от пользователя?
+        # from_id > 0 — сообщение от пользователя
+        # from_id < 0 — сообщение от группы (бота)
+        if last_msg.get('from_id', 0) < 0:
+            # Последнее сообщение от бота — не отвечаем
+            skipped += 1
+            try:
+                vk.messages.markAsRead(peer_id=peer_id)
+            except Exception:
+                pass
+            continue
 
-    print(f"Восстановлено прерванных сессий: {recovered}")
+        # Собираем непрочитанные входящие сообщения в хронологическом порядке
+        incoming = [m for m in messages if m.get('from_id', 0) > 0]
+        incoming.reverse()
+
+        # Берём только последние unread_count входящих
+        if len(incoming) > unread_count:
+            incoming = incoming[-unread_count:]
+
+        for msg in incoming:
+            text = msg.get('text', '').strip()
+            if text:
+                try:
+                    handle_message(peer_id, text)
+                    processed += 1
+                except Exception as e:
+                    print(f"Ошибка обработки непрочитанного сообщения от {peer_id}: {e}")
+
+        # Помечаем диалог прочитанным
+        try:
+            vk.messages.markAsRead(peer_id=peer_id)
+        except Exception as e:
+            print(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
+
+        time.sleep(0.3)
+
+    print(f"Обработано непрочитанных: {processed}, пропущено (последнее от бота): {skipped}")
 
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
@@ -1202,13 +1237,16 @@ def handle_message(user_id, text):
     advance_step(user_id, step_index)
 
 # ----------------- ЗАПУСК -----------------
+
 def main():
     init_db()
 
     bot_start_time = time.time()
     print(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
 
-    recover_interrupted_users()
+    # Обрабатываем только непрочитанные диалоги, где последнее сообщение от пользователя
+    print("Проверяю непрочитанные сообщения...")
+    process_unread_messages()
 
     marked_read = set()
     print("Бот listening...")
@@ -1221,7 +1259,7 @@ def main():
                     if not user_id or not text:
                         continue
 
-                    # Всё, что пришло до старта бота — помечаем прочитанным и пропускаем
+                    # Сообщения до старта бота уже обработаны через process_unread_messages — пропускаем
                     if msg_time and msg_time < bot_start_time:
                         if user_id not in marked_read:
                             try:

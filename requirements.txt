@@ -8,3 +8,6 @@ aiohttp
 git+https://github.com/max-messenger/max-botapi-python.git
 certifi
 requests
+fastapi
+uvicorn
+aiohttp

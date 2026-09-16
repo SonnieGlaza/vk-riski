@@ -604,21 +604,6 @@ def ask_step(user_id, step_key, uni_page=0):
         hint = "Напишите номер выбранного варианта (1 или 2)."
         send_message(user_id, f"{message}\n\n{list_text}\n\n{hint}")
 
-    elif step_key in OPTIONS:
-        opts = OPTIONS[step_key]
-        list_text = format_numbered_list(opts, truncate=False)
-
-        if step_key in MULTI_STEPS:
-            hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
-        else:
-            hint = "Напишите номер выбранного варианта (например: 1)."
-
-        message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
-        send_message(user_id, message)
-
-    else:
-        send_message(user_id, QUESTIONS[step_key])
-
 def advance_step(user_id, step_index):
     next_idx = step_index + 1
     if next_idx >= len(STEPS):

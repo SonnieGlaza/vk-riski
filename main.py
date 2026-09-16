@@ -1,43 +1,26 @@
-import os
-import re
-import time
-import tempfile
-import json
-import logging
-from datetime import datetime, date
-from typing import Optional, List, Dict, Any
-
 import vk_api
 from vk_api.utils import get_random_id
+import re
+import os
+import json
+import time
+import tempfile
+import threading
+import asyncio
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from datetime import datetime, date
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import requests
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
 
 # --- РЕГЕКСЫ ---
-PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 NAME_PATTERN = re.compile(r"^[а-яёА-ЯЁa-zA-Z]+(?:['\-][а-яёА-ЯЁa-zA-Z]+)*$")
 
-CALLBACK_CONFIRM_TOKEN = os.getenv("CALLBACK_CONFIRM_TOKEN", "")
-
-# --- НАСТРОЙКИ ИЗ ENV ---
-VK_TOKEN = os.getenv("VK_TOKEN")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
-GROUP_ID = int(os.getenv("GROUP_ID"))
-DATABASE_URL = os.getenv("DATABASE_URL")
-CALLBACK_CONFIRM_TOKEN = os.getenv("CALLBACK_CONFIRM_TOKEN", "")  # токен подтверждения сервера в настройках группы VK
-
-if not VK_TOKEN or not DATABASE_URL:
-    raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
-
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
     lines = []
     for i, item in enumerate(items, start=start_from):
@@ -46,8 +29,10 @@ def format_numbered_list(items, start_from=1, truncate=True):
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
 
+
 def validate_fio(text):
     text = text.strip()
+
     lower = text.lower()
     if lower in ("начать анкету", "пройти заново", "🔄 пройти заново", "/restart"):
         return False, (
@@ -58,6 +43,7 @@ def validate_fio(text):
         )
 
     parts = text.split()
+
     if len(parts) != 3:
         return False, (
             "Нужно указать ровно три слова: Фамилия, Имя, Отчество — через пробел.\n"
@@ -66,6 +52,7 @@ def validate_fio(text):
         )
 
     surname, first_name, patronymic = parts
+
     errors = []
 
     if not NAME_PATTERN.match(surname) or len(surname) < 2:
@@ -79,7 +66,7 @@ def validate_fio(text):
         hint = (
             "Проверьте следующие поля: " + ", ".join(errors) + ".\n"
             "Используйте только буквы (допускается дефис в двойных фамилиях).\n"
-            "Если отчества нет — поставьте «-»."
+            "Если отчества нет — поставьте «-» (например: Иванов Иван -)."
         )
         return False, hint
 
@@ -91,9 +78,12 @@ def validate_fio(text):
     normalized = f"{cap(surname)} {cap(first_name)} {cap(patronymic)}"
     return True, normalized
 
+
 def validate_contacts(text):
     text = text.strip()
+
     parts = re.split(r'[\s,;]+', text)
+
     phone = None
     email = None
 
@@ -122,6 +112,20 @@ def validate_contacts(text):
 
     return False, None
 
+
+# ================= НАСТРОЙКИ ИЗ ENV =================
+VK_TOKEN = os.getenv("VK_TOKEN")
+ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
+GROUP_ID = int(os.getenv("GROUP_ID"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+CALLBACK_CONFIRM_TOKEN = os.getenv("CALLBACK_CONFIRM_TOKEN", "")
+
+if not VK_TOKEN or not DATABASE_URL:
+    raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
+# =====================================================
+vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk = vk_session.get_api()
+
 # ----------------- БАЗА ДАННЫХ -----------------
 def get_db():
     return psycopg2.connect(DATABASE_URL)
@@ -137,26 +141,26 @@ def init_db():
             employment_status TEXT, target_contract TEXT, experience TEXT,
             practice_eval TEXT, events TEXT, resume_status TEXT,
             interview_training TEXT, special_status TEXT, military TEXT,
-            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT,
-            consent_status BOOLEAN, created_at TIMESTAMP
+            maternity TEXT, graduate TEXT, post_plans TEXT, help_needed TEXT
         )
     ''')
+    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
+    c.execute("ALTER TABLE answers ALTER COLUMN consent_status DROP DEFAULT")
+
+    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
+    c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
+
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
             user_id BIGINT PRIMARY KEY,
             step_index INTEGER DEFAULT 0,
             uni_page INTEGER DEFAULT 0,
-            started INTEGER DEFAULT 0,
-            started_at TIMESTAMP
+            started INTEGER DEFAULT 0
         )
     ''')
-    # --- ДОБАВИТЬ ЭТО ДЛЯ СУЩЕСТВУЮЩИХ ТАБЛИЦ ---
-    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
-    c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
     c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
     conn.commit()
     conn.close()
-
 
 def get_progress(user_id):
     conn = get_db()
@@ -174,14 +178,13 @@ def get_progress(user_id):
 def set_progress(user_id, step_index, uni_page=0, started=1):
     conn = get_db()
     c = conn.cursor()
-    now = datetime.now()
     if started == 1:
         c.execute(
             "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
             "VALUES (%s,%s,%s,%s,%s) "
             "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
             "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
-            (user_id, step_index, uni_page, started, now,
+            (user_id, step_index, uni_page, started, datetime.now(),
              step_index, uni_page, started)
         )
     else:
@@ -230,26 +233,131 @@ def check_answered(user_id, step_key):
         conn.close()
         return row is not None and row[0]
 
-# ----------------- ВУЗы и районы -----------------
+# ----------------- ВУЗы -----------------
 UNIVERSITIES = [
     "БПОУ УР «Воткинский промышленный техникум»",
     "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
     "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",
     "АПОУ УР «Глазовский аграрно-промышленный техникум»",
     "БПОУ УР «Глазовский технический колледж»",
+    "БПОУ «Дебесский политехникум»",
     "БПОУР «Игринский политехнический техникум»",
     "БПОУ УР «Ижевский торгово-экономический техникум»",
+    "БПОУ УР «Ижевский монтажный техникум»",
+    "БПОУ «Ижевский агростроительный техникум»",
+    "ЧПОО «Нефтяной техникум»",
+    "БПОУ УР «Ижевский политехнический колледж»",
+    "БПОУ УР «Ижевский промышленно-экономический колледж»",
+    "БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»",
+    "БПОУ УР «Радиомеханический техникум имени В.А. Шутова»",
+    "АПОУ УР «Экономико-технологический колледж»",
+    "БПОУ УР «Асановский аграрно-технический техникум»",
+    "АПОУ УР «Топливно-энергетический колледж»",
+    "БПОУ УР «Ижевский техникум индустрии питания»",
+    "КПОУ УР «Удмуртский республиканский колледж культуры»",
+    "АНПОО «Международный Восточно-Европейский колледж»",
+    "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+    "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+    "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+    "АНПОО СПО «Ижевский финансово-юридический колледж»",
+    "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+    "АПОУ УР «Строительный техникум»",
+    "ФГБОУ ВО «Ижевская государственная медицинская академия»",
+    "КПОУ УР «Республиканский музыкальный колледж»",
+    "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+    "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",
+    "БПОУ УР «Можгинский агропромышленный колледж»",
+    "БПОУ УР «Сарапульский политехнический техникум»",
+    "БПОУ УР «Сарапульский многопрофильный колледж»",
+    "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+    "БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»",
+    "БПОУ УР «Увинский профессиональный колледж»",
+    "БПОУ УР «Ярский политехникум»",
+    "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
+    "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+    "БПОУ УР «Глазовский политехнический колледж»",
+    "Ижевский институт (филиал) ВГУЮ (РПА Минюста России)",
     "ФГБОУ ВО «Удмуртский государственный университет»",
-    # ... (оставь все свои вузы как было)
+    "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+    "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
+    "БПОУ УР «Ижевский автотранспортный техникум»",
+    "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»",
+    "Сарапульский техникум машиностроения и информационных технологий"
 ]
 ITEMS_PER_PAGE = 10
 
+# ----------------- РАЙОНЫ УДМУРТИИ -----------------
 DISTRICTS_UNIVERSITIES = {
     "Ижевск": [
         "БПОУ УР «Ижевский торгово-экономический техникум»",
-        # ...
+        "БПОУ УР «Ижевский монтажный техникум»",
+        "БПОУ «Ижевский агростроительный техникум»",
+        "ЧПОО «Нефтяной техникум»",
+        "БПОУ УР «Ижевский политехнический колледж»",
+        "БПОУ УР «Ижевский промышленно-экономический колледж»",
+        "БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»",
+        "БПОУ УР «Радиомеханический техникум имени В.А. Шутова»",
+        "АПОУ УР «Экономико-технологический колледж»",
+        "АПОУ УР «Топливно-энергетический колледж»",
+        "БПОУ УР «Ижевский техникум индустрии питания»",
+        "КПОУ УР «Удмуртский республиканский колледж культуры»",
+        "АНПОО «Международный Восточно-Европейский колледж»",
+        "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+        "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+        "АНПОО СПО «Ижевский финансово-юридический колледж»",
+        "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+        "АПОУ УР «Строительный техникум»",
+        "ФГБОУ ВО «Ижевская государственная медицинская академия»",
+        "КПОУ УР «Республиканский музыкальный колледж»",
+        "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
+        "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+        "Ижевский институт (филиал) ВГУЮ (РПА Минюста России)",
+        "ФГБОУ ВО «Удмуртский государственный университет»",
+        "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+        "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
+        "БПОУ УР «Ижевский автотранспортный техникум»",
     ],
-    # ... (оставь как было)
+    "Воткинск": [
+        "БПОУ УР «Воткинский промышленный техникум»",
+        "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
+        "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",
+    ],
+    "Глазов": [
+        "АПОУ УР «Глазовский аграрно-промышленный техникум»",
+        "БПОУ УР «Глазовский технический колледж»",
+        "БПОУ УР «Глазовский политехнический колледж»",
+        "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В. Г. Короленко»",
+    ],
+    "Можга": [
+        "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+        "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",
+        "БПОУ УР «Можгинский агропромышленный колледж»",
+    ],
+    "Сарапул": [
+        "БПОУ УР «Сарапульский политехнический техникум»",
+        "БПОУ УР «Сарапульский многопрофильный колледж»",
+        "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+        "Сарапульский техникум машиностроения и информационных технологий",
+    ],
+    "Алнаши": [
+        "БПОУ УР «Асановский аграрно-технический техникум»",
+    ],
+    "Дебесы": [
+        "БПОУ «Дебесский политехникум»",
+    ],
+    "Игра": [
+        "БПОУР «Игринский политехнический техникум»",
+    ],
+    "Сюмси": [
+        "БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»",
+    ],
+    "Ува": [
+        "БПОУ УР «Увинский профессиональный колледж»",
+    ],
+    "Яр": [
+        "БПОУ УР «Ярский политехникум»",
+    ],
 }
 
 INSTITUTION_TO_DISTRICT = {}
@@ -266,32 +374,163 @@ STEPS = [
     "interview_training", "special_status", "military",
     "maternity", "graduate", "post_plans", "help_needed"
 ]
+
 STEP_TO_DB = {s: s for s in STEPS}
 
 QUESTIONS = {
     "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
     "consent": (
         "Я, {fio}, на основании статей 9, 11 Федерального закона от 27 июля 2006 г. N 152-ФЗ "
-        "\"О персональных данных\" в целях моей профессиональной ориентации даю свое согласие..."
+        "\"О персональных данных\" в целях моей профессиональной ориентации даю свое согласие "
+        "казенному учреждению Удмуртской Республики «Республиканский центр занятости населения» "
+        "на автоматизированную, а также без использования средств автоматизации обработку своих "
+        "персональных данных, включая сбор, систематизацию, накопление, хранение, уточнение "
+        "(обновление, изменение), использование, обезличивание, блокирование, уничтожение "
+        "персональных данных о моих фамилии, имени, отчестве, номере телефона, адресе электронной почты.\n\n"
+        "Настоящее согласие действует в течение 1 года с даты анкетирования.\n\n"
+        "Пожалуйста, подтвердите согласие, нажав кнопку ниже:"
     ),
     "institution": "Выберите ваше учебное заведение из списка (используйте «далее» / «назад» для пролистывания):",
-    # ... (оставь остальные вопросы как было)
+    "specialty": "Укажите вашу специальность обучения:",
+    "study_group": "Укажите номер вашей учебной группы:",
+    "course": "Выберите ваш курс обучения:",
+    "form_of_study": "Выберите форму обучения:",
+    "contacts": "Укажите контактные данные — телефон и/или e-mail (например: +79991234567 student@mail.ru). Можно указать оба контакта через пробел или запятую:",
+    "employment_status": "Ваш статус занятости прямо сейчас. Выберите один вариант, указав его номер:",
+    "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
+    "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
+    "practice_eval": "Как вы в целом оцениваете результаты своих производственных практик у работодателей по специальности обучения?",
+    "events": (
+        "Участвовали ли вы в течение обучения в мероприятиях, которые помогают познакомиться с работодателями "
+        "(ярмарки вакансий, дни карьеры, профтуры на предприятия, встречи с работодателями и т.д.)?"
+    ),
+    "resume_status": "Наличие резюме для поиска работы:",
+    "interview_training": "Проходили ли вы занятия или тренинги по навыкам прохождения собеседования?",
+    "special_status": "Есть ли у вас особый статус или жизненные обстоятельства?",
+    "military": (
+        "Планируется ли в отношении вас призыв на военную службу в ближайшее время "
+        "(после окончания текущего года обучения)?"
+    ),
+    "maternity": (
+        "Планируете ли вы уходить в отпуск по уходу за ребёнком "
+        "в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?"
+    ),
+    "graduate": "Являетесь ли вы студентом выпускного курса (оканчиваете программу в текущем учебном году)?",
+    "post_plans": "Ваши планы после выпуска. Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):",
+    "help_needed": "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной? Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):"
 }
 
 OPTIONS = {
     "consent": ["Да, я согласен(на)", "Нет, я не согласен(на)"],
     "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
-    # ... (оставь как было)
+    "form_of_study": ["очная", "очно-заочная", "заочная"],
+    "employment_status": [
+        "Работаю по трудовому договору (в том числе по совместительству)",
+        "Работаю по гражданско-правовому договору (договор подряда, услуг и т.п.)",
+        "Являюсь самозанятым / ИП / учредителем юрлица",
+        "Прохожу оплачиваемую стажировку / практику у работодателя",
+        "Работаю временно (разовые подработки), не по специальности обучения",
+        "Ничего из вышеперечисленного"
+    ],
+    "target_contract": [
+        "да, договор о целевом обучении заключён",
+        "нет, договора о целевом обучении нет"
+    ],
+    "experience": [
+        "да, есть опыт работы / оплачиваемой стажировки по основной или близкой специальности",
+        "есть опыт работы только вне специальности обучения",
+        "нет, опыта работы и оплачиваемых стажировок пока не было"
+    ],
+    "practice_eval": [
+        "скорее доволен(льна) или полностью доволен(льна)",
+        "скорее не доволен(на) / совсем не доволен(льна) результатами практик",
+        "не проходил(а) производственную практику"
+    ],
+    "events": [
+        "да, за последний год участвовал(а) хотя бы в одном таком мероприятии",
+        "участвовал(а), но более года назад",
+        "нет, ещё ни разу не участвовал(а)"
+    ],
+    "resume_status": [
+        "есть актуальное резюме, которым я пользуюсь или готов(а) пользоваться",
+        "резюме есть, но оно устарело / резюме нет, я его не составлял(а)"
+    ],
+    "interview_training": [
+        "да, проходил(а) одно или несколько таких мероприятий",
+        "пока не проходил(а)"
+    ],
+    "special_status": [
+        "да, имею группу инвалидности",
+        "отношусь к категории детей-сирот и детей, оставшихся без попечения родителей",
+        "планирую переезд в другой регион / страну после окончания обучения",
+        "ничего из вышеперечисленного"
+    ],
+    "military": [
+        "да, планируется призыв",
+        "нет / не подлежу призыву / вопрос уже решён (служба пройдена и др.)"
+    ],
+    "maternity": ["да, планирую", "пока не планирую"],
+    "graduate": [
+        "да, я учусь на выпускном курсе",
+        "нет, я не на выпускном курсе"
+    ],
+    "post_plans": [
+        "У меня есть подписанный трудовой договор (или договор на целевое обучение)",
+        "Есть устная договорённость с работодателем, но без подписанных документов",
+        "Прохожу стажировку",
+        "Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)",
+        "Планирую продолжить обучение (магистратура / аспирантура и пр.)",
+        "Сейчас ищу работу",
+        "Пока нет планов"
+    ],
+    "help_needed": [
+        "Подбор актуальных вакансий с учётом специальности",
+        "Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем",
+        "Профтур-экскурсии на предприятия",
+        "Подбор оплачиваемой стажировки",
+        "Подбор работодателя для практики",
+        "Заключение договора с работодателем на целевое обучение",
+        "Помощь с ЕЦП «Работа России»",
+        "Другое (укажите)"
+    ]
 }
+
 MULTI_STEPS = ["post_plans", "help_needed"]
 
 MESSAGES = {
-    "welcome": "👋 Здравствуйте! Я задам несколько коротких вопросов...",
-    "invalid_contact": "Не удалось распознать контакты...",
-    # ... (оставь как было)
+    "welcome": (
+        "👋 Здравствуйте!\n\n"
+        "Я задам несколько коротких вопросов о вашем обучении и занятости. "
+        "Это займёт примерно 5–7 минут. По итогу анкетирования кадровый центр "
+        "«Работа России» поможет Вам в прохождении тестирования на определение "
+        "склонностей к профессиям, в составлении грамотного резюме, "
+        "а также в подборе подходящих вакансий.\n\n"
+        "Нажмите кнопку «Начать анкету», чтобы приступить."
+    ),
+    "invalid_contact": (
+        "Не удалось распознать контакты. Пожалуйста, введите:\n\n"
+        "• Номер телефона в формате +79991234567 или 89991234567\n"
+        "и/или\n"
+        "• Адрес электронной почты в формате example@mail.ru\n\n"
+        "Можно указать оба контакта через пробел или запятую."
+    ),
+    "invalid_number": "Пожалуйста, введите номер от 1 до {}.",
+    "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
+    "no_data": "Пока нет собранных анкет для выгрузки.",
+    "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
+    "admin_only": "Эта команда доступна только администраторам.",
+    "finished": (
+        "✅ Спасибо! Анкета заполнена.\n\n"
+        "Предоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\n"
+        "Если хотите пройти анкету заново — нажмите кнопку ниже."
+    ),
+    "already_finished": (
+        "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже."
+    ),
 }
 
 # ----------------- КЛАВИАТУРЫ -----------------
+
 def kb_start():
     return json.dumps({
         "one_time": False,
@@ -311,6 +550,7 @@ def kb_restart():
     })
 
 # ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
+
 def send_message(user_id, message, keyboard=None, attachment=None):
     try:
         params = {
@@ -328,9 +568,11 @@ def send_message(user_id, message, keyboard=None, attachment=None):
 
 def ask_university_page(user_id, page):
     page = page if isinstance(page, int) else 0
+
     start = page * ITEMS_PER_PAGE
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
     items = UNIVERSITIES[start:end]
+
     list_text = format_numbered_list(items, start_from=start + 1, truncate=True)
 
     nav = []
@@ -348,8 +590,10 @@ def ask_university_page(user_id, page):
 
 def ask_step(user_id, step_key, uni_page=0):
     uni_page = uni_page if isinstance(uni_page, int) else 0
+
     if step_key == "institution":
         ask_university_page(user_id, uni_page)
+
     elif step_key == "consent":
         conn = get_db()
         c = conn.cursor()
@@ -379,7 +623,6 @@ def ask_step(user_id, step_key, uni_page=0):
     else:
         send_message(user_id, QUESTIONS[step_key])
 
-
 def advance_step(user_id, step_index):
     next_idx = step_index + 1
     if next_idx >= len(STEPS):
@@ -397,7 +640,6 @@ def advance_step(user_id, step_index):
     else:
         set_progress(user_id, next_idx, 0, 1)
         ask_step(user_id, STEPS[next_idx])
-
 
 # ----------------- ПАРСИНГ -----------------
 
@@ -418,7 +660,6 @@ def parse_multi_numbers(text, max_val):
         return nums
     except ValueError:
         return None
-
 
 # ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
 
@@ -488,7 +729,6 @@ def calculate_scores(row):
     total = sum(v for v in scores.values())
     return scores, total
 
-
 # ----------------- ВЫГРУЗКА -----------------
 
 EXPORT_HEADERS = {
@@ -546,7 +786,11 @@ def export_to_table(admin_id, today_only=False):
             send_message(admin_id, MESSAGES["no_data"])
         return
 
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+
     wb = Workbook()
+
     ws1 = wb.active
     ws1.title = "Анкеты"
 
@@ -581,10 +825,18 @@ def export_to_table(admin_id, today_only=False):
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
 
     district_headers = [
-        "ФИО", "Учебное заведение", "Контакты",
-        "Статус занятости", "Целевой договор", "Опыт работы",
-        "Оценка практик", "Мероприятия", "Резюме",
-        "Собеседование", "Особый статус", "Военный призыв",
+        "ФИО",
+        "Учебное заведение",
+        "Контакты",
+        "Статус занятости",
+        "Целевой договор",
+        "Опыт работы",
+        "Оценка практик",
+        "Мероприятия",
+        "Резюме",
+        "Собеседование",
+        "Особый статус",
+        "Военный призыв",
         "Сумма баллов",
     ]
 
@@ -596,6 +848,7 @@ def export_to_table(admin_id, today_only=False):
 
     def write_score_sheet(workbook, sheet_name, sheet_rows):
         ws = workbook.create_sheet(title=sheet_name)
+
         for col_idx, h in enumerate(district_headers, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
@@ -609,15 +862,19 @@ def export_to_table(admin_id, today_only=False):
         row_idx = 2
         for r in sorted_rows:
             scores, total = calculate_scores(dict(r))
+
             ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
             ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
             ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
+
             for i, key in enumerate(score_keys, start=4):
                 val = scores.get(key)
                 ws.cell(row=row_idx, column=i, value=val if val is not None else "")
+
             total_cell = ws.cell(row=row_idx, column=13, value=total)
             total_cell.font = bold_font
             total_cell.fill = total_fill
+
             row_idx += 1
 
         for col_idx in range(1, len(district_headers) + 1):
@@ -667,7 +924,7 @@ def export_to_table(admin_id, today_only=False):
             )
 
         if not resp.content:
-            raise RuntimeError("VK вернул пустой ответ.")
+            raise RuntimeError("VK вернул пустой ответ. Проверьте права токена: нужны «Документы» и «Сообщения сообщества».")
 
         result = resp.json()
 
@@ -729,12 +986,16 @@ def export_to_table(admin_id, today_only=False):
         except Exception:
             pass
 
-
 # ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ ПРИ ЗАПУСКЕ -----------------
 
 def process_unread_messages():
+    """
+    При запуске бота получает непрочитанные диалоги и отвечает только тем,
+    у кого последнее сообщение в переписке — от пользователя (не от бота).
+    """
     processed = 0
     skipped = 0
+
     try:
         result = vk.messages.getConversations(filter='unread', count=100, extended=0)
     except Exception as e:
@@ -896,7 +1157,7 @@ def handle_message(user_id, text):
         ask_university_page(user_id, uni_page)
         return
 
-    # --- Шаг: контакты ---
+    # --- Шаг: контакты (телефон и/или e-mail) ---
     if step_key == "contacts":
         ok, value = validate_contacts(text)
         if ok:
@@ -954,23 +1215,19 @@ def handle_message(user_id, text):
     save_answer(user_id, STEP_TO_DB[step_key], text)
     advance_step(user_id, step_index)
 
-
 # ==================== FASTAPI ПРИЛОЖЕНИЕ ====================
 
 app = FastAPI()
 
 bot_start_time = time.time()
-_db_initialized = False
 
 
 @app.on_event("startup")
 async def startup_event():
-    global _db_initialized
     init_db()
-    _db_initialized = True
     logging.info(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
     logging.info("Проверяю непрочитанные сообщения...")
-    process_unread_messages()
+    threading.Thread(target=process_unread_messages, daemon=True).start()
 
 
 @app.post("/")
@@ -1010,11 +1267,9 @@ async def vk_callback(request: Request):
                 pass
             return PlainTextResponse("ok")
 
-        # Обрабатываем в синхронном режиме (база данных блокирующая)
-        try:
-            handle_message(user_id, text)
-        except Exception as e:
-            logging.error(f"Ошибка обработки сообщения от {user_id}: {e}")
+        # Обрабатываем в отдельном потоке, чтобы не блокировать event loop
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, handle_message, user_id, text)
 
         return PlainTextResponse("ok")
 

@@ -145,10 +145,7 @@ def init_db():
         )
     ''')
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS consent_status BOOLEAN")
-    c.execute("ALTER TABLE answers ALTER COLUMN consent_status DROP DEFAULT")
-
     c.execute("ALTER TABLE answers ADD COLUMN IF NOT EXISTS created_at TIMESTAMP")
-    c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
 
     c.execute('''
         CREATE TABLE IF NOT EXISTS progress (
@@ -161,6 +158,7 @@ def init_db():
     c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
     conn.commit()
     conn.close()
+
 
 def get_progress(user_id):
     conn = get_db()
@@ -494,8 +492,6 @@ OPTIONS = {
         "Другое (укажите)"
     ]
 }
-
-MULTI_STEPS = ["post_plans", "help_needed"]
 
 MESSAGES = {
     "welcome": (

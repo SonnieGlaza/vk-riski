@@ -219,8 +219,8 @@ def save_answer(user_id, field, value):
     try:
         c = conn.cursor()
         c.execute(
-            f"INSERT INTO answers (user_id) VALUES (%s) "
-            f"ON CONFLICT (user_id) DO UPDATE SET {field}=%s",
+            f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
+            f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
             (user_id, value)
         )
         conn.commit()

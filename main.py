@@ -126,7 +126,7 @@ def init_db_pool():
     global db_pool
     db_pool = psycopg2_pool.ThreadedConnectionPool(
         minconn=2,
-        maxconn=10,
+        maxconn=30,
         dsn=DATABASE_URL
     )
 
@@ -1041,11 +1041,13 @@ async def vk_callback(request: Request):
             return PlainTextResponse("ok")
 
         if msg_time and msg_time < bot_start_time:
-            try: vk.messages.markAsRead(peer_id=user_id)
-            except: pass
+            try:
+                vk.messages.markAsRead(peer_id=user_id)
+            except Exception:
+                pass
             return PlainTextResponse("ok")
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()  # ← было get_event_loop()
         loop.run_in_executor(_executor, handle_message, user_id, text)
         return PlainTextResponse("ok")
 

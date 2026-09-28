@@ -15,7 +15,6 @@ from datetime import datetime, date
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import requests
-from concurrent.futures import ThreadPoolExecutor
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -111,21 +110,23 @@ def validate_contacts(text):
 VK_TOKEN = os.getenv("VK_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
 GROUP_ID = int(os.getenv("GROUP_ID"))
-_raw_db = os.getenv("DATABASE_URL")
-# Добавляем таймауты прямо в DSN
-if _raw_db and "connect_timeout" not in _raw_db:
-    DATABASE_URL = _raw_db + ("&" if "?" in _raw_db else " ") + "connect_timeout=5"
-else:
-    DATABASE_URL = _raw_db
+DATABASE_URL = os.getenv("DATABASE_URL")
 CALLBACK_CONFIRM_TOKEN = os.getenv("CALLBACK_CONFIRM_TOKEN", "")
 
 if not VK_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
+
+# Добавляем таймауты к DSN
+if "?" in DATABASE_URL:
+    DATABASE_URL += "&connect_timeout=5"
+else:
+    DATABASE_URL += "?connect_timeout=5"
 # =====================================================
+
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
 
-# Патчим http-сессию vk_api для установки таймаута на все запросы
+# Патчим HTTP-сессию vk_api для установки таймаута на все запросы
 _original_request = vk_session.http.request
 
 def _patched_request(method, url, **kwargs):
@@ -135,14 +136,8 @@ def _patched_request(method, url, **kwargs):
 vk_session.http.request = _patched_request
 
 # ----------------- ПРЕДВЫЧИСЛЕННЫЕ КЛАВИАТУРЫ -----------------
-KB_START = json.dumps({
-    "one_time": False,
-    "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]
-})
-KB_RESTART = json.dumps({
-    "one_time": False,
-    "buttons": [[{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]]
-})
+KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
+KB_RESTART = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]]})
 
 # ----------------- ПУЛ СОЕДИНЕНИЙ БД -----------------
 db_pool = None
@@ -157,7 +152,6 @@ def init_db_pool():
 
 def get_db():
     conn = db_pool.getconn()
-    # Устанавливаем statement_timeout на каждую сессию
     try:
         c = conn.cursor()
         c.execute("SET statement_timeout = 10000")
@@ -214,53 +208,6 @@ def get_progress(user_id):
     finally:
         release_db(conn)
 
-
-def save_and_advance(user_id, step_index, field, value, fio_text=None):
-    """Сохраняет ответ и сдвигает прогресс в одной транзакции — 1 round-trip вместо 2."""
-    next_idx = step_index + 1
-    conn = get_db()
-    try:
-        c = conn.cursor()
-
-        # Сохраняем ответ
-        if field:
-            c.execute(
-                f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
-                f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
-                (user_id, value)
-            )
-
-        if next_idx >= len(STEPS):
-            # Анкета завершена
-            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (datetime.now(), user_id))
-            c.execute(
-                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
-                "VALUES (%s,%s,%s,%s,%s) "
-                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
-                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
-                (user_id, next_idx, 0, 2, datetime.now(), next_idx, 0, 2)
-            )
-        else:
-            c.execute(
-                "INSERT INTO progress (user_id, step_index, uni_page, started) "
-                "VALUES (%s,%s,%s,%s) "
-                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s",
-                (user_id, next_idx, 0, 1, next_idx, 0, 1)
-            )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        release_db(conn)
-
-    # Отправляем следующий шаг (вне транзакции)
-    if next_idx >= len(STEPS):
-        send_message(user_id, MESSAGES["finished"], KB_RESTART)
-    else:
-        ask_step(user_id, STEPS[next_idx], fio_text=fio_text)
-
-
 def set_progress(user_id, step_index, uni_page=0, started=1):
     conn = get_db()
     try:
@@ -310,6 +257,70 @@ def save_answer(user_id, field, value):
     finally:
         release_db(conn)
 
+def check_answered(user_id, step_key):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        if step_key == "consent":
+            c.execute("SELECT consent_status FROM answers WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            return row is not None and row[0] is True
+        elif step_key == "fio":
+            c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            return row is not None and row[0]
+        else:
+            field = STEP_TO_DB.get(step_key, step_key)
+            c.execute(f"SELECT {field} FROM answers WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            return row is not None and row[0]
+    finally:
+        release_db(conn)
+
+# Объединённая функция: сохранить ответ + сдвинуть прогресс в одной транзакции
+def save_and_advance(user_id, step_index, field, value, uni_page=0):
+    next_idx = step_index + 1
+    cols = ["fio","institution","specialty","study_group","course","form_of_study",
+            "contacts","employment_status","target_contract","experience",
+            "practice_eval","events","resume_status","interview_training",
+            "special_status","military","maternity","graduate","post_plans","help_needed"]
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        # Сохраняем ответ
+        if field in cols:
+            c.execute(
+                f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
+                f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
+                (user_id, value)
+            )
+        elif field == "consent_status":
+            c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+            c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (value, user_id))
+        # Сдвигаем прогресс
+        if next_idx >= len(STEPS):
+            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (datetime.now(), user_id))
+            c.execute(
+                "INSERT INTO progress (user_id, step_index, uni_page, started) "
+                "VALUES (%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s",
+                (user_id, next_idx, 0, 2, next_idx, 0, 2)
+            )
+        else:
+            c.execute(
+                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
+                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
+                (user_id, next_idx, 0, 1, datetime.now(), next_idx, 0, 1)
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+    return next_idx
 
 # ----------------- ВУЗы -----------------
 UNIVERSITIES = [
@@ -586,7 +597,6 @@ MESSAGES = {
     "already_finished": "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже.",
 }
 
-
 # ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
 
 def send_message(user_id, message, keyboard=None, attachment=None):
@@ -649,6 +659,24 @@ def ask_step(user_id, step_key, uni_page=0, fio_text=None):
     else:
         send_message(user_id, QUESTIONS[step_key])
 
+def advance_step(user_id, step_index):
+    next_idx = step_index + 1
+    if next_idx >= len(STEPS):
+        conn = get_db()
+        try:
+            c = conn.cursor()
+            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (datetime.now(), user_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            release_db(conn)
+        set_progress(user_id, next_idx, 0, 2)
+        send_message(user_id, MESSAGES["finished"], KB_RESTART)
+    else:
+        set_progress(user_id, next_idx, 0, 1)
+        ask_step(user_id, STEPS[next_idx])
 
 # ----------------- ПАРСИНГ -----------------
 
@@ -669,7 +697,6 @@ def parse_multi_numbers(text, max_val):
         return nums
     except ValueError:
         return None
-
 
 # ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
 
@@ -728,7 +755,6 @@ def calculate_scores(row):
         scores["military"] = 0
     total = sum(v for v in scores.values())
     return scores, total
-
 
 # ----------------- ВЫГРУЗКА -----------------
 
@@ -831,7 +857,7 @@ def export_to_table(admin_id, today_only=False):
         upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
         with open(fname, "rb") as f:
-            resp = requests.post(upload_url, files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}, timeout=30)
+            resp = requests.post(upload_url, files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}, timeout=10)
         if not resp.content:
             raise RuntimeError("VK вернул пустой ответ.")
         result = resp.json()
@@ -864,7 +890,6 @@ def export_to_table(admin_id, today_only=False):
         try: os.remove(fname)
         except: pass
 
-
 # ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ -----------------
 
 def process_unread_messages():
@@ -875,7 +900,7 @@ def process_unread_messages():
     except Exception as e:
         log.error(f"Ошибка getConversations: {e}")
         return
-    items = result.get('items', [])
+    items = result.get('Items', [])
     if not items:
         log.info("Непрочитанных сообщений нет.")
         return
@@ -910,14 +935,13 @@ def process_unread_messages():
         except: pass
     log.info(f"Обработано непрочитанных: {processed}, пропущено: {skipped}")
 
-
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 def handle_message(user_id, text):
-    if not text or not user_id:
-        return
     t0 = time.time()
     t_db = 0.0
+    if not text or not user_id:
+        return
     text_lower = text.lower()
 
     if text_lower in ["/export", "/выгрузить"]:
@@ -947,7 +971,6 @@ def handle_message(user_id, text):
     t_db_start = time.time()
     step_index, uni_page, started = get_progress(user_id)
     t_db = time.time() - t_db_start
-
     step_index = step_index if isinstance(step_index, int) else 0
     uni_page = uni_page if isinstance(uni_page, int) else 0
     started = started if isinstance(started, int) else 0
@@ -971,7 +994,8 @@ def handle_message(user_id, text):
     if step_key == "fio":
         ok, value = validate_fio(text)
         if ok:
-            save_and_advance(user_id, step_index, "fio", value, fio_text=value)
+            next_idx = save_and_advance(user_id, step_index, "fio", value)
+            ask_step(user_id, STEPS[next_idx], fio_text=value)
         else:
             send_message(user_id, value)
         log.info(f"handle_message user={user_id} step=fio duration={time.time()-t0:.3f}s db={t_db:.3f}s")
@@ -998,7 +1022,8 @@ def handle_message(user_id, text):
         if text.isdigit():
             idx = int(text) - 1
             if 0 <= idx < len(UNIVERSITIES):
-                save_and_advance(user_id, step_index, "institution", UNIVERSITIES[idx])
+                next_idx = save_and_advance(user_id, step_index, "institution", UNIVERSITIES[idx])
+                ask_step(user_id, STEPS[next_idx])
                 return
         send_message(user_id, "Пожалуйста, введите номер учебного заведения из списка или используйте «далее» / «назад».")
         ask_university_page(user_id, uni_page)
@@ -1007,10 +1032,10 @@ def handle_message(user_id, text):
     if step_key == "contacts":
         ok, value = validate_contacts(text)
         if ok:
-            save_and_advance(user_id, step_index, "contacts", value)
+            next_idx = save_and_advance(user_id, step_index, "contacts", value)
+            ask_step(user_id, STEPS[next_idx])
         else:
             send_message(user_id, MESSAGES["invalid_contact"])
-        log.info(f"handle_message user={user_id} step=contacts duration={time.time()-t0:.3f}s db={t_db:.3f}s")
         return
 
     if step_key in OPTIONS:
@@ -1021,18 +1046,8 @@ def handle_message(user_id, text):
                 send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
                 return
             is_consent = (n == 1)
-            conn = get_db()
-            try:
-                c = conn.cursor()
-                c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-                c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, user_id))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                release_db(conn)
-            save_and_advance(user_id, step_index, None, None)
+            next_idx = save_and_advance(user_id, step_index, "consent_status", is_consent)
+            ask_step(user_id, STEPS[next_idx])
             return
 
         if step_key in MULTI_STEPS:
@@ -1041,14 +1056,14 @@ def handle_message(user_id, text):
                 send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
                 return
             label = "; ".join(opts[n - 1] for n in nums)
-            save_and_advance(user_id, step_index, STEP_TO_DB[step_key], label)
+            next_idx = save_and_advance(user_id, step_index, STEP_TO_DB[step_key], label)
         else:
             n = parse_single_number(text, len(opts))
             if n is None:
                 send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
                 return
-            save_and_advance(user_id, step_index, STEP_TO_DB[step_key], opts[n - 1])
-        log.info(f"handle_message user={user_id} step={step_key} duration={time.time()-t0:.3f}s db={t_db:.3f}s")
+            next_idx = save_and_advance(user_id, step_index, STEP_TO_DB[step_key], opts[n - 1])
+        ask_step(user_id, STEPS[next_idx])
         return
 
     if step_key not in ["post_plans", "help_needed"]:
@@ -1056,9 +1071,9 @@ def handle_message(user_id, text):
             send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
             return
 
-    save_and_advance(user_id, step_index, STEP_TO_DB[step_key], text)
+    next_idx = save_and_advance(user_id, step_index, STEP_TO_DB[step_key], text)
+    ask_step(user_id, STEPS[next_idx])
     log.info(f"handle_message user={user_id} step={step_key} duration={time.time()-t0:.3f}s db={t_db:.3f}s")
-
 
 # ==================== FASTAPI ====================
 
@@ -1070,6 +1085,7 @@ _executor_heavy = None
 @app.on_event("startup")
 async def startup_event():
     global _executor, _executor_heavy
+    from concurrent.futures import ThreadPoolExecutor
     _executor = ThreadPoolExecutor(max_workers=30)
     _executor_heavy = ThreadPoolExecutor(max_workers=3)
     init_db_pool()

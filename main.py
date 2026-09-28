@@ -1,3 +1,5 @@
+import asyncio
+from contextlib import contextmanager
 import vk_api
 from vk_api.utils import get_random_id
 import re
@@ -142,6 +144,27 @@ vk_session.http.request = _patched_request
 
 # ----------------- ПУЛ СОЕДИНЕНИЙ БД -----------------
 db_pool = None
+_inbox_context = threading.local()
+_inbox_wake = threading.Event()
+_outbox_wake = threading.Event()
+
+class _BorrowedConnection:
+    """Connection facade that keeps handler writes inside the inbox transaction."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def cursor(self, *args, **kwargs):
+        return self.connection.cursor(*args, **kwargs)
+
+    def commit(self):
+        # The inbox worker commits the full state + outbox transaction.
+        return None
+
+    def rollback(self):
+        return self.connection.rollback()
+
+def _current_inbox_context():
+    return getattr(_inbox_context, "current", None)
 
 def init_db_pool():
     global db_pool
@@ -152,15 +175,21 @@ def init_db_pool():
         dsn += "?connect_timeout=5"
     db_pool = psycopg2_pool.ThreadedConnectionPool(
         minconn=2,
-        maxconn=30,
+        maxconn=40,
         dsn=dsn,
         options="-c statement_timeout=10000"
     )
 
 def get_db():
+    context = _current_inbox_context()
+    if context is not None:
+        return context["borrowed_connection"]
     return db_pool.getconn()
 
 def release_db(conn):
+    context = _current_inbox_context()
+    if context is not None and conn is context["borrowed_connection"]:
+        return
     db_pool.putconn(conn)
 
 def init_db():
@@ -185,6 +214,46 @@ def init_db():
         c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
         c.execute("CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_answers_user_id ON answers(user_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS bot_inbox (
+                id BIGSERIAL PRIMARY KEY,
+                peer_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                vk_message_id BIGINT NOT NULL,
+                vk_date BIGINT NOT NULL,
+                text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_error TEXT,
+                UNIQUE (peer_id, vk_message_id))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bot_inbox_pending ON bot_inbox(status, available_at, id)")
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bot_inbox_user_order "
+            "ON bot_inbox(user_id, vk_date, vk_message_id, id) WHERE status='pending'"
+        )
+        c.execute("""CREATE TABLE IF NOT EXISTS bot_outbox (
+                id BIGSERIAL PRIMARY KEY,
+                inbox_id BIGINT NOT NULL REFERENCES bot_inbox(id),
+                sequence INTEGER NOT NULL,
+                peer_id BIGINT NOT NULL,
+                message TEXT NOT NULL,
+                keyboard TEXT,
+                attachment TEXT,
+                random_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                locked_at TIMESTAMPTZ,
+                sent_at TIMESTAMPTZ,
+                last_error TEXT,
+                UNIQUE (inbox_id, sequence))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bot_outbox_pending ON bot_outbox(status, available_at, id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bot_outbox_peer_order ON bot_outbox(peer_id, id, status)")
+        c.execute("UPDATE bot_outbox SET status='pending', locked_at=NULL, available_at=now(), "
+                  "last_error='Retrying previously failed send' WHERE status='failed'")
+        c.execute("UPDATE bot_outbox SET status='pending', locked_at=NULL, available_at=now() "
+                  "WHERE status='sending' AND locked_at < now() - interval '2 minutes'")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -253,6 +322,15 @@ def get_progress_cached(user_id):
             p = progress_cache.setdefault(user_id, loaded)
     return p["step_index"], p["uni_page"], p["started"]
 
+def _update_progress_cache(user_id, step_index, uni_page, started):
+    context = _current_inbox_context()
+    progress = {"step_index": step_index, "uni_page": uni_page, "started": started}
+    if context is not None:
+        context["progress_updates"][user_id] = progress
+        return
+    with cache_lock:
+        progress_cache[user_id] = progress
+
 def set_progress_cached(user_id, step_index, uni_page=0, started=1):
     conn = get_db()
     try:
@@ -279,12 +357,7 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
         raise
     finally:
         release_db(conn)
-    with cache_lock:
-        if user_id not in progress_cache:
-            progress_cache[user_id] = {}
-        progress_cache[user_id]["step_index"] = step_index
-        progress_cache[user_id]["uni_page"] = uni_page
-        progress_cache[user_id]["started"] = started
+    _update_progress_cache(user_id, step_index, uni_page, started)
 
 # ----------------- ОТПРАВКА СООБЩЕНИЙ -----------------
 _vk_thread = threading.local()
@@ -319,11 +392,25 @@ def _wait_for_vk_send_slot():
     if slot > now:
         time.sleep(slot - now)
 
-def send_message(user_id, message, keyboard=None, attachment=None):
+def send_message(user_id, message, keyboard=None, attachment=None, random_id=None):
+    context = _current_inbox_context()
+    if context is not None:
+        context["replies"].append({
+            "peer_id": user_id,
+            "message": message,
+            "keyboard": keyboard,
+            "attachment": attachment
+        })
+        return True
+
     started = time.monotonic()
     try:
         _wait_for_vk_send_slot()
-        params = {"peer_id": user_id, "message": message, "random_id": get_random_id()}
+        params = {
+            "peer_id": user_id,
+            "message": message,
+            "random_id": random_id if random_id is not None else get_random_id()
+        }
         if keyboard:
             params["keyboard"] = keyboard
         if attachment:
@@ -708,13 +795,9 @@ def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=Non
                 (user_id, next_idx, 0, 1, datetime.now(), next_idx, 0, 1)
             )
             conn.commit()
-        # Обновляем кэш
-        with cache_lock:
-            if user_id not in progress_cache:
-                progress_cache[user_id] = {}
-            progress_cache[user_id]["step_index"] = next_idx
-            progress_cache[user_id]["uni_page"] = 0
-            progress_cache[user_id]["started"] = 2 if next_idx >= len(STEPS) else 1
+        _update_progress_cache(
+            user_id, next_idx, 0, 2 if next_idx >= len(STEPS) else 1
+        )
     except Exception:
         conn.rollback()
         raise
@@ -906,7 +989,8 @@ def export_to_table(admin_id, today_only=False):
         return
 
     try:
-        upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
+        api = _get_message_vk()
+        upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
         with open(fname, "rb") as f:
             resp = requests.post(upload_url, files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}, timeout=30)
@@ -917,7 +1001,7 @@ def export_to_table(admin_id, today_only=False):
             raise RuntimeError(f"VK не принял файл: {result}")
         file_data = result["file"]
         file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
-        saved = vk.docs.save(file=file_data, title=file_title)
+        saved = api.docs.save(file=file_data, title=file_title)
         if isinstance(saved, dict) and "doc" in saved:
             d = saved["doc"]
         elif isinstance(saved, dict) and "docs" in saved and len(saved["docs"]) > 0:
@@ -942,16 +1026,58 @@ def export_to_table(admin_id, today_only=False):
         try: os.remove(fname)
         except: pass
 
+# ----------------- ДОЛГОВЕЧНАЯ ОЧЕРЕДЬ ВХОДЯЩИХ -----------------
+def enqueue_incoming(user_id, peer_id, message_id, text, vk_date=None):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text) "
+            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
+            (peer_id, user_id, message_id, int(vk_date or time.time()), text)
+        )
+        inserted = c.rowcount > 0
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+    _inbox_wake.set()
+    return inserted
+
+def enqueue_incoming_batch(entries):
+    if not entries:
+        return 0
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.executemany(
+            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text) "
+            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
+            entries
+        )
+        inserted = max(c.rowcount, 0)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+    _inbox_wake.set()
+    return inserted
+
 # ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ -----------------
 
 def process_unread_messages():
-    processed = 0
+    enqueued = 0
     skipped = 0
     conversations = []
     offset = 0
+    api = _get_message_vk()
     try:
         while True:
-            result = vk.messages.getConversations(
+            result = api.messages.getConversations(
                 filter='unread', count=200, offset=offset, extended=0
             )
             items = result.get('items', [])
@@ -960,7 +1086,7 @@ def process_unread_messages():
                 break
             offset += len(items)
     except Exception as e:
-        log_msg(f"Ошибка getConversations: {e}")
+        log.exception("Ошибка getConversations")
         return
 
     for conv in conversations:
@@ -973,87 +1099,113 @@ def process_unread_messages():
         messages = []
         history_offset = 0
         failed = False
-        while history_offset < unread_count:
-            count = min(200, unread_count - history_offset)
+        while len(messages) < unread_count:
+            count = min(200, unread_count - len(messages))
             try:
-                history = vk.messages.getHistory(
+                history = api.messages.getHistory(
                     peer_id=peer_id, count=count, offset=history_offset
                 )
-            except Exception as e:
-                log_msg(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+            except Exception:
+                log.exception("Ошибка getHistory peer=%s", peer_id)
                 failed = True
                 break
             batch = history.get('items', [])
             if not batch:
                 failed = True
                 break
-            messages.extend(batch)
+            messages.extend(message for message in batch if message.get('from_id', 0) >= 0)
+            skipped += sum(1 for message in batch if message.get('from_id', 0) < 0)
             history_offset += len(batch)
-            if len(batch) < count:
-                break
-
-        # getHistory возвращает новые сообщения первыми; обрабатываем в порядке поступления.
-        messages.reverse()
-        for message in messages:
-            if message.get('from_id', 0) < 0:
-                skipped += 1
-                continue
-            text = (message.get('text') or '').strip()
-            if not text:
-                skipped += 1
-                continue
-            try:
-                handle_message(peer_id, text)
-                processed += 1
-            except Exception as e:
-                log_msg(f"Ошибка обработки от {peer_id}: {e}")
+            if len(batch) < count and len(messages) < unread_count:
                 failed = True
                 break
 
-        # Не очищаем непрочитанное, если история или обработка завершились с ошибкой.
+        messages = messages[:unread_count]
+        messages.reverse()
+        pending = []
+        for message in messages:
+            text = (message.get('text') or '').strip()
+            message_id = message.get('id')
+            if not message_id:
+                log.error("У непрочитанного сообщения нет id: peer=%s", peer_id)
+                failed = True
+                break
+            pending.append((peer_id, peer_id, message_id, int(message.get('date') or time.time()), text))
+
+        if len(messages) < unread_count:
+            failed = True
+        if pending and not failed:
+            try:
+                enqueued += enqueue_incoming_batch(pending)
+            except Exception:
+                log.exception("Не удалось сохранить историю peer=%s", peer_id)
+                failed = True
+
         if not failed:
             try:
-                vk.messages.markAsRead(peer_id=peer_id)
-            except Exception as e:
-                log_msg(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
+                api.messages.markAsRead(peer_id=peer_id)
+            except Exception:
+                log.exception("Ошибка markAsRead peer=%s", peer_id)
 
-    log_msg(f"Обработано непрочитанных: {processed}, пропущено: {skipped}")
+    log.info("В очередь добавлено сообщений: %s; пропущено: %s", enqueued, skipped)
+
+
+def _unread_recovery_worker():
+    while True:
+        try:
+            process_unread_messages()
+        except Exception:
+            log.exception("Ошибка периодического восстановления непрочитанных")
+        time.sleep(60)
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 _USER_LOCKS = {}
 _USER_LOCKS_GUARD = threading.Lock()
 
+@contextmanager
+def _lock_user(user_id):
+    with _USER_LOCKS_GUARD:
+        entry = _USER_LOCKS.get(user_id)
+        if entry is None:
+            entry = {"lock": threading.RLock(), "users": 0}
+            _USER_LOCKS[user_id] = entry
+        entry["users"] += 1
+    waiting = time.monotonic()
+    try:
+        with entry["lock"]:
+            yield time.monotonic() - waiting
+    finally:
+        with _USER_LOCKS_GUARD:
+            entry["users"] -= 1
+            if entry["users"] == 0 and _USER_LOCKS.get(user_id) is entry:
+                del _USER_LOCKS[user_id]
+
 def _serialize_user_messages(func):
     def wrapped(user_id, text):
-        with _USER_LOCKS_GUARD:
-            entry = _USER_LOCKS.get(user_id)
-            if entry is None:
-                entry = {"lock": threading.RLock(), "users": 0}
-                _USER_LOCKS[user_id] = entry
-            entry["users"] += 1
-
-        waiting = time.monotonic()
-        try:
-            with entry["lock"]:
-                lock_wait = time.monotonic() - waiting
-                if lock_wait >= 0.05:
-                    log.warning(
-                        "Ожидание блокировки пользователя peer=%s duration=%.3fs",
-                        user_id, lock_wait
-                    )
-                return func(user_id, text)
-        finally:
-            with _USER_LOCKS_GUARD:
-                entry["users"] -= 1
-                if entry["users"] == 0 and _USER_LOCKS.get(user_id) is entry:
-                    del _USER_LOCKS[user_id]
+        with _lock_user(user_id) as lock_wait:
+            if lock_wait >= 0.05:
+                log.warning(
+                    "Ожидание блокировки пользователя peer=%s duration=%.3fs",
+                    user_id, lock_wait
+                )
+            return func(user_id, text)
     return wrapped
 
 @_serialize_user_messages
 def handle_message(user_id, text):
     t0 = time.time()
-    if not text or not user_id:
+    if not user_id:
+        return
+    text = (text or "").strip()
+    if not text:
+        step_index, uni_page, started = get_progress_cached(user_id)
+        if started == 0:
+            send_message(user_id, MESSAGES["welcome"], KB_START)
+        elif started == 2 or step_index >= len(STEPS):
+            send_message(user_id, MESSAGES["already_finished"], KB_RESTART)
+        else:
+            ask_step(user_id, STEPS[max(0, step_index)], uni_page)
         return
     text_lower = text.lower()
 
@@ -1210,40 +1362,333 @@ def handle_message(user_id, text):
     t_total = time.time() - t0
     log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
 
+# ==================== ОЧЕРЕДИ ОБРАБОТКИ ====================
+
+MAX_INBOX_ATTEMPTS = 8
+INBOX_WORKERS = 20
+OUTBOX_WORKERS = 10
+_inbox_executor = None
+_outbox_executor = None
+_executor_heavy = None
+_inbox_slots = threading.BoundedSemaphore(INBOX_WORKERS)
+_outbox_slots = threading.BoundedSemaphore(OUTBOX_WORKERS)
+
+
+def _apply_progress_updates(context):
+    if not context["progress_updates"]:
+        return
+    with cache_lock:
+        progress_cache.update(context["progress_updates"])
+
+
+def _retry_inbox(inbox_id, error):
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        c = conn.cursor()
+        c.execute(
+            "SELECT attempts, peer_id FROM bot_inbox WHERE id=%s AND status='pending' FOR UPDATE",
+            (inbox_id,)
+        )
+        row = c.fetchone()
+        if row:
+            attempts = row[0] + 1
+            if attempts >= MAX_INBOX_ATTEMPTS:
+                c.execute(
+                    "UPDATE bot_inbox SET status='failed', attempts=%s, last_error=%s WHERE id=%s",
+                    (attempts, str(error)[:2000], inbox_id)
+                )
+                c.execute(
+                    "INSERT INTO bot_outbox "
+                    "(inbox_id, sequence, peer_id, message, random_id) "
+                    "VALUES (%s,0,%s,%s,%s) ON CONFLICT (inbox_id, sequence) DO NOTHING",
+                    (inbox_id, row[1],
+                     "Извините, не получилось обработать ваш ответ. Пожалуйста, отправьте его ещё раз.",
+                     get_random_id())
+                )
+                conn.commit()
+                _outbox_wake.set()
+                log.error("inbox_id=%s marked failed after %s attempts", inbox_id, attempts)
+            else:
+                delay = min(60, 2 ** min(attempts, 6))
+                c.execute(
+                    "UPDATE bot_inbox SET attempts=%s, available_at=now() + (%s * interval '1 second'), "
+                    "last_error=%s WHERE id=%s AND status='pending'",
+                    (attempts, delay, str(error)[:2000], inbox_id)
+                )
+                conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        log.exception("Не удалось запланировать повтор inbox_id=%s", inbox_id)
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+    _inbox_wake.set()
+
+
+def _process_one_inbox():
+    conn = None
+    context = None
+    inbox_id = None
+    failure = None
+    try:
+        conn = db_pool.getconn()
+        c = conn.cursor()
+        c.execute("""
+            SELECT m.id, m.user_id, m.text
+            FROM bot_inbox m
+            WHERE m.status='pending' AND m.available_at <= now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM bot_inbox older
+                  WHERE older.user_id=m.user_id
+                    AND (older.vk_date < m.vk_date
+                         OR (older.vk_date=m.vk_date AND older.vk_message_id<m.vk_message_id)
+                         OR (older.vk_date=m.vk_date AND older.vk_message_id=m.vk_message_id AND older.id<m.id))
+                    AND older.status='pending'
+              )
+            ORDER BY m.vk_date, m.vk_message_id, m.id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        """)
+        row = c.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+
+        inbox_id, user_id, text = row
+        context = {
+            "borrowed_connection": _BorrowedConnection(conn),
+            "progress_updates": {},
+            "replies": []
+        }
+        _inbox_context.current = context
+        with _lock_user(user_id):
+            handle_message(user_id, text)
+
+            c = conn.cursor()
+            for sequence, reply in enumerate(context["replies"]):
+                c.execute(
+                    "INSERT INTO bot_outbox "
+                    "(inbox_id, sequence, peer_id, message, keyboard, attachment, random_id) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (inbox_id, sequence) DO NOTHING",
+                    (inbox_id, sequence, reply["peer_id"], reply["message"],
+                     reply["keyboard"], reply["attachment"], get_random_id())
+                )
+            c.execute(
+                "UPDATE bot_inbox SET status='done', last_error=NULL WHERE id=%s",
+                (inbox_id,)
+            )
+            conn.commit()
+            _apply_progress_updates(context)
+            if context["replies"]:
+                _outbox_wake.set()
+            log.info("inbox_done id=%s user=%s replies=%s", inbox_id, user_id, len(context["replies"]))
+        return True
+    except Exception as e:
+        failure = e
+        if conn:
+            conn.rollback()
+        log.exception("Ошибка обработки inbox_id=%s", inbox_id)
+    finally:
+        if hasattr(_inbox_context, "current"):
+            del _inbox_context.current
+        if conn:
+            db_pool.putconn(conn)
+    if inbox_id is not None and failure is not None:
+        _retry_inbox(inbox_id, failure)
+        return True
+    return False
+
+
+def _process_one_outbox():
+    conn = None
+    row = None
+    try:
+        conn = db_pool.getconn()
+        c = conn.cursor()
+        c.execute("""
+            SELECT o.id, o.peer_id, o.message, o.keyboard, o.attachment, o.random_id, o.attempts
+            FROM bot_outbox o
+            WHERE o.status='pending' AND o.available_at <= now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM bot_outbox older
+                  WHERE older.peer_id=o.peer_id AND older.id<o.id
+                    AND older.status IN ('pending','sending')
+              )
+            ORDER BY o.id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        """)
+        row = c.fetchone()
+        if not row:
+            conn.rollback()
+            return False
+        outbox_id, peer_id, message, keyboard, attachment, random_id, attempts = row
+        c.execute(
+            "UPDATE bot_outbox SET status='sending', attempts=attempts+1, locked_at=now() WHERE id=%s",
+            (outbox_id,)
+        )
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        log.exception("Ошибка получения сообщения из outbox")
+        return False
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+    sent = send_message(peer_id, message, keyboard, attachment, random_id=random_id)
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        c = conn.cursor()
+        if sent:
+            c.execute(
+                "UPDATE bot_outbox SET status='sent', sent_at=now(), locked_at=NULL, last_error=NULL "
+                "WHERE id=%s",
+                (outbox_id,)
+            )
+        else:
+            delay = min(60, 2 ** min(attempts + 1, 6))
+            c.execute(
+                "UPDATE bot_outbox SET status='pending', locked_at=NULL, "
+                "available_at=now() + (%s * interval '1 second'), last_error='VK send failed' "
+                "WHERE id=%s",
+                (delay, outbox_id)
+            )
+            if attempts + 1 >= 10:
+                log.error(
+                    "VK send failed outbox_id=%s peer=%s attempts=%s; retry in %ss",
+                    outbox_id, peer_id, attempts + 1, delay
+                )
+        conn.commit()
+    except Exception:
+        if conn:
+            conn.rollback()
+        log.exception("Ошибка обновления outbox_id=%s", outbox_id)
+        return True
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+    _outbox_wake.set()
+    return True
+
+
+def _count_ready_inbox():
+    conn = db_pool.getconn()
+    try:
+        c = conn.cursor()
+        c.execute("""
+            SELECT count(*) FROM bot_inbox m
+            WHERE m.status='pending' AND m.available_at <= now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM bot_inbox older
+                  WHERE older.user_id=m.user_id
+                    AND (older.vk_date < m.vk_date
+                         OR (older.vk_date=m.vk_date AND older.vk_message_id<m.vk_message_id)
+                         OR (older.vk_date=m.vk_date AND older.vk_message_id=m.vk_message_id AND older.id<m.id))
+                    AND older.status='pending'
+              )
+        """)
+        return c.fetchone()[0]
+    finally:
+        conn.rollback()
+        db_pool.putconn(conn)
+
+
+def _count_ready_outbox():
+    conn = db_pool.getconn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE bot_outbox SET status='pending', locked_at=NULL, available_at=now(), "
+            "last_error='Recovered stale sending lease' "
+            "WHERE status='sending' AND locked_at < now() - interval '2 minutes'"
+        )
+        c.execute("""
+            SELECT count(*) FROM bot_outbox o
+            WHERE o.status='pending' AND o.available_at <= now()
+              AND NOT EXISTS (
+                  SELECT 1 FROM bot_outbox older
+                  WHERE older.peer_id=o.peer_id AND older.id<o.id
+                    AND older.status IN ('pending','sending')
+              )
+        """)
+        count = c.fetchone()[0]
+        conn.commit()
+        return count
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+
+
+def _queue_task_done(future, slots, wake, queue_name):
+    try:
+        if future.result():
+            wake.set()
+    except Exception:
+        log.exception("Необработанная ошибка worker %s", queue_name)
+    finally:
+        slots.release()
+
+
+def _queue_dispatcher(wake, slots, executor, counter, worker, queue_name):
+    while True:
+        # Clear before checking the queue so a concurrent wake-up is never lost.
+        wake.clear()
+        try:
+            pending = counter()
+        except Exception:
+            log.exception("Ошибка проверки очереди %s", queue_name)
+            wake.wait(timeout=1.0)
+            continue
+        while pending > 0 and slots.acquire(blocking=False):
+            try:
+                future = executor.submit(worker)
+            except Exception:
+                slots.release()
+                log.exception("Не удалось запустить worker %s", queue_name)
+                break
+            future.add_done_callback(
+                lambda done, s=slots, w=wake, n=queue_name: _queue_task_done(done, s, w, n)
+            )
+            pending -= 1
+        wake.wait(timeout=1.0)
+
 # ==================== FASTAPI ====================
 
 app = FastAPI()
-bot_start_time = time.time()
-_executor = None
 _executor_heavy = None
+_inbox_executor = None
+_outbox_executor = None
 
 @app.on_event("startup")
 async def startup_event():
-    global _executor, _executor_heavy
-    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=30)
+    global _inbox_executor, _outbox_executor, _executor_heavy
+    _inbox_executor = concurrent.futures.ThreadPoolExecutor(max_workers=INBOX_WORKERS)
+    _outbox_executor = concurrent.futures.ThreadPoolExecutor(max_workers=OUTBOX_WORKERS)
     _executor_heavy = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     init_db_pool()
     init_db()
     preload_progress_cache()
-    log_msg(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
-    log_msg("Проверяю непрочитанные сообщения...")
-    threading.Thread(target=process_unread_messages, daemon=True).start()
-
-def _process_message_task(user_id, text, submitted_at):
-    started = time.monotonic()
-    queue_wait = started - submitted_at
-    try:
-        handle_message(user_id, text)
-    except Exception:
-        log.exception(
-            "Ошибка фоновой обработки peer=%s queue_wait=%.3fs",
-            user_id, queue_wait
-        )
-    finally:
-        log.info(
-            "message_task peer=%s queue_wait=%.3fs duration=%.3fs",
-            user_id, queue_wait, time.monotonic() - started
-        )
+    threading.Thread(
+        target=_queue_dispatcher,
+        args=(_inbox_wake, _inbox_slots, _inbox_executor, _count_ready_inbox, _process_one_inbox, "inbox"),
+        daemon=True
+    ).start()
+    threading.Thread(
+        target=_queue_dispatcher,
+        args=(_outbox_wake, _outbox_slots, _outbox_executor, _count_ready_outbox, _process_one_outbox, "outbox"),
+        daemon=True
+    ).start()
+    _inbox_wake.set()
+    _outbox_wake.set()
+    log_msg("Бот запущен; очереди inbox/outbox готовы.")
+    threading.Thread(target=_unread_recovery_worker, daemon=True).start()
 
 @app.post("/")
 async def vk_callback(request: Request):
@@ -1263,17 +1708,22 @@ async def vk_callback(request: Request):
         obj = data.get("object", {})
         msg = obj.get("message", {})
         user_id = msg.get("from_id") or msg.get("peer_id")
+        peer_id = msg.get("peer_id") or user_id
+        message_id = msg.get("id") or msg.get("conversation_message_id")
         text = (msg.get("text") or "").strip()
-        msg_time = msg.get("date")
 
-        if not user_id or not text:
+        if not user_id:
             return PlainTextResponse("ok")
+        if not message_id:
+            raise HTTPException(status_code=400, detail="Message ID is required")
 
-        if msg_time and msg_time < bot_start_time:
-            # Не помечаем событие прочитанным: стартовая обработка заберет его из unread.
-            return PlainTextResponse("ok")
-
-        _executor.submit(_process_message_task, user_id, text, time.monotonic())
+        try:
+            await asyncio.to_thread(
+                enqueue_incoming, user_id, peer_id, message_id, text, msg.get("date")
+            )
+        except Exception:
+            log.exception("Не удалось сохранить callback peer=%s id=%s", peer_id, message_id)
+            raise HTTPException(status_code=503, detail="Message queue unavailable")
         return PlainTextResponse("ok")
 
     return PlainTextResponse("ok")

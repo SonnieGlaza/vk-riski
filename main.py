@@ -252,6 +252,7 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
 
 # ----------------- ОТПРАВКА СООБЩЕНИЙ -----------------
 def send_message(user_id, message, keyboard=None, attachment=None):
+    started = time.monotonic()
     try:
         params = {"peer_id": user_id, "message": message, "random_id": get_random_id()}
         if keyboard:
@@ -259,8 +260,14 @@ def send_message(user_id, message, keyboard=None, attachment=None):
         if attachment:
             params["attachment"] = attachment
         vk.messages.send(**params)
-    except Exception as e:
-        log_msg(f"VK send error: {e}")
+        elapsed = time.monotonic() - started
+        if elapsed >= 1:
+            log.warning("Медленная отправка VK peer=%s duration=%.3fs", user_id, elapsed)
+        return True
+    except Exception:
+        elapsed = time.monotonic() - started
+        log.exception("Ошибка отправки VK peer=%s duration=%.3fs", user_id, elapsed)
+        return False
 
 # ----------------- ВУЗы -----------------
 UNIVERSITIES = [
@@ -1126,6 +1133,22 @@ async def startup_event():
     log_msg("Проверяю непрочитанные сообщения...")
     threading.Thread(target=process_unread_messages, daemon=True).start()
 
+def _process_message_task(user_id, text, submitted_at):
+    started = time.monotonic()
+    queue_wait = started - submitted_at
+    try:
+        handle_message(user_id, text)
+    except Exception:
+        log.exception(
+            "Ошибка фоновой обработки peer=%s queue_wait=%.3fs",
+            user_id, queue_wait
+        )
+    finally:
+        log.info(
+            "message_task peer=%s queue_wait=%.3fs duration=%.3fs",
+            user_id, queue_wait, time.monotonic() - started
+        )
+
 @app.post("/")
 async def vk_callback(request: Request):
     try:
@@ -1154,7 +1177,7 @@ async def vk_callback(request: Request):
             # Не помечаем событие прочитанным: стартовая обработка заберет его из unread.
             return PlainTextResponse("ok")
 
-        _executor.submit(handle_message, user_id, text)
+        _executor.submit(_process_message_task, user_id, text, time.monotonic())
         return PlainTextResponse("ok")
 
     return PlainTextResponse("ok")

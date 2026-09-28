@@ -14,6 +14,7 @@ from datetime import datetime, date
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import PlainTextResponse
 import requests
+from requests.adapters import HTTPAdapter
 import concurrent.futures
 
 # --- ЛОГИРОВАНИЕ ---
@@ -127,6 +128,8 @@ if not VK_TOKEN or not DATABASE_URL:
 # ----------------- VK СЕССИЯ С ТАЙМАУТОМ -----------------
 vk_session = vk_api.VkApi(token=VK_TOKEN)
 vk = vk_session.get_api()
+# Keep-alive pool aligned with the message worker count (requests defaults to 10).
+vk_session.http.mount("https://", HTTPAdapter(pool_connections=30, pool_maxsize=30))
 
 _original_request = vk_session.http.request
 
@@ -984,12 +987,33 @@ def process_unread_messages():
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
-_MESSAGE_LOCKS = [threading.RLock() for _ in range(256)]
+_USER_LOCKS = {}
+_USER_LOCKS_GUARD = threading.Lock()
 
 def _serialize_user_messages(func):
     def wrapped(user_id, text):
-        with _MESSAGE_LOCKS[user_id % len(_MESSAGE_LOCKS)]:
-            return func(user_id, text)
+        with _USER_LOCKS_GUARD:
+            entry = _USER_LOCKS.get(user_id)
+            if entry is None:
+                entry = {"lock": threading.RLock(), "users": 0}
+                _USER_LOCKS[user_id] = entry
+            entry["users"] += 1
+
+        waiting = time.monotonic()
+        try:
+            with entry["lock"]:
+                lock_wait = time.monotonic() - waiting
+                if lock_wait >= 0.05:
+                    log.warning(
+                        "Ожидание блокировки пользователя peer=%s duration=%.3fs",
+                        user_id, lock_wait
+                    )
+                return func(user_id, text)
+        finally:
+            with _USER_LOCKS_GUARD:
+                entry["users"] -= 1
+                if entry["users"] == 0 and _USER_LOCKS.get(user_id) is entry:
+                    del _USER_LOCKS[user_id]
     return wrapped
 
 @_serialize_user_messages

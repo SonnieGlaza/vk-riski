@@ -191,6 +191,7 @@ def init_db():
 # ----------------- КЭШ ПРОГРЕССА В ПАМЯТИ -----------------
 progress_cache = {}
 cache_lock = threading.Lock()
+progress_cache_ready = False
 
 def _load_progress_from_db(user_id):
     conn = get_db()
@@ -208,11 +209,42 @@ def _load_progress_from_db(user_id):
     finally:
         release_db(conn)
 
+def preload_progress_cache():
+    global progress_cache_ready
+    cache_started = time.monotonic()
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT user_id, step_index, uni_page, started FROM progress")
+        rows = c.fetchall()
+    except Exception:
+        log.exception("Не удалось предварительно загрузить кэш прогресса")
+        return
+    finally:
+        release_db(conn)
+
+    with cache_lock:
+        for user_id, step_index, uni_page, row_started in rows:
+            progress_cache[user_id] = {
+                "step_index": step_index if step_index is not None else 0,
+                "uni_page": uni_page if uni_page is not None else 0,
+                "started": row_started if row_started is not None else 0
+            }
+        progress_cache_ready = True
+    log.info(
+        "Кэш прогресса загружен: %s пользователей за %.3fs",
+        len(rows), time.monotonic() - cache_started
+    )
+
 def get_progress_cached(user_id):
     with cache_lock:
         p = progress_cache.get(user_id)
+        cache_ready = progress_cache_ready
     if p is None:
-        loaded = _load_progress_from_db(user_id)
+        loaded = (
+            {"step_index": 0, "uni_page": 0, "started": 0}
+            if cache_ready else _load_progress_from_db(user_id)
+        )
         with cache_lock:
             p = progress_cache.setdefault(user_id, loaded)
     return p["step_index"], p["uni_page"], p["started"]
@@ -597,6 +629,7 @@ def ask_step(user_id, step_key, uni_page=0, fio_text=None):
 
 # ----------------- СОХРАНЕНИЕ ОТВЕТА + СДВИГ ПРОГРЕССА В ОДНОЙ ТРАНЗАКЦИИ -----------------
 def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=None):
+    db_started = time.monotonic()
     conn = get_db()
     try:
         c = conn.cursor()
@@ -650,6 +683,10 @@ def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=Non
         raise
     finally:
         release_db(conn)
+        log.info(
+            "db_write user=%s duration=%.3fs",
+            user_id, time.monotonic() - db_started
+        )
     # Отправляем следующий шаг или сообщение о завершении
     if next_idx >= len(STEPS):
         send_message(user_id, MESSAGES["finished"], KB_RESTART)
@@ -1129,6 +1166,7 @@ async def startup_event():
     _executor_heavy = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     init_db_pool()
     init_db()
+    preload_progress_cache()
     log_msg(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
     log_msg("Проверяю непрочитанные сообщения...")
     threading.Thread(target=process_unread_messages, daemon=True).start()

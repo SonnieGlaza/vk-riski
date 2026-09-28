@@ -213,11 +213,12 @@ def _load_progress_from_db(user_id):
 
 def get_progress_cached(user_id):
     with cache_lock:
-        if user_id not in progress_cache:
-            p = _load_progress_from_db(user_id)
-            progress_cache[user_id] = p
-        p = progress_cache[user_id]
-        return p["step_index"], p["uni_page"], p["started"]
+        p = progress_cache.get(user_id)
+    if p is None:
+        loaded = _load_progress_from_db(user_id)
+        with cache_lock:
+            p = progress_cache.setdefault(user_id, loaded)
+    return p["step_index"], p["uni_page"], p["started"]
 
 def set_progress_cached(user_id, step_index, uni_page=0, started=1):
     conn = get_db()
@@ -854,52 +855,94 @@ def export_to_table(admin_id, today_only=False):
         try: os.remove(fname)
         except: pass
 
-# ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ (ОГРАНИЧЕННАЯ) -----------------
+# ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ -----------------
 
 def process_unread_messages():
     processed = 0
     skipped = 0
+    conversations = []
+    offset = 0
     try:
-        result = vk.messages.getConversations(filter='unread', count=10, extended=0)
+        while True:
+            result = vk.messages.getConversations(
+                filter='unread', count=200, offset=offset, extended=0
+            )
+            items = result.get('items', [])
+            conversations.extend(items)
+            if len(items) < 200:
+                break
+            offset += len(items)
     except Exception as e:
         log_msg(f"Ошибка getConversations: {e}")
         return
-    items = result.get('items', [])
-    if not items:
-        return
-    for conv in items:
+
+    for conv in conversations:
         conv_info = conv.get('conversation', {})
         peer_id = conv_info.get('peer', {}).get('id')
         unread_count = conv_info.get('unread_count', 0)
-        if not peer_id or unread_count == 0:
+        if not peer_id or not unread_count:
             continue
-        try:
-            history = vk.messages.getHistory(peer_id=peer_id, count=1)
-        except Exception as e:
-            log_msg(f"Ошибка getHistory для peer_id={peer_id}: {e}")
-            continue
-        messages = history.get('items', [])
-        if not messages:
-            continue
-        last_msg = messages[0]
-        if last_msg.get('from_id', 0) < 0:
-            skipped += 1
-            try: vk.messages.markAsRead(peer_id=peer_id)
-            except: pass
-            continue
-        text = last_msg.get('text', '').strip()
-        if text:
+
+        messages = []
+        history_offset = 0
+        failed = False
+        while history_offset < unread_count:
+            count = min(200, unread_count - history_offset)
+            try:
+                history = vk.messages.getHistory(
+                    peer_id=peer_id, count=count, offset=history_offset
+                )
+            except Exception as e:
+                log_msg(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+                failed = True
+                break
+            batch = history.get('items', [])
+            if not batch:
+                failed = True
+                break
+            messages.extend(batch)
+            history_offset += len(batch)
+            if len(batch) < count:
+                break
+
+        # getHistory возвращает новые сообщения первыми; обрабатываем в порядке поступления.
+        messages.reverse()
+        for message in messages:
+            if message.get('from_id', 0) < 0:
+                skipped += 1
+                continue
+            text = (message.get('text') or '').strip()
+            if not text:
+                skipped += 1
+                continue
             try:
                 handle_message(peer_id, text)
                 processed += 1
             except Exception as e:
                 log_msg(f"Ошибка обработки от {peer_id}: {e}")
-        try: vk.messages.markAsRead(peer_id=peer_id)
-        except: pass
+                failed = True
+                break
+
+        # Не очищаем непрочитанное, если история или обработка завершились с ошибкой.
+        if not failed:
+            try:
+                vk.messages.markAsRead(peer_id=peer_id)
+            except Exception as e:
+                log_msg(f"Ошибка markAsRead для peer_id={peer_id}: {e}")
+
     log_msg(f"Обработано непрочитанных: {processed}, пропущено: {skipped}")
 
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
+_MESSAGE_LOCKS = [threading.RLock() for _ in range(256)]
+
+def _serialize_user_messages(func):
+    def wrapped(user_id, text):
+        with _MESSAGE_LOCKS[user_id % len(_MESSAGE_LOCKS)]:
+            return func(user_id, text)
+    return wrapped
+
+@_serialize_user_messages
 def handle_message(user_id, text):
     t0 = time.time()
     if not text or not user_id:
@@ -1113,10 +1156,7 @@ async def vk_callback(request: Request):
             return PlainTextResponse("ok")
 
         if msg_time and msg_time < bot_start_time:
-            try:
-                vk.messages.markAsRead(peer_id=user_id)
-            except Exception:
-                pass
+            # Не помечаем событие прочитанным: стартовая обработка заберет его из unread.
             return PlainTextResponse("ok")
 
         _executor.submit(handle_message, user_id, text)

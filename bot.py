@@ -290,7 +290,7 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
 _vk_thread = threading.local()
 _vk_send_rate_lock = threading.Lock()
 _vk_next_send_at = 0.0
-_VK_SEND_INTERVAL = 0.1  # 10 отправок/с, оставляя запас для других методов API.
+_VK_SEND_INTERVAL = 0.06  # Около 16 отправок/с, оставляя запас до лимита сообщества.
 
 def _get_message_vk():
     api = getattr(_vk_thread, "api", None)

@@ -1,34 +1,38 @@
-import os
-import re
-import json
-import time
-import logging
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
-
 import vk_api
 from vk_api.utils import get_random_id
+import re
+import os
+import json
+import time
+import tempfile
+import threading
+import logging
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2 import pool as psycopg2_pool
-from datetime import datetime
-
+from datetime import datetime, date
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
 import requests
+import concurrent.futures
 
-# --- ЛОГИРОВАНИЕ (print для гарантированного вывода в лог) ---
+# --- ЛОГИРОВАНИЕ ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("vk_bot")
+
 def log_msg(msg):
     print(f"[BOT] {msg}", flush=True)
 
 # --- РЕГЕКСЫ ---
-PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?$?\d{3}$?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 NAME_PATTERN = re.compile(r"^[а-яёА-ЯЁa-zA-Z]+(?:['\-][а-яёА-ЯЁa-zA-Z]+)*$")
 
 # --- ПРЕДВЫЧИСЛЕННЫЕ КЛАВИАТУРЫ ---
-KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]})
-KB_RESTART = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]})
+KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
+KB_RESTART = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]]})
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
     lines = []
     for i, item in enumerate(items, start=start_from):
@@ -36,6 +40,7 @@ def format_numbered_list(items, start_from=1, truncate=True):
             item = item[:77] + "…"
         lines.append(f"{i} — {item}")
     return "\n".join(lines)
+
 
 def validate_fio(text):
     text = text.strip()
@@ -78,6 +83,7 @@ def validate_fio(text):
     normalized = f"{cap(surname)} {cap(first_name)} {cap(patronymic)}"
     return True, normalized
 
+
 def validate_contacts(text):
     text = text.strip()
     parts = re.split(r'[\s,;]+', text)
@@ -106,6 +112,7 @@ def validate_contacts(text):
         return True, "; ".join(contacts)
     return False, None
 
+
 # ================= НАСТРОЙКИ ИЗ ENV =================
 VK_TOKEN = os.getenv("VK_TOKEN")
 ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else set()
@@ -117,13 +124,28 @@ if not VK_TOKEN or not DATABASE_URL:
     raise ValueError("Не заданы переменные окружения VK_TOKEN или DATABASE_URL")
 # =====================================================
 
+# ----------------- VK СЕССИЯ С ТАЙМАУТОМ -----------------
+vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk = vk_session.get_api()
+
+_original_request = vk_session.http.request
+
+def _patched_request(method, url, **kwargs):
+    kwargs.setdefault("timeout", 5)
+    return _original_request(method, url, **kwargs)
+
+vk_session.http.request = _patched_request
+
 # ----------------- ПУЛ СОЕДИНЕНИЙ БД -----------------
 db_pool = None
 
 def init_db_pool():
     global db_pool
-    # Добавляем таймауты в DSN
-    dsn = DATABASE_URL + " connect_timeout=5"
+    dsn = DATABASE_URL
+    if "?" in dsn:
+        dsn += "&connect_timeout=5"
+    else:
+        dsn += "?connect_timeout=5"
     db_pool = psycopg2_pool.ThreadedConnectionPool(
         minconn=2,
         maxconn=30,
@@ -132,7 +154,6 @@ def init_db_pool():
 
 def get_db():
     conn = db_pool.getconn()
-    # Устанавливаем statement_timeout на уровне сессии
     cur = conn.cursor()
     cur.execute("SET statement_timeout = 10000")
     cur.close()
@@ -164,46 +185,41 @@ def init_db():
         c.execute("CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_answers_user_id ON answers(user_id)")
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        log_msg(f"DB init error: {e}")
         raise
     finally:
         release_db(conn)
 
 # ----------------- КЭШ ПРОГРЕССА В ПАМЯТИ -----------------
-# Это убирает лишние SELECT на каждый шаг
-progress_cache = {}  # user_id -> {step_index, uni_page, started}
+progress_cache = {}
 cache_lock = threading.Lock()
 
-def load_progress_to_cache(user_id):
+def _load_progress_from_db(user_id):
     conn = get_db()
     try:
         c = conn.cursor()
         c.execute("SELECT step_index, uni_page, started FROM progress WHERE user_id=%s", (user_id,))
         row = c.fetchone()
-        with cache_lock:
-            if row:
-                progress_cache[user_id] = {
-                    "step_index": row[0] if row[0] is not None else 0,
-                    "uni_page": row[1] if row[1] is not None else 0,
-                    "started": row[2] if row[2] is not None else 0
-                }
-            else:
-                progress_cache[user_id] = {"step_index": 0, "uni_page": 0, "started": 0}
-    except Exception as e:
-        log_msg(f"Error loading progress to cache: {e}")
+        if row:
+            return {
+                "step_index": row[0] if row[0] is not None else 0,
+                "uni_page": row[1] if row[1] is not None else 0,
+                "started": row[2] if row[2] is not None else 0
+            }
+        return {"step_index": 0, "uni_page": 0, "started": 0}
     finally:
         release_db(conn)
 
 def get_progress_cached(user_id):
     with cache_lock:
         if user_id not in progress_cache:
-            load_progress_to_cache(user_id)
-        return progress_cache[user_id]["step_index"], progress_cache[user_id]["uni_page"], progress_cache[user_id]["started"]
+            p = _load_progress_from_db(user_id)
+            progress_cache[user_id] = p
+        p = progress_cache[user_id]
+        return p["step_index"], p["uni_page"], p["started"]
 
 def set_progress_cached(user_id, step_index, uni_page=0, started=1):
-    # Сначала обновляем в БД
     conn = get_db()
     try:
         c = conn.cursor()
@@ -224,14 +240,11 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
                 (user_id, step_index, uni_page, started, step_index, uni_page, started)
             )
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
-        log_msg(f"Error setting progress: {e}")
         raise
     finally:
         release_db(conn)
-    
-    # Потом обновляем кэш
     with cache_lock:
         if user_id not in progress_cache:
             progress_cache[user_id] = {}
@@ -239,42 +252,7 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
         progress_cache[user_id]["uni_page"] = uni_page
         progress_cache[user_id]["started"] = started
 
-def save_answer_db(user_id, field, value):
-    cols = ["fio","institution","specialty","study_group","course","form_of_study",
-            "contacts","employment_status","target_contract","experience",
-            "practice_eval","events","resume_status","interview_training",
-            "special_status","military","maternity","graduate","post_plans","help_needed"]
-    if field not in cols:
-        return
-    conn = get_db()
-    try:
-        c = conn.cursor()
-        c.execute(
-            f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
-            f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
-            (user_id, value)
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        log_msg(f"Error saving answer: {e}")
-        raise
-    finally:
-        release_db(conn)
-
-# ----------------- VK С ТАЙМАУТОМ -----------------
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk = vk_session.get_api()
-
-# Исправленная строка: vk_session.http.request вместо .session.request
-_original_request = vk_session.http.request
-
-def _patched_request(method, url, **kwargs):
-    kwargs.setdefault("timeout", 5)
-    return _original_request(method, url, **kwargs)
-
-vk_session.http.request = _patched_request
-
+# ----------------- ОТПРАВКА СООБЩЕНИЙ -----------------
 def send_message(user_id, message, keyboard=None, attachment=None):
     try:
         params = {"peer_id": user_id, "message": message, "random_id": get_random_id()}
@@ -286,56 +264,7 @@ def send_message(user_id, message, keyboard=None, attachment=None):
     except Exception as e:
         log_msg(f"VK send error: {e}")
 
-# ----------------- ШАГИ АНКЕТЫ -----------------
-STEPS = [
-    "welcome",
-    "fio",
-    "consent",
-    "institution",
-    "specialty",
-    "study_group",
-    "course",
-    "form_of_study",
-    "contacts",
-    "employment_status",
-    "target_contract",
-    "experience",
-    "practice_eval",
-    "events",
-    "resume_status",
-    "interview_training",
-    "special_status",
-    "military",
-    "maternity",
-    "graduate",
-    "post_plans",
-    "help_needed",
-    "finish"
-]
-
-STEP_TO_DB = {
-    "fio": "fio",
-    "institution": "institution",
-    "specialty": "specialty",
-    "study_group": "study_group",
-    "course": "course",
-    "form_of_study": "form_of_study",
-    "contacts": "contacts",
-    "employment_status": "employment_status",
-    "target_contract": "target_contract",
-    "experience": "experience",
-    "practice_eval": "practice_eval",
-    "events": "events",
-    "resume_status": "resume_status",
-    "interview_training": "interview_training",
-    "special_status": "special_status",
-    "military": "military",
-    "maternity": "maternity",
-    "graduate": "graduate",
-    "post_plans": "post_plans",
-    "help_needed": "help_needed"
-}
-
+# ----------------- ВУЗы -----------------
 UNIVERSITIES = [
     "БПОУ УР «Воткинский промышленный техникум»",
     "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
@@ -358,306 +287,843 @@ UNIVERSITIES = [
     "БПОУ УР «Асановский аграрно-технический техникум»",
     "АПОУ УР «Топливно-энергетический колледж»",
     "БПОУ УР «Ижевский техникум индустрии питания»",
-        "КПОУ УР «Удмуртский республиканский колледж культуры и искусства»",
-    "БПОУ УР «Сарапульский индустриальный техникум»",
-    "АПОУ УР «Сарапульский политехнический колледж»",
+    "КПОУ УР «Удмуртский республиканский колледж культуры»",
+    "АНПОО «Международный Восточно-Европейский колледж»",
+    "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+    "Можгинский филиал АПОУ УР Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной",
+    "Сарапульский филиал АПОУ УР Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной",
+    "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+    "Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной, Глазовский филиал",
+    "Воткинский филиал АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+    "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+    "АНПОО СПО «Ижевский финансово-юридический колледж»",
+    "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+    "АПОУ УР «Строительный техникум»",
+    "ФГБОУ ВО «Ижевская государственная медицинская академия»",
+    "КПОУ УР «Республиканский музыкальный колледж»",
+    "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+    "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",
     "БПОУ УР «Можгинский агропромышленный колледж»",
+    "БПОУ УР «Сарапульский политехнический техникум»",
+    "БПОУ УР «Сарапульский многопрофильный колледж»",
+    "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+    "БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»",
     "БПОУ УР «Увинский профессиональный колледж»",
-    "БПОУ УР «Якшур-Бодьинский политехникум»"
+    "БПОУ УР «Ярский политехникум»",
+    "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
+    "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+    "БПОУ УР «Глазовский политехнический колледж»",
+    "Ижевский институт (филиал) ВГУЮ (РПА Минюста России)",
+    "ФГБОУ ВО «Удмуртский государственный университет»",
+    "ФГБОУ ВО «Удмуртский государственный университет» филиал в г.Воткинске",
+    "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+    "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
+    "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» Камбарский филиал",
+    "Глазовский инженерно-экономический институт(филиал) ФГБОУ ВО «ИжГТУ имени М.Т. Калашникова»",
+    "БПОУ УР «Ижевский автотранспортный техникум»",
+    "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В.Г. Короленко»",
+    "Сарапульский техникум машиностроения и информационных технологий"
 ]
+ITEMS_PER_PAGE = 10
 
+# ----------------- РАЙОНЫ УДМУРТИИ -----------------
 DISTRICTS_UNIVERSITIES = {
-    "Ижевск": [u for u in UNIVERSITIES if "Ижевский" in u or "филиал" in u.lower()],
-    "Воткинск": [u for u in UNIVERSITIES if "Воткинский" in u],
-    "Глазов": [u for u in UNIVERSITIES if "Глазовский" in u],
-    "Можга": [u for u in UNIVERSITIES if "Можга" in u.lower() or "филиал" in u.lower()],
-    "Сарапул": [u for u in UNIVERSITIES if "Сарапульский" in u],
-    "Ува": [u for u in UNIVERSITIES if "Увинский" in u],
-    "Дебесы": [u for u in UNIVERSITIES if "Дебесский" in u],
-    "Якшур‑Бодья": [u for u in UNIVERSITIES if "Якшур-Бодьинский" in u],
-    "Игрино": [u for u in UNIVERSITIES if "Игринский" in u],
-    "Асаново": [u for u in UNIVERSITIES if "Асановский" in u],
-    "Кез": [u for u in UNIVERSITIES if "Кез" in u],
+    "Ижевск": [
+        "БПОУ УР «Ижевский торгово-экономический техникум»",
+        "БПОУ УР «Ижевский монтажный техникум»",
+        "БПОУ «Ижевский агростроительный техникум»",
+        "ЧПОО «Нефтяной техникум»",
+        "БПОУ УР «Ижевский политехнический колледж»",
+        "БПОУ УР «Ижевский промышленно-экономический колледж»",
+        "БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»",
+        "БПОУ УР «Радиомеханический техникум имени В.А. Шутова»",
+        "АПОУ УР «Экономико-технологический колледж»",
+        "АПОУ УР «Топливно-энергетический колледж»",
+        "БПОУ УР «Ижевский техникум индустрии питания»",
+        "КПОУ УР «Удмуртский республиканский колледж культуры»",
+        "АНПОО «Международный Восточно-Европейский колледж»",
+        "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+        "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+        "АНПОО СПО «Ижевский финансово-юридический колледж»",
+        "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+        "АПОУ УР «Строительный техникум»",
+        "ФГБОУ ВО «Ижевская государственная медицинская академия»",
+        "КПОУ УР «Республиканский музыкальный колледж»",
+        "ФГБОУ ВО «Приволжский государственный университет путей сообщения»",
+        "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+        "Ижевский институт (филиал) ВГУЮ (РПА Минюста России)",
+        "ФГБОУ ВО «Удмуртский государственный университет»",
+        "БПОУ УР «Ижевский автотранспортный техникум»",
+        "ФГБОУ ВО «Удмуртский государственный аграрный университет»",
+        "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова»",
+    ],
+    "Воткинск": [
+        "БПОУ УР «Воткинский промышленный техникум»",
+        "БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",
+        "ФГБОУ ВО «Удмуртский государственный университет» филиал в г.Воткинске",
+        "Воткинский филиал АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",
+    ],
+    "Глазов": [
+        "АПОУ УР «Глазовский аграрно-промышленный техникум»",
+        "БПОУ УР «Глазовский технический колледж»",
+        "БПОУ УР «Глазовский политехнический колледж»",
+        "Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной, Глазовский филиал",
+        "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет имени В.Г. Короленко»",
+        "Глазовский инженерно-экономический институт(филиал) ФГБОУ ВО «ИжГТУ имени М.Т. Калашникова»",
+    ],
+    "Можга": [
+        "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+        "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",
+        "Филиал АПОУ УР Ижевский промышленно-экономический колледж в г.Можга",
+        "Можгинский филиал АПОУ УР Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной",
+        "БПОУ УР «Можгинский агропромышленный колледж»",
+    ],
+    "Сарапул": [
+        "БПОУ УР «Сарапульский политехнический техникум»",
+        "БПОУ УР «Сарапульский многопрофильный колледж»",
+        "Сарапульский филиал АПОУ УР Республиканский медицинский колледж имени Героя Советского Союза Ф.А. Пушиной",
+        "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+        "Сарапульский техникум машиностроения и информационных технологий",
+    ],
+    "Алнаши": ["БПОУ УР «Асановский аграрно-технический техникум»"],
+    "Дебесы": ["БПОУ «Дебесский политехникум»"],
+    "Кез": ["Филиал БПОУ УР «Дебесский политехникум» п. Кез"],
+    "Камбарка": ["ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» Камбарский филиал"],
+    "Игра": ["БПОУР «Игринский политехнический техникум»"],
+    "Сюмси": ["БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»"],
+    "Ува": ["БПОУ УР «Увинский профессиональный колледж»"],
+    "Яр": ["БПОУ УР «Ярский политехникум»"],
 }
 
-# ----------------- ЛОГИКА ШАГОВ -----------------
-def ask_step(user_id, step_name):
-    if step_name == "welcome":
-        msg = (
-            "👋 Привет! Это бот для сбора данных для центра карьеры.\n"
-            "Пройдём короткую анкету — это займёт 3–5 минут.\n\n"
-            "Нажмите кнопку «Начать анкету», чтобы продолжить."
-        )
-        send_message(user_id, msg, keyboard=KB_START)
-    elif step_name == "fio":
-        msg = (
-            "📝 Пожалуйста, укажите Фамилию, Имя и Отчество через пробел.\n"
-            "Например: Иванов Иван Иванович\n"
-            "Если отчества нет — поставьте «-» (например: Иванов Иван -)."
-        )
-        send_message(user_id, msg)
-    elif step_name == "consent":
-        msg = (
-            "✅ Вы согласны на обработку персональных данных?\n"
-            "Пожалуйста, ответьте «Да» или «Нет»."
-        )
-        send_message(user_id, msg)
-    elif step_name == "institution":
-        districts = list(DISTRICTS_UNIVERSITIES.keys())
-        msg = "📍 Выберите ваш населённый пункт (или напишите название):\n" + format_numbered_list(districts)
-        send_message(user_id, msg)
-    elif step_name == "specialty":
-        # Здесь можно подставить конкретный список специальностей по выбранному вузу, пока — заглушка
-        msg = (
-            "🎓 Напишите направление/специальность, на которой вы учитесь.\n"
-            "Можно кратко, как в зачётке."
-        )
-        send_message(user_id, msg)
-    elif step_name == "study_group":
-        msg = "📋 Укажите номер вашей учебной группы (например: ИВТ-231)."
-        send_message(user_id, msg)
-    elif step_name == "course":
-        msg = "🎓 Укажите курс (цифрой): 1, 2, 3, 4 или 5."
-        send_message(user_id, msg)
-    elif step_name == "form_of_study":
-        msg = (
-            "📚 Форма обучения:\n"
-            "1 — Очная\n"
-            "2 — Очно‑заочная\n"
-            "3 — Заочная"
-        )
-        send_message(user_id, msg)
-    elif step_name == "contacts":
-        msg = (
-            "📞 Укажите контакты для связи: телефон и/или email.\n"
-            "Можно в любом порядке, через пробел или запятую."
-        )
-        send_message(user_id, msg)
-    elif step_name == "employment_status":
-        msg = (
-            "💼 Ваш текущий статус занятости:\n"
-            "1 — Работаю\n"
-            "2 — Не работаю\n"
-            "3 — В декрете\n"
-            "4 — Другое"
-        )
-        send_message(user_id, msg)
-    elif step_name == "target_contract":
-        msg = (
-            "📄 Планируете ли вы целевое обучение/трудоустройство?\n"
-            "Ответьте «Да» или «Нет», или кратко опишите планы."
-        )
-        send_message(user_id, msg)
-    elif step_name == "experience":
-        msg = (
-            "🧑‍💼 Есть ли у вас опыт работы по специальности?\n"
-            "Напишите кратко: где и сколько месяцев/лет."
-        )
-        send_message(user_id, msg)
-    elif step_name == "practice_eval":
-        msg = (
-            "🏫 Как вы оцениваете свою практику?\n"
-            "Кратко: что понравилось, что хотелось бы улучшить."
-        )
-        send_message(user_id, msg)
-    elif step_name == "events":
-        msg = (
-            "🗓 Участвовали ли вы в карьерных мероприятиях центра?\n"
-            "Напишите, какие, или «Нет» — если не участвовали."
-        )
-        send_message(user_id, msg)
-    elif step_name == "resume_status":
-        msg = (
-            "📄 Есть ли у вас резюме?\n"
-            "«Да» / «Нет» / «Есть, но не обновлено»"
-        )
-        send_message(user_id, msg)
-    elif step_name == "interview_training":
-        msg = (
-            "🗣 Хотели бы пройти подготовку к собеседованию?\n"
-            "«Да» / «Нет»"
-        )
-        send_message(user_id, msg)
-    elif step_name == "special_status":
-        msg = (
-            "⚠️ Есть ли особые обстоятельства (инвалидность, ОВЗ, иные статусы)?\n"
-            "Напишите «Нет» или кратко укажите статус."
-        )
-        send_message(user_id, msg)
-    elif step_name == "military":
-        msg = (
-            "🪖 Воинская обязанность:\n"
-            "«Призывник» / «В запасе» / «Не подлежит» / «Другое»"
-        )
-        send_message(user_id, msg)
-    elif step_name == "maternity":
-        msg = (
-            "👩‍🍼 Статус по материнству/отцовству:\n"
-            "«В декрете» / «Планирую» / «Не актуально»"
-        )
-        send_message(user_id, msg)
-    elif step_name == "graduate":
-        msg = (
-            "🎓 Вы выпускник этого года?\n"
-            "«Да» / «Нет»"
-        )
-        send_message(user_id, msg)
-    elif step_name == "post_plans":
-        msg = (
-            "🚀 Ваши планы после выпуска:\n"
-            "Работа, магистратура, переезд, другое — кратко."
-        )
-        send_message(user_id, msg)
-    elif step_name == "help_needed":
-        msg = (
-            "🤝 Какая помощь от центра карьеры вам нужна?\n"
-            "Вакансии, стажировки, резюме, профориентация — напишите 1–2 пункта."
-        )
-        send_message(user_id, msg)
-    elif step_name == "finish":
-        msg = (
-            "🎉 Спасибо за заполнение анкеты!\n"
-            "Ваши данные переданы в центр карьеры.\n"
-            "При необходимости с вами свяжутся."
-        )
-        send_message(user_id, msg, keyboard=KB_RESTART)
+INSTITUTION_TO_DISTRICT = {}
+for _district, _unis in DISTRICTS_UNIVERSITIES.items():
+    for _uni in _unis:
+        INSTITUTION_TO_DISTRICT[_uni] = _district
 
-def get_next_step_index(current_index):
-    # Защита от выхода за границы
-    next_idx = current_index + 1
+# ----------------- ШАГИ АНКЕТЫ -----------------
+STEPS = [
+    "fio", "consent", "institution", "specialty", "study_group",
+    "course", "form_of_study", "contacts",
+    "employment_status", "target_contract", "experience",
+    "practice_eval", "events", "resume_status",
+    "interview_training", "special_status", "military",
+    "maternity", "graduate", "post_plans", "help_needed"
+]
+
+STEP_TO_DB = {s: s for s in STEPS}
+
+QUESTIONS = {
+    "fio": "Пожалуйста, укажите ваши фамилию, имя и отчество полностью:",
+    "consent": (
+        "Я, {fio}, на основании статей 9, 11 Федерального закона от 27 июля 2006 г. N 152-ФЗ "
+        "\"О персональных данных\" в целях моей профессиональной ориентации даю свое согласие "
+        "казенному учреждению Удмуртской Республики «Республиканский центр занятости населения» "
+        "на автоматизированную, а также без использования средств автоматизации обработку своих "
+        "персональных данных, включая сбор, систематизацию, накопление, хранение, уточнение "
+        "(обновление, изменение), использование, обезличивание, блокирование, уничтожение "
+        "персональных данных о моих фамилии, имени, отчестве, номере телефона, адресе электронной почты.\n\n"
+        "Настоящее согласие действует в течение 1 года с даты анкетирования.\n\n"
+        "Пожалуйста, подтвердите согласие, нажав кнопку ниже:"
+    ),
+    "institution": "Выберите ваше учебное заведение из списка (используйте «далее» / «назад» для пролистывания):",
+    "specialty": "Укажите вашу специальность обучения:",
+    "study_group": "Укажите номер вашей учебной группы:",
+    "course": "Выберите ваш курс обучения:",
+    "form_of_study": "Выберите форму обучения:",
+    "contacts": "Укажите контактные данные — телефон и/или e-mail (например: +79991234567 student@mail.ru). Можно указать оба контакта через пробел или запятую:",
+    "employment_status": "Ваш статус занятости прямо сейчас. Выберите один вариант, указав его номер:",
+    "target_contract": "Есть ли у вас заключённый договор о целевом обучении с работодателем?",
+    "experience": "Есть ли у вас опыт работы или оплачиваемой стажировки по основной или близкой к ней специальности?",
+    "practice_eval": "Как вы в целом оцениваете результаты своих производственных практик у работодателей по специальности обучения?",
+    "events": "Участвовали ли вы в течение обучения в мероприятиях, которые помогают познакомиться с работодателями (ярмарки вакансий, дни карьеры, профтуры на предприятия, встречи с работодателями и т.д.)?",
+    "resume_status": "Наличие резюме для поиска работы:",
+    "interview_training": "Проходили ли вы занятия или тренинги по навыкам прохождения собеседования?",
+    "special_status": "Есть ли у вас особый статус или жизненные обстоятельства?",
+    "military": "Планируется ли в отношении вас призыв на военную службу в ближайшее время (после окончания текущего года обучения)?",
+    "maternity": "Планируете ли вы уходить в отпуск по уходу за ребёнком в период обучения или сразу после окончания обучения (или продолжать уже начатый отпуск)?",
+    "graduate": "Являетесь ли вы студентом выпускного курса (оканчиваете программу в текущем учебном году)?",
+    "post_plans": "Ваши планы после выпуска. Выберите один или несколько вариантов, указав их номера через запятую (например: 1, 3):",
+    "help_needed": "Какую помощь от Кадрового центра «Работа России» вы бы считали наиболее полезной? Выберите все подходящие варианты, указав их номера через запятую (например: 1, 2, 4):"
+}
+
+OPTIONS = {
+    "consent": ["Да, я согласен(на)", "Нет, я не согласен(на)"],
+    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
+    "form_of_study": ["очная", "очно-заочная", "заочная"],
+    "employment_status": [
+        "Работаю по трудовому договору (в том числе по совместительству)",
+        "Работаю по гражданско-правовому договору (договор подряда, услуг и т.п.)",
+        "Являюсь самозанятым / ИП / учредителем юрлица",
+        "Прохожу оплачиваемую стажировку / практику у работодателя",
+        "Работаю временно (разовые подработки), не по специальности обучения",
+        "Ничего из вышеперечисленного"
+    ],
+    "target_contract": ["да, договор о целевом обучении заключён", "нет, договора о целевом обучении нет"],
+    "experience": [
+        "да, есть опыт работы / оплачиваемой стажировки по основной или близкой специальности",
+        "есть опыт работы только вне специальности обучения",
+        "нет, опыта работы и оплачиваемых стажировок пока не было"
+    ],
+    "practice_eval": [
+        "скорее доволен(льна) или полностью доволен(льна)",
+        "скорее не доволен(на) / совсем не доволен(льна) результатами практик",
+        "не проходил(а) производственную практику"
+    ],
+    "events": [
+        "да, за последний год участвовал(а) хотя бы в одном таком мероприятии",
+        "участвовал(а), но более года назад",
+        "нет, ещё ни разу не участвовал(а)"
+    ],
+    "resume_status": [
+        "есть актуальное резюме, которым я пользуюсь или готов(а) пользоваться",
+        "резюме есть, но оно устарело / резюме нет, я его не составлял(а)"
+    ],
+    "interview_training": ["да, проходил(а) одно или несколько таких мероприятий", "пока не проходил(а)"],
+    "special_status": [
+        "да, имею группу инвалидности",
+        "отношусь к категории детей-сирот и детей, оставшихся без попечения родителей",
+        "планирую переезд в другой регион / страну после окончания обучения",
+        "ничего из вышеперечисленного"
+    ],
+    "military": ["да, планируется призыв", "нет / не подлежу призыву / вопрос уже решён (служба пройдена и др.)"],
+    "maternity": ["да, планирую", "пока не планирую"],
+    "graduate": ["да, я учусь на выпускном курсе", "нет, я не на выпускном курсе"],
+    "post_plans": [
+        "У меня есть подписанный трудовой договор (или договор на целевое обучение)",
+        "Есть устная договорённость с работодателем, но без подписанных документов",
+        "Прохожу стажировку",
+        "Планирую организовать своё дело (самозанятость / ИП / учредитель юрлица)",
+        "Планирую продолжить обучение (магистратура / аспирантура и пр.)",
+        "Сейчас ищу работу",
+        "Пока нет планов"
+    ],
+    "help_needed": [
+        "Подбор актуальных вакансий с учётом специальности",
+        "Тренинги по составлению резюме, подготовке к собеседованиям, сопроводительных писем",
+        "Профтур-экскурсии на предприятия",
+        "Подбор оплачиваемой стажировки",
+        "Подбор работодателя для практики",
+        "Заключение договора с работодателем на целевое обучение",
+        "Помощь с ЕЦП «Работа России»",
+        "Другое (укажите)"
+    ]
+}
+
+MULTI_STEPS = ["post_plans", "help_needed"]
+
+MESSAGES = {
+    "welcome": (
+        "👋 Здравствуйте!\n\n"
+        "Я задам несколько коротких вопросов о вашем обучении и занятости. "
+        "Это займёт примерно 5–7 минут. По итогу анкетирования кадровый центр "
+        "«Работа России» поможет Вам в прохождении тестирования на определение "
+        "склонностей к профессиям, в составлении грамотного резюме, "
+        "а также в подборе подходящих вакансий.\n\n"
+        "Нажмите кнопку «Начать анкету», чтобы приступить."
+    ),
+    "invalid_contact": (
+        "Не удалось распознать контакты. Пожалуйста, введите:\n\n"
+        "• Номер телефона в формате +79991234567 или 89991234567\n"
+        "и/или\n"
+        "• Адрес электронной почты в формате example@mail.ru\n\n"
+        "Можно указать оба контакта через пробел или запятую."
+    ),
+    "invalid_number": "Пожалуйста, введите номер от 1 до {}.",
+    "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
+    "no_data": "Пока нет собранных анкет для выгрузки.",
+    "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
+    "admin_only": "Эта команда доступна только администраторам.",
+    "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку ниже.",
+    "already_finished": "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже.",
+}
+
+# ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
+
+def ask_university_page(user_id, page):
+    page = page if isinstance(page, int) else 0
+    start = page * ITEMS_PER_PAGE
+    end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
+    items = UNIVERSITIES[start:end]
+    list_text = format_numbered_list(items, start_from=start + 1, truncate=True)
+    nav = []
+    if page > 0:
+        nav.append("«назад» — предыдущая страница")
+    if end < len(UNIVERSITIES):
+        nav.append("«далее» — следующая страница")
+    nav_text = "\n".join(nav) if nav else ""
+    message = f"{QUESTIONS['institution']}\n\n{list_text}"
+    if nav_text:
+        message += f"\n\n{nav_text}"
+    message += "\n\nВведите номер вашего учебного заведения."
+    send_message(user_id, message)
+
+def ask_step(user_id, step_key, uni_page=0, fio_text=None):
+    uni_page = uni_page if isinstance(uni_page, int) else 0
+    if step_key == "institution":
+        ask_university_page(user_id, uni_page)
+    elif step_key == "consent":
+        if fio_text is None:
+            conn = get_db()
+            try:
+                c = conn.cursor()
+                c.execute("SELECT fio FROM answers WHERE user_id=%s", (user_id,))
+                row = c.fetchone()
+                fio_text = row[0] if row and row[0] else "[ФИО не указано]"
+            finally:
+                release_db(conn)
+        message = QUESTIONS["consent"].format(fio=fio_text)
+        opts = OPTIONS["consent"]
+        list_text = format_numbered_list(opts, truncate=False)
+        hint = "Напишите номер выбранного варианта (1 или 2)."
+        send_message(user_id, f"{message}\n\n{list_text}\n\n{hint}")
+    elif step_key in OPTIONS:
+        opts = OPTIONS[step_key]
+        list_text = format_numbered_list(opts, truncate=False)
+        if step_key in MULTI_STEPS:
+            hint = "Напишите номера выбранных вариантов через запятую (например: 1, 3)."
+        else:
+            hint = "Напишите номер выбранного варианта (например: 1)."
+        message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
+        send_message(user_id, message)
+    else:
+        send_message(user_id, QUESTIONS[step_key])
+
+# ----------------- СОХРАНЕНИЕ ОТВЕТА + СДВИГ ПРОГРЕССА В ОДНОЙ ТРАНЗАКЦИИ -----------------
+def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=None):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        # Сохраняем ответ
+        if field:
+            c.execute(
+                f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
+                f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
+                (user_id, value)
+            )
+        # Сдвигаем прогресс
+        next_idx = step_index + 1
+        if next_idx >= len(STEPS):
+            # Анкета завершена
+            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (datetime.now(), user_id))
+            c.execute(
+                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
+                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
+                (user_id, next_idx, 0, 2, datetime.now(), next_idx, 0, 2)
+            )
+            conn.commit()
+        else:
+            c.execute(
+                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
+                "VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
+                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
+                (user_id, next_idx, 0, 1, datetime.now(), next_idx, 0, 1)
+            )
+            conn.commit()
+        # Обновляем кэш
+        with cache_lock:
+            if user_id not in progress_cache:
+                progress_cache[user_id] = {}
+            progress_cache[user_id]["step_index"] = next_idx
+            progress_cache[user_id]["uni_page"] = 0
+            progress_cache[user_id]["started"] = 2 if next_idx >= len(STEPS) else 1
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+    # Отправляем следующий шаг или сообщение о завершении
     if next_idx >= len(STEPS):
-        return len(STEPS) - 1  # последний шаг — finish
-    return next_idx
+        send_message(user_id, MESSAGES["finished"], KB_RESTART)
+    else:
+        ask_step(user_id, STEPS[next_idx], 0, fio_text)
+
+# ----------------- ПАРСИНГ -----------------
+
+def parse_single_number(text, max_val):
+    text = text.strip()
+    if text.isdigit():
+        n = int(text)
+        if 1 <= n <= max_val:
+            return n
+    return None
+
+def parse_multi_numbers(text, max_val):
+    try:
+        parts = [p.strip() for p in text.split(",") if p.strip()]
+        nums = [int(p) for p in parts]
+        if any(n < 1 or n > max_val for n in nums):
+            return None
+        return nums
+    except ValueError:
+        return None
+
+# ----------------- ПОДСЧЁТ БАЛЛОВ -----------------
+
+def calculate_scores(row):
+    scores = {}
+    emp = (row.get("employment_status") or "").lower()
+    if "трудовому договору" in emp:
+        scores["employment"] = 0
+    elif any(k in emp for k in ["гражданско-правовому", "самозанят", "стажировк", "временно"]):
+        scores["employment"] = 0
+    elif "ничего из вышеперечисленного" in emp:
+        scores["employment"] = 1
+    tc = (row.get("target_contract") or "").lower()
+    if "да" in tc and "нет" not in tc:
+        scores["target_contract"] = 0
+    elif "нет" in tc:
+        scores["target_contract"] = 2
+    exp = (row.get("experience") or "").lower()
+    if "да, есть опыт" in exp:
+        scores["experience"] = 0
+    elif "вне специальности" in exp:
+        scores["experience"] = 3
+    elif "нет, опыта" in exp:
+        scores["experience"] = 3
+    pe = (row.get("practice_eval") or "").lower()
+    if "не доволен" in pe or "недоволен" in pe:
+        scores["practice_eval"] = 2
+    elif "доволен" in pe:
+        scores["practice_eval"] = 0
+    elif "не проходил" in pe:
+        scores["practice_eval"] = 2
+    ev = (row.get("events") or "").lower()
+    if "за последний год" in ev:
+        scores["events"] = 0
+    elif "более года назад" in ev or "ни разу" in ev:
+        scores["events"] = 2
+    rs = (row.get("resume_status") or "").lower()
+    if "актуальное" in rs:
+        scores["resume"] = 0
+    elif "устарело" in rs or "не составлял" in rs:
+        scores["resume"] = 1
+    it = (row.get("interview_training") or "").lower()
+    if "да" in it and "не проходил" not in it:
+        scores["interview"] = 1
+    elif "не проходил" in it:
+        scores["interview"] = 0
+    ss = (row.get("special_status") or "").lower()
+    if "ничего из вышеперечисленного" in ss:
+        scores["special_status"] = 0
+    elif ss:
+        scores["special_status"] = 1
+    mil = (row.get("military") or "").lower()
+    if "да, планируется" in mil:
+        scores["military"] = 1
+    elif "нет" in mil or "не подлежу" in mil:
+        scores["military"] = 0
+    total = sum(v for v in scores.values())
+    return scores, total
+
+# ----------------- ВЫГРУЗКА -----------------
+
+EXPORT_HEADERS = {
+    "user_id": "ID пользователя", "fio": "ФИО", "institution": "Учебное заведение",
+    "specialty": "Специальность", "study_group": "Учебная группа", "course": "Курс",
+    "form_of_study": "Форма обучения", "contacts": "Контакты",
+    "employment_status": "Статус занятости", "target_contract": "Целевой договор",
+    "experience": "Опыт работы", "practice_eval": "Оценка практик",
+    "events": "Участие в мероприятиях", "resume_status": "Наличие резюме",
+    "interview_training": "Тренинги по собеседованию", "special_status": "Особый статус",
+    "military": "Призыв на военную службу", "maternity": "Отпуск по уходу за ребёнком",
+    "graduate": "Выпускной курс", "post_plans": "Планы после выпуска",
+    "help_needed": "Нужная помощь", "created_at": "Дата заполнения",
+}
+
+def export_to_table(admin_id, today_only=False):
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        if today_only:
+            today = date.today()
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
+        else:
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
+
+    if not rows:
+        send_message(admin_id, MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"])
+        return
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+
+    wb = Workbook()
+    ws1 = wb.active
+    ws1.title = "Анкеты"
+    cols = list(rows[0].keys())
+    header_font = Font(bold=True)
+    for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws1.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    for row_idx, r in enumerate(rows, start=2):
+        for col_idx, col_name in enumerate(cols, start=1):
+            val = r[col_name]
+            if col_name == "created_at" and val is not None:
+                val = val.strftime("%Y-%m-%d %H:%M")
+            ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+    for col in ws1.columns:
+        ws1.column_dimensions[col[0].column_letter].width = 25
+
+    bold_font = Font(bold=True)
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    district_headers = ["ФИО","Учебное заведение","Контакты","Статус занятости","Целевой договор","Опыт работы","Оценка практик","Мероприятия","Резюме","Собеседование","Особый статус","Военный призыв","Сумма баллов"]
+    score_keys = ["employment","target_contract","experience","practice_eval","events","resume","interview","special_status","military"]
+
+    def write_score_sheet(workbook, sheet_name, sheet_rows):
+        ws = workbook.create_sheet(title=sheet_name)
+        for col_idx, h in enumerate(district_headers, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+        sorted_rows = sorted(sheet_rows, key=lambda r: r.get("created_at") or datetime.min)
+        row_idx = 2
+        for r in sorted_rows:
+            scores, total = calculate_scores(dict(r))
+            ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
+            ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
+            ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
+            for i, key in enumerate(score_keys, start=4):
+                val = scores.get(key)
+                ws.cell(row=row_idx, column=i, value=val if val is not None else "")
+            total_cell = ws.cell(row=row_idx, column=13, value=total)
+            total_cell.font = bold_font
+            total_cell.fill = total_fill
+            row_idx += 1
+        for col_idx in range(1, len(district_headers) + 1):
+            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 25
+
+    for district_name in DISTRICTS_UNIVERSITIES:
+        district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
+        if district_rows:
+            write_score_sheet(wb, district_name, district_rows)
+    other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
+    if other_rows:
+        write_score_sheet(wb, "Прочие", other_rows)
+
+    fname = tempfile.mktemp(suffix=".xlsx")
+    wb.save(fname)
+    if not os.path.exists(fname) or os.path.getsize(fname) == 0:
+        send_message(admin_id, "❌ Не удалось создать файл выгрузки.")
+        try: os.remove(fname)
+        except: pass
+        return
+
+    try:
+        upload_server = vk.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
+        upload_url = upload_server['upload_url']
+        with open(fname, "rb") as f:
+            resp = requests.post(upload_url, files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}, timeout=30)
+        if not resp.content:
+            raise RuntimeError("VK вернул пустой ответ.")
+        result = resp.json()
+        if "file" not in result or not result["file"]:
+            raise RuntimeError(f"VK не принял файл: {result}")
+        file_data = result["file"]
+        file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
+        saved = vk.docs.save(file=file_data, title=file_title)
+        if isinstance(saved, dict) and "doc" in saved:
+            d = saved["doc"]
+        elif isinstance(saved, dict) and "docs" in saved and len(saved["docs"]) > 0:
+            d = saved["docs"][0]
+        else:
+            raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
+        attachment = f"doc{d['owner_id']}_{d['id']}"
+        sheet_list = []
+        for district_name in DISTRICTS_UNIVERSITIES:
+            count = sum(1 for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name)
+            if count:
+                sheet_list.append(f"  • «{district_name}» — {count} чел.")
+        if other_rows:
+            sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
+        sheets_text = "\n".join(sheet_list) if sheet_list else ""
+        header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n" if today_only else "📊 Вот полная выгрузка анкет:\n\n"
+        send_message(admin_id, f"{header}• Лист «Анкеты» — полные ответы\n• Листы по районам — ФИО, баллы:\n\n{sheets_text}\n\nВсего анкет: {len(rows)}", attachment=attachment)
+    except Exception as e:
+        log_msg(f"Ошибка загрузки .xlsx: {e}")
+        send_message(admin_id, f"❌ Не удалось отправить Excel: {e}\n\nПроверьте права токена.")
+    finally:
+        try: os.remove(fname)
+        except: pass
+
+# ----------------- ОБРАБОТКА НЕПРОЧИТАННЫХ (ОГРАНИЧЕННАЯ) -----------------
+
+def process_unread_messages():
+    processed = 0
+    skipped = 0
+    try:
+        result = vk.messages.getConversations(filter='unread', count=10, extended=0)
+    except Exception as e:
+        log_msg(f"Ошибка getConversations: {e}")
+        return
+    items = result.get('items', [])
+    if not items:
+        return
+    for conv in items:
+        conv_info = conv.get('conversation', {})
+        peer_id = conv_info.get('peer', {}).get('id')
+        unread_count = conv_info.get('unread_count', 0)
+        if not peer_id or unread_count == 0:
+            continue
+        try:
+            history = vk.messages.getHistory(peer_id=peer_id, count=1)
+        except Exception as e:
+            log_msg(f"Ошибка getHistory для peer_id={peer_id}: {e}")
+            continue
+        messages = history.get('items', [])
+        if not messages:
+            continue
+        last_msg = messages[0]
+        if last_msg.get('from_id', 0) < 0:
+            skipped += 1
+            try: vk.messages.markAsRead(peer_id=peer_id)
+            except: pass
+            continue
+        text = last_msg.get('text', '').strip()
+        if text:
+            try:
+                handle_message(peer_id, text)
+                processed += 1
+            except Exception as e:
+                log_msg(f"Ошибка обработки от {peer_id}: {e}")
+        try: vk.messages.markAsRead(peer_id=peer_id)
+        except: pass
+    log_msg(f"Обработано непрочитанных: {processed}, пропущено: {skipped}")
+
+# ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 def handle_message(user_id, text):
     t0 = time.time()
-    step_index, uni_page, started = get_progress_cached(user_id)
-    t_db_read = time.time() - t0
+    if not text or not user_id:
+        return
+    text_lower = text.lower()
 
-    # Если анкета ещё не начата — проверяем кнопку «Начать»
-    if started == 0 and text.strip().lower() in ["начать анкету", "начать"]:
-        set_progress_cached(user_id, 0, uni_page=0, started=1)
-        step_index = 0
-        ask_step(user_id, STEPS[step_index])
-        t_total = time.time() - t0
-        log_msg(f"handle_message user={user_id} step={STEPS[step_index]} duration={t_total:.3f}s db={t_db_read:.3f}s")
+    if text_lower in ["/export", "/выгрузить"]:
+        if user_id in ADMIN_IDS:
+            _executor_heavy.submit(export_to_table, user_id, False)
+        else:
+            send_message(user_id, MESSAGES["admin_only"])
         return
 
-    # Обработка по шагам
-    current_step = STEPS[step_index]
-    validated_value = None
-    error_msg = None
-
-    if current_step == "fio":
-        ok, result = validate_fio(text)
-        if not ok:
-            send_message(user_id, result)
-            t_total = time.time() - t0
-            log_msg(f"handle_message user={user_id} step={current_step} duration={t_total:.3f}s db={t_db_read:.3f}s")
-            return
-        validated_value = result
-    elif current_step == "consent":
-        lower = text.strip().lower()
-        if lower in ["да", "yes", "1"]:
-            validated_value = True
-        elif lower in ["нет", "no", "0"]:
-            validated_value = False
+    if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
+        if user_id in ADMIN_IDS:
+            _executor_heavy.submit(export_to_table, user_id, True)
         else:
-            send_message(user_id, "Пожалуйста, ответьте «Да» или «Нет».")
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    if text_lower == "/restart":
+        set_progress_cached(user_id, 0, 0, 0)
+        send_message(user_id, "Анкета сброшена. Нажмите «Начать анкету».", KB_START)
+        return
+
+    if text == "🔄 Пройти заново":
+        set_progress_cached(user_id, 0, 0, 0)
+        send_message(user_id, MESSAGES["welcome"], KB_START)
+        return
+
+    t_db_start = time.time()
+    step_index, uni_page, started = get_progress_cached(user_id)
+    t_db_read = time.time() - t_db_start
+    step_index = step_index if isinstance(step_index, int) else 0
+    uni_page = uni_page if isinstance(uni_page, int) else 0
+    started = started if isinstance(started, int) else 0
+
+    if started == 0:
+        if text == "Начать анкету":
+            set_progress_cached(user_id, 0, 0, 1)
+            ask_step(user_id, STEPS[0])
+        else:
+            send_message(user_id, MESSAGES["welcome"], KB_START)
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step=welcome duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
+
+    if started == 2 or step_index >= len(STEPS):
+        send_message(user_id, MESSAGES["already_finished"], KB_RESTART)
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step=finished duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
+
+    step_key = STEPS[step_index]
+    fio_text = None
+
+    if step_key == "fio":
+        ok, value = validate_fio(text)
+        if ok:
+            fio_text = value
+            save_and_advance(user_id, "fio", value, step_index, 0, fio_text)
+        else:
+            send_message(user_id, value)
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
+
+    if step_key == "institution":
+        if text.lower() in ["далее", ">", "следующий"]:
+            max_page = (len(UNIVERSITIES) - 1) // ITEMS_PER_PAGE
+            if uni_page < max_page:
+                set_progress_cached(user_id, step_index, uni_page + 1, 1)
+                ask_university_page(user_id, uni_page + 1)
+            else:
+                send_message(user_id, "Это последняя страница.")
+                ask_university_page(user_id, uni_page)
             t_total = time.time() - t0
-            log_msg(f"handle_message user={user_id} step={current_step} duration={t_total:.3f}s db={t_db_read:.3f}s")
+            log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
             return
-    elif current_step == "contacts":
-        ok, result = validate_contacts(text)
-        if not ok:
-            send_message(user_id, "Не удалось распознать контакты. Напишите телефон и/или email через пробел или запятую.")
+        elif text.lower() in ["назад", "<", "←"]:
+            if uni_page > 0:
+                set_progress_cached(user_id, step_index, uni_page - 1, 1)
+                ask_university_page(user_id, uni_page - 1)
+            else:
+                send_message(user_id, "Это первая страница.")
+                ask_university_page(user_id, uni_page)
             t_total = time.time() - t0
-            log_msg(f"handle_message user={user_id} step={current_step} duration={t_total:.3f}s db={t_db_read:.3f}s")
+            log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
             return
-        validated_value = result
-    elif current_step in ["course", "form_of_study", "employment_status", "military", "maternity", "graduate"]:
-        # Для простоты принимаем любой текст, можно добавить валидацию
-        validated_value = text.strip()
+        if text.isdigit():
+            idx = int(text) - 1
+            if 0 <= idx < len(UNIVERSITIES):
+                save_and_advance(user_id, "institution", UNIVERSITIES[idx], step_index, uni_page)
+                t_total = time.time() - t0
+                log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+                return
+        send_message(user_id, "Пожалуйста, введите номер учебного заведения из списка или используйте «далее» / «назад».")
+        ask_university_page(user_id, uni_page)
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
 
-    # Сохраняем ответ, если есть что сохранять
-    if validated_value is not None and current_step in STEP_TO_DB:
-        save_answer_db(user_id, STEP_TO_DB[current_step], validated_value)
+    if step_key == "contacts":
+        ok, value = validate_contacts(text)
+        if ok:
+            save_and_advance(user_id, "contacts", value, step_index)
+        else:
+            send_message(user_id, MESSAGES["invalid_contact"])
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
 
-    # Переходим к следующему шагу
-    next_idx = get_next_step_index(step_index)
-    set_progress_cached(user_id, next_idx, uni_page, 1)
+    if step_key in OPTIONS:
+        opts = OPTIONS[step_key]
+        if step_key == "consent":
+            n = parse_single_number(text, len(opts))
+            if n is None:
+                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
+                t_total = time.time() - t0
+                log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+                return
+            is_consent = (n == 1)
+            conn = get_db()
+            try:
+                c = conn.cursor()
+                c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
+                c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, user_id))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                release_db(conn)
+            save_and_advance(user_id, None, None, step_index)
+            t_total = time.time() - t0
+            log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+            return
 
-    # Показываем следующий шаг
-    ask_step(user_id, STEPS[next_idx])
+        if step_key in MULTI_STEPS:
+            nums = parse_multi_numbers(text, len(opts))
+            if nums is None:
+                send_message(user_id, MESSAGES["invalid_multi"].format(len(opts)))
+                t_total = time.time() - t0
+                log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+                return
+            label = "; ".join(opts[n - 1] for n in nums)
+            save_and_advance(user_id, STEP_TO_DB[step_key], label, step_index)
+        else:
+            n = parse_single_number(text, len(opts))
+            if n is None:
+                send_message(user_id, MESSAGES["invalid_number"].format(len(opts)))
+                t_total = time.time() - t0
+                log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+                return
+            save_and_advance(user_id, STEP_TO_DB[step_key], opts[n - 1], step_index)
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+        return
 
+    if step_key not in ["post_plans", "help_needed"]:
+        if len(text) < 2:
+            send_message(user_id, "Пожалуйста, введите более развёрнутый ответ.")
+            t_total = time.time() - t0
+            log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
+            return
+
+    save_and_advance(user_id, STEP_TO_DB[step_key], text, step_index)
     t_total = time.time() - t0
-    log_msg(f"handle_message user={user_id} step={current_step} duration={t_total:.3f}s db={t_db_read:.3f}s")
+    log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
 
-# ----------------- ФОНОВАЯ ОБРАБОТКА НЕПРОЧИТАННЫХ -----------------
-def process_unread_messages():
-    """Ограниченная фоновая обработка: только последние 10 непрочитанных диалогов"""
-    try:
-        vk_api_obj = vk_session.get_api()
-        resp = vk_api_obj.messages.getConversations(filter="unread", count=10)
-        items = resp.get("items", [])
-        for item in items:
-            peer = item.get("conversation", {}).get("peer", {})
-            if not peer:
-                continue
-            peer_id = peer.get("id")
-            # Получаем только последнее сообщение
-            history = vk_api_obj.messages.getHistory(peer_id=peer_id, count=1)
-            msgs = history.get("items", [])
-            if msgs:
-                msg = msgs[0]
-                text = msg.get("text", "")
-                user_id = msg.get("from_id")
-                if user_id:
-                    # Обрабатываем в отдельном потоке, чтобы не блокировать основной пул
-                    executor_heavy.submit(handle_message, user_id, text)
-    except Exception as e:
-        log_msg(f"Error in process_unread_messages: {e}")
+# ==================== FASTAPI ====================
 
-# ----------------- ПУЛЫ ПОТОКОВ -----------------
-_executor = ThreadPoolExecutor(max_workers=30)  # обычные ответы
-_executor_heavy = ThreadPoolExecutor(max_workers=3)  # фоновые задачи и тяжёлые операции
+app = FastAPI()
+bot_start_time = time.time()
+_executor = None
+_executor_heavy = None
 
-# ----------------- ОБРАБОТЧИК VK CALLBACK -----------------
-def callback_handler(event):
-    obj = event.get("object", {})
-    message = obj.get("message", {})
-    user_id = message.get("from_id")
-    text = message.get("text", "").strip()
-    if not user_id or not text:
-        return {"ok": True}
-
-    # Отправляем в пул для обычных ответов
-    _executor.submit(handle_message, user_id, text)
-    return {"ok": True}
-
-# ----------------- ЗАПУСК -----------------
-if __name__ == "__main__":
+@app.on_event("startup")
+async def startup_event():
+    global _executor, _executor_heavy
+    _executor = concurrent.futures.ThreadPoolExecutor(max_workers=30)
+    _executor_heavy = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     init_db_pool()
     init_db()
-    log_msg("DB initialized")
+    log_msg(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")
+    log_msg("Проверяю непрочитанные сообщения...")
+    threading.Thread(target=process_unread_messages, daemon=True).start()
 
-    # Запускаем фоновую обработку раз в 5 минут
-    def run_background():
-        while True:
-            time.sleep(300)
-            process_unread_messages()
+@app.post("/")
+async def vk_callback(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    threading.Thread(target=run_background, daemon=True).start()
-    log_msg("Background unread processor started")
+    event_type = data.get("type")
+    if not event_type:
+        raise HTTPException(status_code=400, detail="No event type")
 
-    from fastapi import FastAPI
-    app = FastAPI()
+    if event_type == "confirmation":
+        return PlainTextResponse(CALLBACK_CONFIRM_TOKEN)
 
-    @app.post("/")
-    async def vk_callback(event: dict):
-        # Это синхронный обработчик, но логика вынесена в потоки
-        callback_handler(event)
-        return {"ok": True}
+    if event_type == "message_new":
+        obj = data.get("object", {})
+        msg = obj.get("message", {})
+        user_id = msg.get("from_id") or msg.get("peer_id")
+        text = (msg.get("text") or "").strip()
+        msg_time = msg.get("date")
 
+        if not user_id or not text:
+            return PlainTextResponse("ok")
+
+        if msg_time and msg_time < bot_start_time:
+            try:
+                vk.messages.markAsRead(peer_id=user_id)
+            except Exception:
+                pass
+            return PlainTextResponse("ok")
+
+        _executor.submit(handle_message, user_id, text)
+        return PlainTextResponse("ok")
+
+    return PlainTextResponse("ok")
+
+if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

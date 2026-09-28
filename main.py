@@ -149,15 +149,12 @@ def init_db_pool():
     db_pool = psycopg2_pool.ThreadedConnectionPool(
         minconn=2,
         maxconn=30,
-        dsn=dsn
+        dsn=dsn,
+        options="-c statement_timeout=10000"
     )
 
 def get_db():
-    conn = db_pool.getconn()
-    cur = conn.cursor()
-    cur.execute("SET statement_timeout = 10000")
-    cur.close()
-    return conn
+    return db_pool.getconn()
 
 def release_db(conn):
     db_pool.putconn(conn)
@@ -597,7 +594,16 @@ def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=Non
     try:
         c = conn.cursor()
         # Сохраняем ответ
-        if field:
+        if field == "consent_status":
+            c.execute(
+                "INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id,)
+            )
+            c.execute(
+                "UPDATE answers SET consent_status=%s WHERE user_id=%s",
+                (value, user_id)
+            )
+        elif field:
             c.execute(
                 f"INSERT INTO answers (user_id, {field}) VALUES (%s, %s) "
                 f"ON CONFLICT (user_id) DO UPDATE SET {field}=EXCLUDED.{field}",
@@ -1065,18 +1071,7 @@ def handle_message(user_id, text):
                 log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
                 return
             is_consent = (n == 1)
-            conn = get_db()
-            try:
-                c = conn.cursor()
-                c.execute("INSERT INTO answers (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-                c.execute("UPDATE answers SET consent_status=%s WHERE user_id=%s", (is_consent, user_id))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                release_db(conn)
-            save_and_advance(user_id, None, None, step_index)
+            save_and_advance(user_id, "consent_status", is_consent, step_index)
             t_total = time.time() - t0
             log_msg(f"handle_message user={user_id} step={step_key} duration={t_total:.3f}s db={t_db_read:.3f}s")
             return

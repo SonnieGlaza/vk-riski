@@ -1087,7 +1087,7 @@ async def startup_event():
     global _executor, _executor_heavy
     from concurrent.futures import ThreadPoolExecutor
     _executor = ThreadPoolExecutor(max_workers=30)
-    _executor_heavy = ThreadPoolExecutor(max_workers=3)
+    _executor_heavy = ThreadPoolExecutor(max_workers=20)
     init_db_pool()
     init_db()
     log.info(f"Бот запущен. Время старта: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bot_start_time))}")

@@ -126,7 +126,8 @@ if not VK_TOKEN or not DATABASE_URL:
 # =====================================================
 
 # ----------------- VK СЕССИЯ С ТАЙМАУТОМ -----------------
-vk_session = vk_api.VkApi(token=VK_TOKEN)
+vk_session_type = getattr(vk_api, "VkApiGroup", vk_api.VkApi)
+vk_session = vk_session_type(token=VK_TOKEN)
 vk = vk_session.get_api()
 # Keep-alive pool aligned with the message worker count (requests defaults to 10).
 vk_session.http.mount("https://", HTTPAdapter(pool_connections=30, pool_maxsize=30))
@@ -286,15 +287,48 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
         progress_cache[user_id]["started"] = started
 
 # ----------------- ОТПРАВКА СООБЩЕНИЙ -----------------
+_vk_thread = threading.local()
+_vk_send_rate_lock = threading.Lock()
+_vk_next_send_at = 0.0
+_VK_SEND_INTERVAL = 0.1  # 10 отправок/с, оставляя запас для других методов API.
+
+def _get_message_vk():
+    api = getattr(_vk_thread, "api", None)
+    if api is None:
+        session_type = getattr(vk_api, "VkApiGroup", vk_api.VkApi)
+        session = session_type(token=VK_TOKEN, api_version=vk_session.api_version)
+        session.http.mount("https://", HTTPAdapter(pool_connections=1, pool_maxsize=1))
+        original_request = session.http.request
+
+        def request_with_timeout(method, url, **kwargs):
+            kwargs.setdefault("timeout", 5)
+            return original_request(method, url, **kwargs)
+
+        session.http.request = request_with_timeout
+        _vk_thread.session = session
+        _vk_thread.api = session.get_api()
+        api = _vk_thread.api
+    return api
+
+def _wait_for_vk_send_slot():
+    global _vk_next_send_at
+    with _vk_send_rate_lock:
+        now = time.monotonic()
+        slot = max(now, _vk_next_send_at)
+        _vk_next_send_at = slot + _VK_SEND_INTERVAL
+    if slot > now:
+        time.sleep(slot - now)
+
 def send_message(user_id, message, keyboard=None, attachment=None):
     started = time.monotonic()
     try:
+        _wait_for_vk_send_slot()
         params = {"peer_id": user_id, "message": message, "random_id": get_random_id()}
         if keyboard:
             params["keyboard"] = keyboard
         if attachment:
             params["attachment"] = attachment
-        vk.messages.send(**params)
+        _get_message_vk().messages.send(**params)
         elapsed = time.monotonic() - started
         if elapsed >= 1:
             log.warning("Медленная отправка VK peer=%s duration=%.3fs", user_id, elapsed)

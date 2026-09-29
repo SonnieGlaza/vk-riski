@@ -927,7 +927,7 @@ def export_to_table(admin_id, today_only=False):
         return
 
     from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
     wb = Workbook()
     ws1 = wb.active
@@ -944,8 +944,100 @@ def export_to_table(admin_id, today_only=False):
             if col_name == "created_at" and val is not None:
                 val = val.strftime("%Y-%m-%d %H:%M")
             ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+
+    # Summary table in Y:AE, alongside the detailed survey export.
+    def education_type(row):
+        institution = str(row.get("institution") or "").strip().casefold()
+        if not institution:
+            return "Не указано"
+        if any(marker in institution for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
+            return "ВО"
+        return "СПО"
+
+    grouped_rows = {"СПО": [], "ВО": [], "Не указано": []}
+    for row in rows:
+        grouped_rows[education_type(row)].append(row)
+
+    ws1["Y1"] = "Студенты"
+    ws1["Z1"] = (
+        "Количество студентов ПОО, в отношении которых проведена "
+        "оценка риска нетрудоустройства, чел."
+    )
+    ws1["AB1"] = "Число студентов ПОО, находящихся под риском нетрудоустройства, чел."
+    ws1["Z2"] = "Всего"
+    ws1["AA2"] = "Из них"
+    ws1["AA4"] = "Студентов выпускных курсов"
+    ws1["AB2"] = "Всего"
+    ws1["AC2"] = "Из них"
+    ws1["AC3"] = (
+        "Студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    )
+    ws1["AD3"] = "Студентов выпускных курсов"
+    ws1["AE3"] = "Из них"
+    ws1["AE4"] = (
+        "Студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    )
+    for merged_range in (
+        "Y1:Y4", "Z1:AA1", "Z2:Z4", "AA2:AA3", "AB1:AE1", "AB2:AB4",
+        "AC2:AE2", "AC3:AC4", "AD3:AD4"
+    ):
+        ws1.merge_cells(merged_range)
+
+    thin_border = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000")
+    )
+    summary_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    for row in ws1.iter_rows(min_row=1, max_row=4, min_col=25, max_col=31):
+        for cell in row:
+            cell.font = Font(bold=True, size=10)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.fill = summary_header_fill
+            cell.border = thin_border
+
+    summary_levels = ["СПО", "ВО"]
+    if grouped_rows["Не указано"]:
+        summary_levels.append("Не указано")
+    for row_idx, level in enumerate(summary_levels, start=5):
+        level_rows = grouped_rows[level]
+        risk_rows = [r for r in level_rows if calculate_scores(dict(r))[1] >= 5]
+        graduate_rows = [r for r in level_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
+        risk_graduates = [r for r in risk_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
+
+        def has_special_circumstances(row):
+            return any(
+                str(row.get(field) or "").strip().casefold().startswith("да")
+                for field in ("military", "maternity")
+            )
+
+        values = (
+            level,
+            len(level_rows),
+            len(graduate_rows),
+            len(risk_rows),
+            sum(1 for r in risk_rows if has_special_circumstances(r)),
+            len(risk_graduates),
+            sum(1 for r in risk_graduates if has_special_circumstances(r))
+        )
+        for col_idx, value in enumerate(values, start=25):
+            cell = ws1.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = thin_border
+
+    ws1.row_dimensions[1].height = 60
+    ws1.row_dimensions[2].height = 32
+    ws1.row_dimensions[3].height = 75
+    ws1.row_dimensions[4].height = 75
     for col in ws1.columns:
         ws1.column_dimensions[col[0].column_letter].width = 25
+    for column, width in {
+        "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
+    }.items():
+        ws1.column_dimensions[column].width = width
 
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")

@@ -1122,18 +1122,31 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
             raise RuntimeError("Не удалось создать файл выгрузки.")
 
         api = _get_message_vk()
-        upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
-        upload_url = upload_server['upload_url']
-        with open(fname, "rb") as f:
-            resp = requests.post(
-                upload_url,
-                files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                timeout=30
+        result = None
+        max_upload_attempts = 3
+        for attempt in range(1, max_upload_attempts + 1):
+            upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
+            upload_url = upload_server['upload_url']
+            with open(fname, "rb") as f:
+                resp = requests.post(
+                    upload_url,
+                    files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                    timeout=30
+                )
+            resp.raise_for_status()
+            result = resp.json()
+            if result.get("file"):
+                break
+
+            upload_error = str(result).casefold()
+            if "no_free_space" not in upload_error or attempt == max_upload_attempts:
+                raise RuntimeError(f"VK не принял файл: {result}")
+            delay = 2 ** (attempt - 1)
+            log.warning(
+                "VK upload server has no free space; retry %s/%s in %ss",
+                attempt, max_upload_attempts, delay
             )
-        resp.raise_for_status()
-        result = resp.json()
-        if not result.get("file"):
-            raise RuntimeError(f"VK не принял файл: {result}")
+            time.sleep(delay)
 
         file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
         saved = api.docs.save(file=result["file"], title=file_title)
@@ -1173,12 +1186,19 @@ def _run_export_task(admin_id, today_only, inbox_id=None):
     try:
         export_to_table(admin_id, today_only, inbox_id)
         log.info("Задача выгрузки завершена admin=%s today_only=%s", admin_id, today_only)
-    except Exception:
+    except Exception as exc:
         log.exception("Не удалось подготовить выгрузку для admin=%s", admin_id)
+        if "no_free_space" in str(exc).casefold():
+            failure_message = (
+                "VK сформировал отказ из-за отсутствия свободного места на сервере загрузки. "
+                "Файл не удалось передать; попробуйте повторить выгрузку позже."
+            )
+        else:
+            failure_message = "❌ Не удалось сформировать или отправить выгрузку. Подробности записаны в журнал."
         try:
             _queue_export_reply(
                 admin_id,
-                "❌ Не удалось сформировать или отправить выгрузку. Подробности записаны в журнал.",
+                failure_message,
                 inbox_id
             )
         except Exception:

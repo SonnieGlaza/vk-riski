@@ -420,8 +420,19 @@ def send_message(user_id, message, keyboard=None, attachment=None, random_id=Non
         if elapsed >= 1:
             log.warning("Медленная отправка VK peer=%s duration=%.3fs", user_id, elapsed)
         return True
-    except Exception:
+    except Exception as exc:
         elapsed = time.monotonic() - started
+        error_code = getattr(exc, "code", None)
+        if error_code is None:
+            error_data = getattr(exc, "error", None)
+            if isinstance(error_data, dict):
+                error_code = error_data.get("error_code")
+        if str(error_code) == "901":
+            log.error(
+                "VK запретил отправку peer=%s: пользователь не разрешил сообщения "
+                "от сообщества (ApiError 901)", user_id
+            )
+            return None
         log.exception("Ошибка отправки VK peer=%s duration=%.3fs", user_id, elapsed)
         return False
 
@@ -909,7 +920,30 @@ EXPORT_HEADERS = {
     "help_needed": "Нужная помощь", "created_at": "Дата заполнения",
 }
 
-def export_to_table(admin_id, today_only=False):
+def _queue_export_reply(admin_id, message, inbox_id=None, attachment=None):
+    if inbox_id is None:
+        return send_message(admin_id, message, attachment=attachment)
+
+    conn = db_pool.getconn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO bot_outbox "
+            "(inbox_id, sequence, peer_id, message, attachment, random_id) "
+            "VALUES (%s,1,%s,%s,%s,%s) ON CONFLICT (inbox_id, sequence) DO NOTHING",
+            (inbox_id, admin_id, message, attachment, get_random_id())
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        db_pool.putconn(conn)
+    _outbox_wake.set()
+    return True
+
+
+def export_to_table(admin_id, today_only=False, inbox_id=None):
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
@@ -923,8 +957,12 @@ def export_to_table(admin_id, today_only=False):
         release_db(conn)
 
     if not rows:
-        send_message(admin_id, MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"])
-        return
+        _queue_export_reply(
+            admin_id,
+            MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
+            inbox_id
+        )
+        return True
 
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -1075,35 +1113,37 @@ def export_to_table(admin_id, today_only=False):
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)
 
-    fname = tempfile.mktemp(suffix=".xlsx")
-    wb.save(fname)
-    if not os.path.exists(fname) or os.path.getsize(fname) == 0:
-        send_message(admin_id, "❌ Не удалось создать файл выгрузки.")
-        try: os.remove(fname)
-        except: pass
-        return
-
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as temp_file:
+        fname = temp_file.name
     try:
+        wb.save(fname)
+        if not os.path.exists(fname) or os.path.getsize(fname) == 0:
+            raise RuntimeError("Не удалось создать файл выгрузки.")
+
         api = _get_message_vk()
         upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
         upload_url = upload_server['upload_url']
         with open(fname, "rb") as f:
-            resp = requests.post(upload_url, files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}, timeout=30)
-        if not resp.content:
-            raise RuntimeError("VK вернул пустой ответ.")
+            resp = requests.post(
+                upload_url,
+                files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                timeout=30
+            )
+        resp.raise_for_status()
         result = resp.json()
-        if "file" not in result or not result["file"]:
+        if not result.get("file"):
             raise RuntimeError(f"VK не принял файл: {result}")
-        file_data = result["file"]
+
         file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
-        saved = api.docs.save(file=file_data, title=file_title)
+        saved = api.docs.save(file=result["file"], title=file_title)
         if isinstance(saved, dict) and "doc" in saved:
-            d = saved["doc"]
-        elif isinstance(saved, dict) and "docs" in saved and len(saved["docs"]) > 0:
-            d = saved["docs"][0]
+            document = saved["doc"]
+        elif isinstance(saved, dict) and saved.get("docs"):
+            document = saved["docs"][0]
         else:
             raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
-        attachment = f"doc{d['owner_id']}_{d['id']}"
+        attachment = f"doc{document['owner_id']}_{document['id']}"
+
         sheet_list = []
         for district_name in DISTRICTS_UNIVERSITIES:
             count = sum(1 for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name)
@@ -1113,13 +1153,62 @@ def export_to_table(admin_id, today_only=False):
             sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
         sheets_text = "\n".join(sheet_list) if sheet_list else ""
         header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n" if today_only else "📊 Вот полная выгрузка анкет:\n\n"
-        send_message(admin_id, f"{header}• Лист «Анкеты» — полные ответы\n• Листы по районам — ФИО, баллы:\n\n{sheets_text}\n\nВсего анкет: {len(rows)}", attachment=attachment)
-    except Exception as e:
-        log_msg(f"Ошибка загрузки .xlsx: {e}")
-        send_message(admin_id, f"❌ Не удалось отправить Excel: {e}\n\nПроверьте права токена.")
+        _queue_export_reply(
+            admin_id,
+            f"{header}• Лист «Анкеты» — полные ответы\n• Листы по районам — ФИО, баллы:\n\n{sheets_text}\n\nВсего анкет: {len(rows)}",
+            inbox_id,
+            attachment
+        )
+        log.info("Файл выгрузки загружен и поставлен в outbox admin=%s rows=%s", admin_id, len(rows))
+        return True
     finally:
-        try: os.remove(fname)
-        except: pass
+        try:
+            os.remove(fname)
+        except OSError:
+            log.warning("Не удалось удалить временный файл выгрузки: %s", fname)
+
+def _run_export_task(admin_id, today_only, inbox_id=None):
+    log.info("Запуск задачи выгрузки admin=%s today_only=%s", admin_id, today_only)
+    try:
+        export_to_table(admin_id, today_only, inbox_id)
+        log.info("Задача выгрузки завершена admin=%s today_only=%s", admin_id, today_only)
+    except Exception:
+        log.exception("Не удалось подготовить выгрузку для admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id,
+                "❌ Не удалось сформировать или отправить выгрузку. Подробности записаны в журнал.",
+                inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось поставить сообщение об ошибке выгрузки в outbox admin=%s", admin_id)
+
+
+def _submit_export(admin_id, today_only, inbox_id=None):
+    try:
+        if _executor_heavy is None:
+            raise RuntimeError("Фоновый исполнитель выгрузки ещё не запущен")
+        _executor_heavy.submit(_run_export_task, admin_id, today_only, inbox_id)
+        log.info("Задача выгрузки поставлена в очередь admin=%s today_only=%s", admin_id, today_only)
+    except Exception:
+        log.exception("Не удалось запустить выгрузку для admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id,
+                "❌ Не удалось запустить выгрузку. Попробуйте позже.",
+                inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось поставить сообщение о запуске выгрузки в outbox admin=%s", admin_id)
+
+
+def _schedule_export(admin_id, today_only):
+    context = _current_inbox_context()
+    if context is not None:
+        context["exports"].append((admin_id, today_only, context["inbox_id"]))
+        return
+    _submit_export(admin_id, today_only)
+
 
 # ----------------- ДОЛГОВЕЧНАЯ ОЧЕРЕДЬ ВХОДЯЩИХ -----------------
 def enqueue_incoming(user_id, peer_id, message_id, text, vk_date=None):
@@ -1305,15 +1394,21 @@ def handle_message(user_id, text):
     text_lower = text.lower()
 
     if text_lower in ["/export", "/выгрузить"]:
-        if user_id in ADMIN_IDS:
-            _executor_heavy.submit(export_to_table, user_id, False)
+        is_admin = user_id in ADMIN_IDS
+        log.info("Команда выгрузки user=%s is_admin=%s", user_id, is_admin)
+        if is_admin:
+            send_message(user_id, "📊 Запрос на выгрузку принят. Подготавливаю файл…")
+            _schedule_export(user_id, False)
         else:
             send_message(user_id, MESSAGES["admin_only"])
         return
 
     if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
-        if user_id in ADMIN_IDS:
-            _executor_heavy.submit(export_to_table, user_id, True)
+        is_admin = user_id in ADMIN_IDS
+        log.info("Команда выгрузки за сегодня user=%s is_admin=%s", user_id, is_admin)
+        if is_admin:
+            send_message(user_id, "📊 Запрос на выгрузку за сегодня принят. Подготавливаю файл…")
+            _schedule_export(user_id, True)
         else:
             send_message(user_id, MESSAGES["admin_only"])
         return
@@ -1553,9 +1648,11 @@ def _process_one_inbox():
 
         inbox_id, user_id, text = row
         context = {
+            "inbox_id": inbox_id,
             "borrowed_connection": _BorrowedConnection(conn),
             "progress_updates": {},
-            "replies": []
+            "replies": [],
+            "exports": []
         }
         _inbox_context.current = context
         with _lock_user(user_id):
@@ -1578,6 +1675,8 @@ def _process_one_inbox():
             _apply_progress_updates(context)
             if context["replies"]:
                 _outbox_wake.set()
+            for export_job in context["exports"]:
+                _submit_export(*export_job)
             log.info("inbox_done id=%s user=%s replies=%s", inbox_id, user_id, len(context["replies"]))
         return True
     except Exception as e:
@@ -1639,11 +1738,23 @@ def _process_one_outbox():
     try:
         conn = db_pool.getconn()
         c = conn.cursor()
-        if sent:
+        if sent is True:
             c.execute(
                 "UPDATE bot_outbox SET status='sent', sent_at=now(), locked_at=NULL, last_error=NULL "
                 "WHERE id=%s",
                 (outbox_id,)
+            )
+        elif sent is None:
+            c.execute(
+                "UPDATE bot_outbox SET status='undeliverable', locked_at=NULL, "
+                "last_error='VK ApiError 901: user has not allowed community messages' "
+                "WHERE peer_id=%s AND status IN ('pending','sending')",
+                (peer_id,)
+            )
+            log.warning(
+                "Отклонены ожидающие сообщения peer=%s: VK ApiError 901; "
+                "пользователь должен разрешить сообщения сообщества",
+                peer_id
             )
         else:
             delay = min(60, 2 ** min(attempts + 1, 6))
@@ -1653,7 +1764,7 @@ def _process_one_outbox():
                 "WHERE id=%s",
                 (delay, outbox_id)
             )
-            if attempts + 1 >= 10:
+            if attempts + 1 == 10 or (attempts + 1) % 100 == 0:
                 log.error(
                     "VK send failed outbox_id=%s peer=%s attempts=%s; retry in %ss",
                     outbox_id, peer_id, attempts + 1, delay

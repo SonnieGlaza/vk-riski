@@ -966,6 +966,7 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
 
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws1 = wb.active
@@ -1070,8 +1071,8 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
     ws1.row_dimensions[2].height = 32
     ws1.row_dimensions[3].height = 75
     ws1.row_dimensions[4].height = 75
-    for col in ws1.columns:
-        ws1.column_dimensions[col[0].column_letter].width = 25
+    for col_idx in range(1, ws1.max_column + 1):
+        ws1.column_dimensions[get_column_letter(col_idx)].width = 25
     for column, width in {
         "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
     }.items():

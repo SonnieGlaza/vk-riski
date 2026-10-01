@@ -1137,7 +1137,7 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
                 resp = requests.post(
                     upload_url,
                     files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                    timeout=130
+                    timeout=30
                 )
             resp.raise_for_status()
             result = resp.json()

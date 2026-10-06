@@ -860,10 +860,12 @@ def calculate_scores(row):
     emp = (row.get("employment_status") or "").lower()
     if "трудовому договору" in emp:
         scores["employment"] = 0
-    elif any(k in emp for k in ["гражданско-правовому", "самозанят", "стажировк", "временно"]):
+    elif any(k in emp for k in ["гражданско-правовому", "самозанят", "стажировк"]):
         scores["employment"] = 0
     elif "ничего из вышеперечисленного" in emp:
         scores["employment"] = 1
+    elif "Работаю временно (разовые подработки), не по специальности обучения" in emp:
+        scores ["employment"] = 1
     tc = (row.get("target_contract") or "").lower()
     if "да" in tc and "нет" not in tc:
         scores["target_contract"] = 0

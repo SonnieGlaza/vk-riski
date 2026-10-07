@@ -1088,7 +1088,7 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
 
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    district_headers = ["ФИО","Учебное заведение","Контакты","Статус занятости","Целевой договор","Опыт работы","Оценка практик","Мероприятия","Резюме","Собеседование","Особый статус","Военный призыв","Сумма баллов"]
+    district_headers = ["ФИО","Учебное заведение","Контакты","Согласие на обработку ПДн","Статус занятости","Целевой договор","Опыт работы","Оценка практик","Мероприятия","Резюме","Собеседование","Особый статус","Военный призыв","Сумма баллов","Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)","Получивший хотя бы один сервис из ПКР, (да/нет)","Полностью получивший сервисы из ПКР, (да/нет)","Получивший сервис «Подбор стажировки», (да/нет)","Получивший сервис «Подбор практики», (да/нет)","Получивший сервис «Целевое обучение», (да/нет)"]
     score_keys = ["employment","target_contract","experience","practice_eval","events","resume","interview","special_status","military"]
 
     def write_score_sheet(workbook, sheet_name, sheet_rows):
@@ -1104,10 +1104,12 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
             ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
             ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
             ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
-            for i, key in enumerate(score_keys, start=4):
+            consent_val = r.get("consent_status")
+            ws.cell(row=row_idx, column=4, value="Да" if consent_val is True else ("Нет" if consent_val is False else ""))
+            for i, key in enumerate(score_keys, start=5):
                 val = scores.get(key)
                 ws.cell(row=row_idx, column=i, value=val if val is not None else "")
-            total_cell = ws.cell(row=row_idx, column=13, value=total)
+            total_cell = ws.cell(row=row_idx, column=14, value=total)
             total_cell.font = bold_font
             total_cell.fill = total_fill
             row_idx += 1

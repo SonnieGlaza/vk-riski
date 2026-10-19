@@ -393,6 +393,29 @@ def _wait_for_vk_send_slot():
     if slot > now:
         time.sleep(slot - now)
 
+_vk_last_error = threading.local()
+
+def _set_last_send_error(text):
+    _vk_last_error.text = text
+
+def _take_last_send_error():
+    text = getattr(_vk_last_error, "text", None)
+    _vk_last_error.text = None
+    return text
+
+def _vk_error_code(exc):
+    code = getattr(exc, "code", None)
+    if code is None:
+        error_data = getattr(exc, "error", None)
+        if isinstance(error_data, dict):
+            code = error_data.get("error_code")
+    return None if code is None else str(code)
+
+def _is_attachment_error(exc):
+    """VK отверг именно вложение (ошибка 100/113), а не всю отправку."""
+    text = str(exc).lower()
+    return _vk_error_code(exc) in ("100", "113") and ("attach" in text or "doc" in text or "param" in text)
+
 def send_message(user_id, message, keyboard=None, attachment=None, random_id=None):
     context = _current_inbox_context()
     if context is not None:
@@ -416,7 +439,21 @@ def send_message(user_id, message, keyboard=None, attachment=None, random_id=Non
             params["keyboard"] = keyboard
         if attachment:
             params["attachment"] = attachment
-        _get_message_vk().messages.send(**params)
+        try:
+            _get_message_vk().messages.send(**params)
+        except Exception as exc:
+            # Вложение могло устареть/не пройти проверку VK. Тогда терять весь ответ
+            # незачем: отправляем текст без файла и громко пишем причину в журнал.
+            if attachment and _is_attachment_error(exc):
+                log.warning(
+                    "VK отклонил вложение %s для peer=%s (%s) — повторяю без файла",
+                    attachment, user_id, exc
+                )
+                _set_last_send_error(f"attachment rejected: {exc}"[:500])
+                params.pop("attachment", None)
+                _get_message_vk().messages.send(**params)
+            else:
+                raise
         elapsed = time.monotonic() - started
         if elapsed >= 1:
             log.warning("Медленная отправка VK peer=%s duration=%.3fs", user_id, elapsed)
@@ -429,11 +466,13 @@ def send_message(user_id, message, keyboard=None, attachment=None, random_id=Non
             if isinstance(error_data, dict):
                 error_code = error_data.get("error_code")
         if str(error_code) == "901":
+            _set_last_send_error("VK ApiError 901: user has not allowed community messages")
             log.error(
                 "VK запретил отправку peer=%s: пользователь не разрешил сообщения "
                 "от сообщества (ApiError 901)", user_id
             )
             return None
+        _set_last_send_error(f"{error_code}: {exc}"[:500])
         log.exception("Ошибка отправки VK peer=%s duration=%.3fs", user_id, elapsed)
         return False
 
@@ -936,18 +975,29 @@ def _queue_export_reply(admin_id, message, inbox_id=None, attachment=None):
     conn = db_pool.getconn()
     try:
         c = conn.cursor()
+        # Номер sequence не фиксированный: несколько ответов на одну заявку (старт, файл,
+        # ошибка) раньше писались все как sequence=1, и ON CONFLICT DO NOTHING молча
+        # выбрасывал сообщение с файлом. Теперь берём следующий свободный номер.
         c.execute(
             "INSERT INTO bot_outbox "
             "(inbox_id, sequence, peer_id, message, attachment, random_id) "
-            "VALUES (%s,1,%s,%s,%s,%s) ON CONFLICT (inbox_id, sequence) DO NOTHING",
-            (inbox_id, admin_id, message, attachment, get_random_id())
+            "SELECT %s, COALESCE(MAX(sequence), -1) + 1, %s, %s, %s, %s "
+            "FROM bot_outbox WHERE inbox_id = %s "
+            "RETURNING id, sequence",
+            (inbox_id, admin_id, message, attachment, get_random_id(), inbox_id)
         )
+        row = c.fetchone()
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         db_pool.putconn(conn)
+    outbox_id = row[0] if row else None
+    log.info(
+        "outbox_enqueue id=%s inbox=%s peer=%s sequence=%s attachment=%s",
+        outbox_id, inbox_id, admin_id, row[1] if row else None, attachment or "нет"
+    )
     _outbox_wake.set()
     return True
 
@@ -1258,6 +1308,9 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
         else:
             raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
         attachment = f"doc{document['owner_id']}_{document['id']}"
+        if document.get("access_key"):
+            attachment += f"_{document['access_key']}"
+        log.info("Выгрузка: файл загружен в VK, вложение=%s", attachment)
 
         sheet_list = []
         for district_name in DISTRICTS_UNIVERSITIES:
@@ -1679,6 +1732,7 @@ def handle_message(user_id, text):
 MAX_INBOX_ATTEMPTS = 8
 INBOX_WORKERS = 20
 OUTBOX_WORKERS = 12
+OUTBOX_MAX_ATTEMPTS = 12
 _inbox_executor = None
 _outbox_executor = None
 _executor_heavy = None
@@ -1855,6 +1909,12 @@ def _process_one_outbox():
         if conn:
             db_pool.putconn(conn)
 
+    if attachment:
+        log.info(
+            "outbox_send id=%s peer=%s attachment=%s attempts=%s",
+            outbox_id, peer_id, attachment, attempts + 1
+        )
+    _take_last_send_error()
     sent = send_message(peer_id, message, keyboard, attachment, random_id=random_id)
     conn = None
     try:
@@ -1866,6 +1926,8 @@ def _process_one_outbox():
                 "WHERE id=%s",
                 (outbox_id,)
             )
+            if attachment:
+                log.info("outbox_sent id=%s peer=%s attachment=%s", outbox_id, peer_id, attachment)
         elif sent is None:
             c.execute(
                 "UPDATE bot_outbox SET status='undeliverable', locked_at=NULL, "
@@ -1880,16 +1942,30 @@ def _process_one_outbox():
             )
         else:
             delay = min(60, 2 ** min(attempts + 1, 6))
-            c.execute(
-                "UPDATE bot_outbox SET status='pending', locked_at=NULL, "
-                "available_at=now() + (%s * interval '1 second'), last_error='VK send failed' "
-                "WHERE id=%s",
-                (delay, outbox_id)
-            )
-            if attempts + 1 == 10 or (attempts + 1) % 100 == 0:
+            error_text = _take_last_send_error() or "VK send failed"
+            if attempts + 1 >= OUTBOX_MAX_ATTEMPTS:
+                # Старая "отравленная" строка раньше ретраилась бесконечно и блокировала
+                # все последующие сообщения этому peer — теперь она уходит в failed.
+                c.execute(
+                    "UPDATE bot_outbox SET status='failed', locked_at=NULL, last_error=%s "
+                    "WHERE id=%s",
+                    (error_text, outbox_id)
+                )
                 log.error(
-                    "VK send failed outbox_id=%s peer=%s attempts=%s; retry in %ss",
-                    outbox_id, peer_id, attempts + 1, delay
+                    "outbox_failed id=%s peer=%s attempts=%s error=%s — строка снята с очереди, "
+                    "следующие сообщения больше не ждут",
+                    outbox_id, peer_id, attempts + 1, error_text
+                )
+            else:
+                c.execute(
+                    "UPDATE bot_outbox SET status='pending', locked_at=NULL, "
+                    "available_at=now() + (%s * interval '1 second'), last_error=%s "
+                    "WHERE id=%s",
+                    (delay, error_text, outbox_id)
+                )
+                log.warning(
+                    "outbox_retry id=%s peer=%s attempts=%s delay=%ss error=%s",
+                    outbox_id, peer_id, attempts + 1, delay, error_text
                 )
         conn.commit()
     except Exception:

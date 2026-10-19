@@ -18,6 +18,7 @@ from fastapi.responses import PlainTextResponse
 import requests
 from requests.adapters import HTTPAdapter
 import concurrent.futures
+from openpyxl.styles import Font
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

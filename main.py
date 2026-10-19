@@ -1088,33 +1088,123 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
 
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    district_headers = ["ФИО","Учебное заведение","Контакты","Согласие на обработку ПДн","Статус занятости","Целевой договор","Опыт работы","Оценка практик","Мероприятия","Резюме","Собеседование","Особый статус","Военный призыв","Сумма баллов","Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)","Получивший хотя бы один сервис из ПКР, (да/нет)","Полностью получивший сервисы из ПКР, (да/нет)","Получивший сервис «Подбор стажировки», (да/нет)","Получивший сервис «Подбор практики», (да/нет)","Получивший сервис «Целевое обучение», (да/нет)"]
-    score_keys = ["employment","target_contract","experience","practice_eval","events","resume","interview","special_status","military"]
+    district_headers = [
+    "ФИО",
+    "Учебное заведение",
+    "Контакты",
+    "Согласие на обработку ПДн",
+    "Учебная группа",      # Новая колонка
+    "Курс",                # Новая колонка
+    "Дата заполнения",     # Новая колонка
+    "Статус занятости",
+    "Целевой договор",
+    "Опыт работы",
+    "Оценка практик",
+    "Мероприятия",
+    "Резюме",
+    "Собеседование",
+    "Особый статус",
+    "Военный призыв",
+    "Сумма баллов",        # Теперь это колонка 17
+    "Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)",
+    "Получивший хотя бы один сервис из ПКР, (да/нет)",
+    "Полностью получивший сервисы из ПКР, (да/нет)",
+    "Получивший сервис «Подбор стажировки», (да/нет)",
+    "Получивший сервис «Подбор практики», (да/нет)",
+    "Получивший сервис «Целевое обучение», (да/нет)"
+]
 
-    def write_score_sheet(workbook, sheet_name, sheet_rows):
-        ws = workbook.create_sheet(title=sheet_name)
-        for col_idx, h in enumerate(district_headers, start=1):
-            cell = ws.cell(row=1, column=col_idx, value=h)
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
-        sorted_rows = sorted(sheet_rows, key=lambda r: r.get("created_at") or datetime.min)
-        row_idx = 2
-        for r in sorted_rows:
-            scores, total = calculate_scores(dict(r))
-            ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
-            ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
-            ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
-            consent_val = r.get("consent_status")
-            ws.cell(row=row_idx, column=4, value="Да" if consent_val is True else ("Нет" if consent_val is False else ""))
-            for i, key in enumerate(score_keys, start=5):
-                val = scores.get(key)
-                ws.cell(row=row_idx, column=i, value=val if val is not None else "")
-            total_cell = ws.cell(row=row_idx, column=14, value=total)
-            total_cell.font = bold_font
-            total_cell.fill = total_fill
-            row_idx += 1
-        for col_idx in range(1, len(district_headers) + 1):
-            ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 25
+# Если у тебя нет переменной header_font, создадим её здесь, чтобы код не упал
+if 'header_font' not in globals():
+    header_font = Font(bold=True, size=10)
+
+bold_font = Font(bold=True)
+total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+score_keys = ["employment", "target_contract", "experience", "practice_eval", "events", "resume", "interview", "special_status", "military"]
+
+
+# ==============================================================================
+# 2. ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ write_score_sheet
+# ==============================================================================
+def write_score_sheet(workbook, sheet_name, sheet_rows):
+    ws = workbook.create_sheet(title=sheet_name)
+
+    # Пишем заголовки
+    for col_idx, h in enumerate(district_headers, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=h)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Сортируем по дате заполнения анкеты (если даты нет - ставим минимальную)
+    sorted_rows = sorted(sheet_rows, key=lambda r: r.get("created_at") or datetime.min)
+    row_idx = 2
+
+    for r in sorted_rows:
+        scores, total = calculate_scores(dict(r))
+
+        # --- КОЛОНКА 1: ФИО ---
+        ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
+
+        # --- КОЛОНКА 2: Учебное заведение ---
+        ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
+
+        # --- КОЛОНКА 3: Контакты ---
+        ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
+
+        # --- КОЛОНКА 4: Согласие на обработку ПДн ---
+        consent_val = r.get("consent_status")
+        consent_text = ""
+        if consent_val is True:
+            consent_text = "Да"
+        elif consent_val is False:
+            consent_text = "Нет"
+        ws.cell(row=row_idx, column=4, value=consent_text)
+
+        # --- НОВЫЕ КОЛОНКИ: 5, 6, 7 ---
+        
+        # Колонка 5: Учебная группа
+        ws.cell(row=row_idx, column=5, value=r.get("study_group") or "")
+
+        # Колонка 6: Курс
+        ws.cell(row=row_idx, column=6, value=r.get("course") or "")
+
+        # Колонка 7: Дата заполнения
+        created_at = r.get("created_at")
+        date_value = ""
+        if created_at:
+            if isinstance(created_at, datetime):
+                # Форматируем в красивый вид: 2023-10-25 14:30
+                date_value = created_at.strftime("%Y-%m-%d %H:%M")
+            else:
+                date_value = str(created_at)
+        ws.cell(row=row_idx, column=7, value=date_value)
+        # ---------------------------------
+
+        # --- ОСТАЛЬНЫЕ КОЛОНКИ (баллы и статусы) ---
+        # Начинаем с 8, так как 5-7 заняты новыми полями
+        for i, key in enumerate(score_keys, start=8):
+            val = scores.get(key)
+            ws.cell(row=row_idx, column=i, value=val if val is not None else "")
+
+        # --- ИТОГОВАЯ СУММА БАЛЛОВ ---
+        # Раньше была в колонке 14, теперь сдвинулась на 17 (7 новых колонок + 10 старых ключей)
+        total_cell = ws.cell(row=row_idx, column=17, value=total)
+        total_cell.font = bold_font
+        total_cell.fill = total_fill
+        total_cell.alignment = Alignment(horizontal="center")
+
+        row_idx += 1
+
+    # Настройка ширины колонок
+    for col_idx in range(1, len(district_headers) + 1):
+        col_letter = get_column_letter(col_idx)
+        # Можно сделать колонки с датами и группами чуть шире, если нужно
+        width = 25
+        if col_idx == 5: width = 15  # Группа
+        if col_idx == 6: width = 8   # Курс
+        if col_idx == 7: width = 18   # Дата
+        ws.column_dimensions[col_letter].width = width
 
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]

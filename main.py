@@ -18,7 +18,9 @@ from fastapi.responses import PlainTextResponse
 import requests
 from requests.adapters import HTTPAdapter
 import concurrent.futures
-from openpyxl.styles import Font, PatternFill
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1002,49 +1004,125 @@ def _queue_export_reply(admin_id, message, inbox_id=None, attachment=None):
     return True
 
 
-def export_to_table(admin_id, today_only=False, inbox_id=None):
-    conn = get_db()
-    try:
-        c = conn.cursor(cursor_factory=RealDictCursor)
-        if today_only:
-            today = date.today()
-            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
-        else:
-            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
-        rows = c.fetchall()
-    finally:
-        release_db(conn)
+# Сколько ВК принимает в одном документе сообщения: примерно 5 МБ на вложение.
+# Запас берём меньше лимита, чтобы не упираться в границу.
+EXPORT_MAX_DOC_BYTES = 4_500_000
+EXPORT_SPLIT_TARGET_BYTES = 4_000_000
 
-    if not rows:
-        log.info("Выгрузка: в таблице answers нет строк — отправляю только текст 'нет анкет' admin=%s", admin_id)
-        _queue_export_reply(
-            admin_id,
-            MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
-            inbox_id
-        )
-        return True
+# Лист «Анкеты»: ФИО оставляем, чтобы человека можно было найти. Поля, которые
+# уже есть на районных листах (контакты, согласие, курс, группа, дата), не дублируем.
+EXPORT_FULL_COLUMNS = (
+    "user_id", "fio", "institution", "specialty", "form_of_study",
+    "employment_status", "target_contract", "experience", "practice_eval",
+    "events", "resume_status", "interview_training", "special_status",
+    "military", "maternity", "graduate", "post_plans", "help_needed",
+)
 
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
-    from openpyxl.utils import get_column_letter
+DISTRICT_HEADERS = [
+    "ФИО",
+    "Учебное заведение",
+    "Контакты",
+    "Согласие на обработку ПДн",
+    "Курс",
+    "Учебная группа",
+    "Дата заполнения",
+    "Статус занятости",
+    "Целевой договор",
+    "Опыт работы",
+    "Оценка практик",
+    "Мероприятия",
+    "Резюме",
+    "Собеседование",
+    "Особый статус",
+    "Военный призыв",
+    "Сумма баллов",
+    "Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)",
+    "Получивший хотя бы один сервис из ПКР, (да/нет)",
+    "Полностью получивший сервисы из ПКР, (да/нет)",
+    "Получивший сервис «Подбор стажировки», (да/нет)",
+    "Получивший сервис «Подбор практики», (да/нет)",
+    "Получивший сервис «Целевое обучение», (да/нет)",
+]
 
+SCORE_KEYS = [
+    "employment", "target_contract", "experience", "practice_eval",
+    "events", "resume", "interview", "special_status", "military",
+]
+
+
+def _format_created_at(value):
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value)
+
+
+def write_score_sheet(workbook, sheet_name, sheet_rows):
+    """Лист района: ФИО, вуз, контакты, согласие, курс, группа, дата, баллы, сводка."""
+    ws = workbook.create_sheet(title=sheet_name)
+    header_font = Font(bold=True)
+    bold_font = Font(bold=True)
+    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    for col_idx, header in enumerate(DISTRICT_HEADERS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    sorted_rows = sorted(sheet_rows, key=lambda r: r.get("created_at") or datetime.min)
+    row_idx = 2
+    for r in sorted_rows:
+        scores, total = calculate_scores(dict(r))
+        ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
+        ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
+        ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
+        consent_val = r.get("consent_status")
+        consent_text = "Да" if consent_val is True else ("Нет" if consent_val is False else "")
+        ws.cell(row=row_idx, column=4, value=consent_text)
+        ws.cell(row=row_idx, column=5, value=r.get("course") or "")
+        ws.cell(row=row_idx, column=6, value=r.get("study_group") or "")
+        ws.cell(row=row_idx, column=7, value=_format_created_at(r.get("created_at")))
+        for i, key in enumerate(SCORE_KEYS, start=8):
+            value = scores.get(key)
+            ws.cell(row=row_idx, column=i, value=value if value is not None else "")
+        total_cell = ws.cell(row=row_idx, column=17, value=total)
+        total_cell.font = bold_font
+        total_cell.fill = total_fill
+        total_cell.alignment = Alignment(horizontal="center")
+        row_idx += 1
+
+    for col_idx in range(1, len(DISTRICT_HEADERS) + 1):
+        width = 25
+        if col_idx == 5:
+            width = 10   # Курс
+        elif col_idx == 6:
+            width = 15   # Учебная группа
+        elif col_idx == 7:
+            width = 18   # Дата заполнения
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+
+def _build_export_workbook(rows):
+    """Собрать книгу xlsx во временный файл и вернуть её путь."""
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Анкеты"
-    cols = list(rows[0].keys())
     header_font = Font(bold=True)
+    available = rows[0].keys()
+    cols = [name for name in EXPORT_FULL_COLUMNS if name in available]
     for col_idx, col_name in enumerate(cols, start=1):
         cell = ws1.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center")
     for row_idx, r in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(cols, start=1):
-            val = r[col_name]
-            if col_name == "created_at" and val is not None:
-                val = val.strftime("%Y-%m-%d %H:%M")
-            ws1.cell(row=row_idx, column=col_idx, value=val if val is not None else "")
+            value = r[col_name]
+            if col_name == "created_at" and value is not None:
+                value = _format_created_at(value)
+            ws1.cell(row=row_idx, column=col_idx, value=value if value is not None else "")
 
-    # Summary table in Y:AE, alongside the detailed survey export.
+    # Сводная таблица Y:AE рядом с подробной выгрузкой.
     def education_type(row):
         institution = str(row.get("institution") or "").strip().casefold()
         if not institution:
@@ -1098,6 +1176,12 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
             cell.fill = summary_header_fill
             cell.border = thin_border
 
+    def has_special_circumstances(row):
+        return any(
+            str(row.get(field) or "").strip().casefold().startswith("да")
+            for field in ("military", "maternity")
+        )
+
     summary_levels = ["СПО", "ВО"]
     if grouped_rows["Не указано"]:
         summary_levels.append("Не указано")
@@ -1106,13 +1190,6 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
         risk_rows = [r for r in level_rows if calculate_scores(dict(r))[1] >= 5]
         graduate_rows = [r for r in level_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
         risk_graduates = [r for r in risk_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
-
-        def has_special_circumstances(row):
-            return any(
-                str(row.get(field) or "").strip().casefold().startswith("да")
-                for field in ("military", "maternity")
-            )
-
         values = (
             level,
             len(level_rows),
@@ -1138,126 +1215,6 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
     }.items():
         ws1.column_dimensions[column].width = width
 
-    bold_font = Font(bold=True)
-    total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    district_headers = [
-    "ФИО",
-    "Учебное заведение",
-    "Контакты",
-    "Согласие на обработку ПДн",
-    "Курс",                # Новая колонка
-    "Учебная группа",      # Новая колонка
-    "Дата заполнения",     # Новая колонка
-    "Статус занятости",
-    "Целевой договор",
-    "Опыт работы",
-    "Оценка практик",
-    "Мероприятия",
-    "Резюме",
-    "Собеседование",
-    "Особый статус",
-    "Военный призыв",
-    "Сумма баллов",        # Теперь это колонка 17
-    "Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)",
-    "Получивший хотя бы один сервис из ПКР, (да/нет)",
-    "Полностью получивший сервисы из ПКР, (да/нет)",
-    "Получивший сервис «Подбор стажировки», (да/нет)",
-    "Получивший сервис «Подбор практики», (да/нет)",
-    "Получивший сервис «Целевое обучение», (да/нет)"
-]
-
-# Если у тебя нет переменной header_font, создадим её здесь, чтобы код не упал
-if 'header_font' not in globals():
-    header_font = Font(bold=True, size=10)
-
-bold_font = Font(bold=True)
-total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-
-score_keys = ["employment", "target_contract", "experience", "practice_eval", "events", "resume", "interview", "special_status", "military"]
-
-
-# ==============================================================================
-# 2. ПОЛНОСТЬЮ ПЕРЕПИСАННАЯ ФУНКЦИЯ write_score_sheet
-# ==============================================================================
-def write_score_sheet(workbook, sheet_name, sheet_rows):
-    ws = workbook.create_sheet(title=sheet_name)
-
-    # Пишем заголовки
-    for col_idx, h in enumerate(district_headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=h)
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
-    # Сортируем по дате заполнения анкеты (если даты нет - ставим минимальную)
-    sorted_rows = sorted(sheet_rows, key=lambda r: r.get("created_at") or datetime.min)
-    row_idx = 2
-
-    for r in sorted_rows:
-        scores, total = calculate_scores(dict(r))
-
-        # --- КОЛОНКА 1: ФИО ---
-        ws.cell(row=row_idx, column=1, value=r.get("fio") or "")
-
-        # --- КОЛОНКА 2: Учебное заведение ---
-        ws.cell(row=row_idx, column=2, value=r.get("institution") or "")
-
-        # --- КОЛОНКА 3: Контакты ---
-        ws.cell(row=row_idx, column=3, value=r.get("contacts") or "")
-
-        # --- КОЛОНКА 4: Согласие на обработку ПДн ---
-        consent_val = r.get("consent_status")
-        consent_text = ""
-        if consent_val is True:
-            consent_text = "Да"
-        elif consent_val is False:
-            consent_text = "Нет"
-        ws.cell(row=row_idx, column=4, value=consent_text)
-
-        # --- НОВЫЕ КОЛОНКИ: 5, 6, 7 ---
-        
-        # Колонка 5: Курс
-        ws.cell(row=row_idx, column=5, value=r.get("course") or "")
-
-        # Колонка 6: Учебная группа
-        ws.cell(row=row_idx, column=6, value=r.get("study_group") or "")
-
-        # Колонка 7: Дата заполнения
-        created_at = r.get("created_at")
-        date_value = ""
-        if created_at:
-            if isinstance(created_at, datetime):
-                # Форматируем в красивый вид: 2023-10-25 14:30
-                date_value = created_at.strftime("%Y-%m-%d %H:%M")
-            else:
-                date_value = str(created_at)
-        ws.cell(row=row_idx, column=7, value=date_value)
-        # ---------------------------------
-
-        # --- ОСТАЛЬНЫЕ КОЛОНКИ (баллы и статусы) ---
-        # Начинаем с 8, так как 5-7 заняты новыми полями
-        for i, key in enumerate(score_keys, start=8):
-            val = scores.get(key)
-            ws.cell(row=row_idx, column=i, value=val if val is not None else "")
-
-        # --- ИТОГОВАЯ СУММА БАЛЛОВ ---
-        # Раньше была в колонке 14, теперь сдвинулась на 17 (7 новых колонок + 10 старых ключей)
-        total_cell = ws.cell(row=row_idx, column=17, value=total)
-        total_cell.font = bold_font
-        total_cell.fill = total_fill
-        total_cell.alignment = Alignment(horizontal="center")
-
-        row_idx += 1
-
-    # Настройка ширины колонок
-    for col_idx in range(1, len(district_headers) + 1):
-        col_letter = get_column_letter(col_idx)
-        # Можно сделать колонки с датами и группами чуть шире, если нужно
-        width = 25
-        if col_idx == 5: width = 15  # Группа
-        if col_idx == 6: width = 8   # Курс
-        if col_idx == 7: width = 18   # Дата
-        ws.column_dimensions[col_letter].width = width
-
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
         if district_rows:
@@ -1266,76 +1223,163 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)
 
-    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as temp_file:
-        fname = temp_file.name
-    try:
-        wb.save(fname)
-        if not os.path.exists(fname) or os.path.getsize(fname) == 0:
-            raise RuntimeError("Не удалось создать файл выгрузки.")
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    wb.save(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Не удалось создать файл выгрузки.")
+    return path
 
-        api = _get_message_vk()
-        log.info("Выгрузка: файл готов admin=%s rows=%s size=%s байт, загружаю в VK", admin_id, len(rows), os.path.getsize(fname))
-        result = None
-        max_upload_attempts = 3
-        for attempt in range(1, max_upload_attempts + 1):
-            upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
-            upload_url = upload_server['upload_url']
-            with open(fname, "rb") as f:
-                resp = requests.post(
-                    upload_url,
-                    files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-                    timeout=30
-                )
-            resp.raise_for_status()
-            result = resp.json()
-            if result.get("file"):
-                break
 
-            upload_error = str(result).casefold()
-            if "no_free_space" not in upload_error or attempt == max_upload_attempts:
-                raise RuntimeError(f"VK не принял файл: {result}")
-            delay = 2 ** (attempt - 1)
-            log.warning(
-                "VK upload server has no free space; retry %s/%s in %ss",
-                attempt, max_upload_attempts, delay
+def _upload_export_document(path, title, admin_id):
+    """Загрузить xlsx в VK и вернуть attachment вида doc{owner}_{id}[_key]."""
+    api = _get_message_vk()
+    size = os.path.getsize(path)
+    max_upload_attempts = 3
+    result = None
+    for attempt in range(1, max_upload_attempts + 1):
+        upload_server = api.docs.getMessagesUploadServer(type='doc', peer_id=admin_id)
+        upload_url = upload_server['upload_url']
+        with open(path, "rb") as f:
+            resp = requests.post(
+                upload_url,
+                files={"file": ("survey_export.xlsx", f, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                timeout=120
             )
-            time.sleep(delay)
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"VK upload вернул HTTP {resp.status_code} (файл {size} байт): {resp.text[:300]}"
+            )
+        result = resp.json()
+        if result.get("file"):
+            break
 
-        file_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
-        saved = api.docs.save(file=result["file"], title=file_title)
-        if isinstance(saved, dict) and "doc" in saved:
-            document = saved["doc"]
-        elif isinstance(saved, dict) and saved.get("docs"):
-            document = saved["docs"][0]
+        upload_error = str(result).casefold()
+        if "no_free_space" not in upload_error or attempt == max_upload_attempts:
+            raise RuntimeError(f"VK не принял файл ({size} байт): {result}")
+        delay = 2 ** (attempt - 1)
+        log.warning(
+            "VK upload server has no free space; retry %s/%s in %ss",
+            attempt, max_upload_attempts, delay
+        )
+        time.sleep(delay)
+
+    saved = api.docs.save(file=result["file"], title=title)
+    if isinstance(saved, dict) and "doc" in saved:
+        document = saved["doc"]
+    elif isinstance(saved, dict) and saved.get("docs"):
+        document = saved["docs"][0]
+    else:
+        raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
+    attachment = f"doc{document['owner_id']}_{document['id']}"
+    if document.get("access_key"):
+        attachment += f"_{document['access_key']}"
+    log.info("Выгрузка: файл загружен в VK, вложение=%s size=%s байт", attachment, size)
+    return attachment
+
+
+def _export_message_text(rows, today_only, part_index=1, part_count=1):
+    sheet_list = []
+    for district_name in DISTRICTS_UNIVERSITIES:
+        count = sum(1 for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name)
+        if count:
+            sheet_list.append(f"  • «{district_name}» — {count} чел.")
+    other_count = sum(
+        1 for r in rows
+        if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
+    )
+    if other_count:
+        sheet_list.append(f"  • «Прочие» — {other_count} чел.")
+    sheets_text = "\n".join(sheet_list)
+    if today_only:
+        header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n"
+    else:
+        header = "📊 Вот полная выгрузка анкет:\n\n"
+    part_note = f"Часть {part_index} из {part_count}.\n\n" if part_count > 1 else ""
+    return (
+        f"{header}{part_note}"
+        f"• Лист «Анкеты» — полные ответы (ФИО и ответы анкеты)\n"
+        f"• Листы по районам — ФИО, курс, учебная группа, дата заполнения, баллы:\n\n"
+        f"{sheets_text}\n\nВсего анкет в файле: {len(rows)}"
+    )
+
+
+def _split_rows(rows, part_count):
+    part_count = max(1, min(part_count, len(rows)))
+    chunk_size = -(-len(rows) // part_count)
+    return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
+
+
+def export_to_table(admin_id, today_only=False, inbox_id=None):
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        if today_only:
+            today = date.today()
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
         else:
-            raise RuntimeError(f"Неожиданный ответ docs.save: {saved}")
-        attachment = f"doc{document['owner_id']}_{document['id']}"
-        if document.get("access_key"):
-            attachment += f"_{document['access_key']}"
-        log.info("Выгрузка: файл загружен в VK, вложение=%s", attachment)
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
 
-        sheet_list = []
-        for district_name in DISTRICTS_UNIVERSITIES:
-            count = sum(1 for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name)
-            if count:
-                sheet_list.append(f"  • «{district_name}» — {count} чел.")
-        if other_rows:
-            sheet_list.append(f"  • «Прочие» — {len(other_rows)} чел.")
-        sheets_text = "\n".join(sheet_list) if sheet_list else ""
-        header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n" if today_only else "📊 Вот полная выгрузка анкет:\n\n"
+    if not rows:
+        log.info("Выгрузка: в таблице answers нет строк — отправляю только текст 'нет анкет' admin=%s", admin_id)
         _queue_export_reply(
             admin_id,
-            f"{header}• Лист «Анкеты» — полные ответы\n• Листы по районам — ФИО, баллы:\n\n{sheets_text}\n\nВсего анкет: {len(rows)}",
-            inbox_id,
-            attachment
+            MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
+            inbox_id
         )
-        log.info("Файл выгрузки загружен и поставлен в outbox admin=%s rows=%s", admin_id, len(rows))
+        return True
+
+    paths = []
+    try:
+        full_path = _build_export_workbook(rows)
+        paths.append(full_path)
+        size = os.path.getsize(full_path)
+        log.info("Выгрузка: файл готов admin=%s rows=%s size=%s байт", admin_id, len(rows), size)
+
+        parts = [(full_path, rows)]
+        if size > EXPORT_MAX_DOC_BYTES:
+            # ВК не принимает документ больше ~5 МБ в сообщении — режем на части
+            # и отправляем несколькими файлами.
+            part_count = size // EXPORT_SPLIT_TARGET_BYTES + 1
+            chunks = _split_rows(rows, part_count)
+            os.remove(full_path)
+            paths.remove(full_path)
+            parts = []
+            for chunk in chunks:
+                chunk_path = _build_export_workbook(chunk)
+                paths.append(chunk_path)
+                parts.append((chunk_path, chunk))
+            sizes = ", ".join(str(os.path.getsize(p)) for p, _ in parts)
+            log.warning(
+                "Выгрузка: файл %s байт больше лимита ВК, режу на %s частей (%s байт)",
+                size, len(parts), sizes
+            )
+
+        base_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
+        for index, (path, chunk) in enumerate(parts, start=1):
+            title = base_title if len(parts) == 1 else f"{base_title} (часть {index} из {len(parts)})"
+            attachment = _upload_export_document(path, title, admin_id)
+            _queue_export_reply(
+                admin_id,
+                _export_message_text(chunk, today_only, index, len(parts)),
+                inbox_id,
+                attachment
+            )
+            log.info(
+                "Файл выгрузки загружен и поставлен в outbox admin=%s rows=%s part=%s/%s",
+                admin_id, len(chunk), index, len(parts)
+            )
         return True
     finally:
-        try:
-            os.remove(fname)
-        except OSError:
-            log.warning("Не удалось удалить временный файл выгрузки: %s", fname)
+        for path in paths:
+            try:
+                os.remove(path)
+            except OSError:
+                log.warning("Не удалось удалить временный файл выгрузки: %s", path)
+
 
 def _run_export_task(admin_id, today_only, inbox_id=None):
     log.info("Запуск задачи выгрузки admin=%s today_only=%s", admin_id, today_only)

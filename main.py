@@ -1145,8 +1145,8 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
     "Учебное заведение",
     "Контакты",
     "Согласие на обработку ПДн",
-    "Учебная группа",      # Новая колонка
     "Курс",                # Новая колонка
+    "Учебная группа",      # Новая колонка
     "Дата заполнения",     # Новая колонка
     "Статус занятости",
     "Целевой договор",
@@ -1215,11 +1215,11 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
 
         # --- НОВЫЕ КОЛОНКИ: 5, 6, 7 ---
         
-        # Колонка 5: Учебная группа
-        ws.cell(row=row_idx, column=5, value=r.get("study_group") or "")
+        # Колонка 5: Курс
+        ws.cell(row=row_idx, column=5, value=r.get("course") or "")
 
-        # Колонка 6: Курс
-        ws.cell(row=row_idx, column=6, value=r.get("course") or "")
+        # Колонка 6: Учебная группа
+        ws.cell(row=row_idx, column=6, value=r.get("study_group") or "")
 
         # Колонка 7: Дата заполнения
         created_at = r.get("created_at")

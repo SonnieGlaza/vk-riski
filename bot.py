@@ -1016,6 +1016,7 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
         release_db(conn)
 
     if not rows:
+        log.info("Выгрузка: в таблице answers нет строк — отправляю только текст 'нет анкет' admin=%s", admin_id)
         _queue_export_reply(
             admin_id,
             MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
@@ -1273,6 +1274,7 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
             raise RuntimeError("Не удалось создать файл выгрузки.")
 
         api = _get_message_vk()
+        log.info("Выгрузка: файл готов admin=%s rows=%s size=%s байт, загружаю в VK", admin_id, len(rows), os.path.getsize(fname))
         result = None
         max_upload_attempts = 3
         for attempt in range(1, max_upload_attempts + 1):

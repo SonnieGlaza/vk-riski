@@ -1551,6 +1551,9 @@ REPORT_FORM_SHEET = "Лист1"
 REPORT_SUMMARY_SHEET = "Сводка"
 REPORT_HEADER_ROWS = 5
 REPORT_RISK_THRESHOLD = 5
+# Пометка «данных нет»: такие графы в форме закрашиваем серым.
+REPORT_EMPTY_MARKER = "х"
+REPORT_EMPTY_FILL_COLOR = "D9D9D9"
 
 REPORT_FORM_HEADERS = {
     "A1": "Место на-хождение",
@@ -2042,7 +2045,7 @@ def _write_report_form_sheet(ws, stats):
         ws.cell(row=excel_row, column=2, value=name)
         spo_values = _form_metrics_values(_form_level_metrics(stats[offset]["СПО"]))
         vo_values = _form_metrics_values(_form_level_metrics(stats[offset]["ВО"]))
-        empty_marker = ["х"] * 6
+        empty_marker = [REPORT_EMPTY_MARKER] * 6
         if form_level == "ВО":
             # ВУЗу нечего показывать в графах ПОО, если среди его анкет нет студентов ПОО.
             spo_cells = spo_values if stats[offset]["СПО"] else empty_marker
@@ -2069,6 +2072,11 @@ def _write_report_form_sheet(ws, stats):
                 )
             group_start = index
 
+    empty_fill = PatternFill(
+        start_color=REPORT_EMPTY_FILL_COLOR,
+        end_color=REPORT_EMPTY_FILL_COLOR,
+        fill_type="solid"
+    )
     for cells_row in ws.iter_rows(
         min_row=1, max_row=last_data_row, min_col=1, max_col=14
     ):
@@ -2083,6 +2091,9 @@ def _write_report_form_sheet(ws, stats):
                 )
             else:
                 cell.alignment = center
+            # Графы с пометкой «х» (информации нет) заливаем серым.
+            if cell.row > REPORT_HEADER_ROWS and cell.value == REPORT_EMPTY_MARKER:
+                cell.fill = empty_fill
 
     ws.row_dimensions[1].height = 56.25
     ws.row_dimensions[4].height = 77.25

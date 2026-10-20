@@ -1106,6 +1106,8 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
 def _build_export_workbook(rows):
     """Собрать книгу xlsx во временный файл и вернуть её путь."""
     wb = Workbook()
+    
+    # --- 1. Лист «Анкеты» (оставляем как есть) ---
     ws1 = wb.active
     ws1.title = "Анкеты"
     header_font = Font(bold=True)
@@ -1121,6 +1123,160 @@ def _build_export_workbook(rows):
             if col_name == "created_at" and value is not None:
                 value = _format_created_at(value)
             ws1.cell(row=row_idx, column=col_idx, value=value if value is not None else "")
+
+    # --- 2. НОВЫЙ ЛИСТ «ОТЧЕТ» (по вашей структуре из Excel) ---
+    report_ws = wb.create_sheet(title="Отчет")
+    
+    # Заголовки колонок (соответствуют колонкам C-N в вашем Excel)
+    report_headers = [
+        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Всего",
+        "из них студентов выпускных курсов",
+        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел. - Всего",
+        "из них студентов выпускных курсов",
+        "из них студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком",
+        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Всего",
+        "из них студентов выпускных курсов",
+        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел. - Всего",
+        "из них студентов выпускных курсов",
+        "из них студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком",
+        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Из них (доп. уточнение)",
+        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел. - Из них (доп. уточнение)",
+        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Из них (доп. уточнение)",
+        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел. - Из них (доп. уточнение)"
+    ]
+    
+    # Пишем заголовки в строку 1 (начиная со 2-го столбца, B)
+    for idx, header in enumerate(report_headers, start=2):
+        cell = report_ws.cell(row=1, column=idx, value=header)
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
+    # Словари для группировки данных
+    # Ключ: (район, учебное заведение)
+    grouped_data = {}
+    
+    for row in rows:
+        institution = (row.get("institution") or "").strip()
+        if not institution:
+            continue
+            
+        district = INSTITUTION_TO_DISTRICT.get(institution, "Прочие")
+        
+        key = (district, institution)
+        if key not in grouped_data:
+            # Инициализируем словарь с нулями для всех 14 числовых колонок
+            grouped_data[key] = {
+                "district": district,
+                "institution": institution,
+                "poo_total": 0, "poo_grad": 0, "poo_risk_total": 0, "poo_risk_grad": 0, "poo_risk_mil_matern": 0,
+                "vo_total": 0, "vo_grad": 0, "vo_risk_total": 0, "vo_risk_grad": 0, "vo_risk_mil_matern": 0,
+                # Колонки 11-14 в вашем Excel часто дублируют или уточняют данные, заполним их аналогично
+                "poo_total_2": 0, "poo_risk_total_2": 0, "vo_total_2": 0, "vo_risk_total_2": 0
+            }
+            
+        # Логика подсчета баллов для определения "риска" (порог 5 взят из вашего кода)
+        scores, total_score = calculate_scores(row)
+        
+        # Определяем тип образования по названию учреждения
+        edu_type = "poo"  # По умолчанию СПО
+        if any(marker in institution.lower() for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
+            edu_type = "vo"
+            
+        is_graduate = str(row.get("graduate") or "").strip().lower().startswith("да")
+        is_mil_matern = any(str(row.get(f) or "").strip().lower().startswith("да") for f in ("military", "maternity"))
+        
+        # Заполняем данные в зависимости от типа образования
+        if edu_type == "poo":
+            grouped_data[key]["poo_total"] += 1
+            if is_graduate:
+                grouped_data[key]["poo_grad"] += 1
+            if total_score >= 5:
+                grouped_data[key]["poo_risk_total"] += 1
+                if is_graduate:
+                    grouped_data[key]["poo_risk_grad"] += 1
+                if is_mil_matern:
+                    grouped_data[key]["poo_risk_mil_matern"] += 1
+        else: # VO
+            grouped_data[key]["vo_total"] += 1
+            if is_graduate:
+                grouped_data[key]["vo_grad"] += 1
+            if total_score >= 5:
+                grouped_data[key]["vo_risk_total"] += 1
+                if is_graduate:
+                    grouped_data[key]["vo_risk_grad"] += 1
+                if is_mil_matern:
+                    grouped_data[key]["vo_risk_mil_matern"] += 1
+
+    # --- Запись данных в лист «Отчет» с правильной сортировкой ---
+    # Сначала собираем уникальные районы в нужном порядке
+    ordered_districts = []
+    for d in DISTRICTS_UNIVERSITIES.keys():
+        if any(v[0] == d for v in grouped_data.keys()):
+            ordered_districts.append(d)
+    if any(v[0] == "Прочие" for v in grouped_data.keys()):
+        ordered_districts.append("Прочие")
+        
+    current_row = 2
+    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), 
+                         top=Side(style="thin"), bottom=Side(style="thin"))
+    
+    for district in ordered_districts:
+        # Фильтруем заведения текущего района
+        district_rows = [(k, v) for k, v in grouped_data.items() if k[0] == district]
+        # Сортируем по названию учреждения
+        district_rows.sort(key=lambda x: x[1]["institution"])
+        
+        for (dist, inst), data in district_rows:
+            # Колонка A: Район (записываем только для первого заведения района)
+            if current_row == 2 or report_ws.cell(row=current_row - 1, column=1).value != district:
+                report_ws.cell(row=current_row, column=1, value=district)
+            # Колонка B: Учебное заведение
+            report_ws.cell(row=current_row, column=2, value=inst)
+            
+            # Колонки C-N (индексы 3-16)
+            values = [
+                data["poo_total"], data["poo_grad"], data["poo_risk_total"], data["poo_risk_grad"], data["poo_risk_mil_matern"],
+                data["vo_total"], data["vo_grad"], data["vo_risk_total"], data["vo_risk_grad"], data["vo_risk_mil_matern"],
+                data["poo_total_2"], data["poo_risk_total_2"], data["vo_total_2"], data["vo_risk_total_2"]
+            ]
+            
+            for col_idx, val in enumerate(values, start=3):
+                cell = report_ws.cell(row=current_row, column=col_idx, value=val)
+                cell.alignment = Alignment(horizontal="center")
+                cell.border = thin_border
+                
+            current_row += 1
+            
+    # Автоподбор ширины колонок
+    for col in range(1, 17):
+        max_length = 0
+        col_letter = get_column_letter(col)
+        for cell in report_ws[col_letter]:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2) if max_length > 0 else 15
+        report_ws.column_dimensions[col_letter].width = adjusted_width
+
+    # --- 3. Оставляем ваш существующий код создания районных листов (DISTRICTS) ---
+    # Он никак не конфликтует с новым листом "Отчет"
+    for district_name in DISTRICTS_UNIVERSITIES:
+        district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
+        if district_rows:
+            write_score_sheet(wb, district_name, district_rows)
+            
+    other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
+    if other_rows:
+        write_score_sheet(wb, "Прочие", other_rows)
+
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    wb.save(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Не удалось создать файл выгрузки.")
+    return path
 
     # Сводная таблица Y:AE рядом с подробной выгрузкой.
     def education_type(row):

@@ -1107,72 +1107,99 @@ def _build_export_workbook(rows):
     """Собрать книгу xlsx во временный файл и вернуть её путь."""
     wb = Workbook()
     
-    # --- 1. Лист «Анкеты» (оставляем как есть) ---
+    # --- 1. Лист «Анкеты» (возвращаем красивое оформление) ---
     ws1 = wb.active
     ws1.title = "Анкеты"
     header_font = Font(bold=True)
     available = rows[0].keys()
     cols = [name for name in EXPORT_FULL_COLUMNS if name in available]
+    
     for col_idx, col_name in enumerate(cols, start=1):
         cell = ws1.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
     for row_idx, r in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(cols, start=1):
             value = r[col_name]
             if col_name == "created_at" and value is not None:
                 value = _format_created_at(value)
             ws1.cell(row=row_idx, column=col_idx, value=value if value is not None else "")
+    
+    # Настройка ширины для Анкет
+    for col_idx in range(1, len(cols) + 1):
+        ws1.column_dimensions[get_column_letter(col_idx)].width = 25
+    ws1.column_dimensions['A'].width = 8 # ID пользователя
 
-    # --- 2. НОВЫЙ ЛИСТ «ОТЧЕТ» (по вашей структуре из Excel) ---
+    # --- 2. НОВЫЙ ЛИСТ «ОТЧЕТ» (точная копия вашего Excel) ---
     report_ws = wb.create_sheet(title="Отчет")
     
-    # Заголовки колонок (14 штук, соответствуют вашим данным)
-    report_headers = [
-        "Количество студентов ПОО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nВсего",
-        "из них\nстудентов\nвыпускных\nкурсов",
-        "Число студентов ПОО, находящихся под риском\nнетрудоустройства, чел.\nВсего",
-        "из них\nстудентов\nвыпускных\nкурсов",
-        "из них студентов, призывающихся на военную службу\nили собирающихся осуществлять уход за ребенком",
-        "Количество студентов ОО ВО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nВсего",
-        "из них\nстудентов\nвыпускных\nкурсов",
-        "Число студентов ОО ВО, находящихся под риском\nнетрудоустройства, чел.\nВсего",
-        "из них\nстудентов\nвыпускных\nкурсов",
-        "из них студентов, призывающихся на военную службу\nили собирающихся осуществлять уход за ребенком",
-        "Количество студентов ПОО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nИз них (доп. уточнение)",
-        "Число студентов ПОО, находящихся под риском\nнетрудоустройства, чел.\nИз них (доп. уточнение)",
-        "Количество студентов ОО ВО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nИз них (доп. уточнение)",
-        "Число студентов ОО ВО, находящихся под риском\nнетрудоустройства, чел.\nИз них (доп. уточнение)"
-    ]
-    
     # Настройки стилей
-    header_font = Font(bold=True)
-    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid") # Светло-голубая заливка как в Excel
+    header_font = Font(bold=True, size=10)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid") # Серый фон заголовка
+    data_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid") # Серый фон для крестиков
     thin_border = Border(
         left=Side(style="thin", color="000000"),
         right=Side(style="thin", color="000000"),
         top=Side(style="thin", color="000000"),
         bottom=Side(style="thin", color="000000")
     )
-    center_wrap_align = Alignment(
-        horizontal="center", 
-        vertical="center", 
-        wrap_text=True,
-        shrink_to_fit=False
-    )
     center_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
-
-    # Пишем заголовки в строку 1 (начиная со 2-го столбца, B)
-    for idx, header in enumerate(report_headers, start=2):
-        cell = report_ws.cell(row=1, column=idx, value=header)
+    wrap_center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    
+    # Объединение ячеек в шапке (строка 1, колонки A-N)
+    # Это объединяет "Всего / из них / студентов выпускных курсов" в одну ячейку
+    for col in range(1, 15):
+        report_ws.merge_cells(start_row=1, start_column=col, end_row=4, end_column=col)
+        
+    # Заголовки (теперь они в 5-й строке, так как 1-4 объединены)
+    report_headers_row5 = [
+        "Место нахождение", "Наименование учебного заведения", 
+        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел.", 
+        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел.", 
+        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел.", 
+        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел."
+    ]
+    
+    # Подзаголовки для 3 и 4 строк (которые визуально находятся внутри объединенных ячеек 1-4)
+    # В Excel это выглядит как текст внутри большой рамки. В openpyxl мы пишем его в 3 и 4 строки.
+    # Но чтобы не усложнять, мы просто оставим 1-4 строки пустыми (объединенными), а данные начнем с 5-й.
+    # ВАЖНО: Судя по вашему файлу, данные начинаются с 5-й строки. 1-4 - это только шапка.
+    
+    # Заполняем 5-ю строку (настоящие заголовки колонок)
+    for idx, header in enumerate(report_headers_row5, start=1):
+        cell = report_ws.cell(row=5, column=idx, value=header)
         cell.font = header_font
         cell.fill = header_fill
-        cell.alignment = center_wrap_align
+        cell.alignment = wrap_center_align
         cell.border = thin_border
+        
+    # Подписи для колонок (строка 6, как в вашем образце: Всего / из них...)
+    sub_headers = [
+        ["Всего", "из них", "Всего", "из них", "Всего", "из них", "Всего", "из них"],
+        ["", "студентов выпускных курсов", "", "студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком", 
+         "", "студентов выпускных курсов", "", "студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком"]
+    ]
     
-    # Настроим ширину первой колонки (Районы)
-    report_ws.column_dimensions['A'].width = 15
-    
+    for r in range(2):
+        for c in range(8):
+            col_idx = 3 + c # Начинаем с колонки D (3+1)
+            cell = report_ws.cell(row=6 + r, column=col_idx, value=sub_headers[r][c])
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center_align
+            cell.border = thin_border
+            
+    # Колонки A и B в строках 1-6 тоже оформляем
+    for r in range(1, 7):
+        for c in range(1, 3):
+            cell = report_ws.cell(row=r, column=c)
+            cell.border = thin_border
+            if r >= 5:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_align
+                
     # Словари для группировки данных
     grouped_data = {}
     
@@ -1182,15 +1209,15 @@ def _build_export_workbook(rows):
             continue
             
         district = INSTITUTION_TO_DISTRICT.get(institution, "Прочие")
-        
         key = (district, institution)
         if key not in grouped_data:
             grouped_data[key] = {
                 "district": district,
                 "institution": institution,
+                # ПОО
                 "poo_total": 0, "poo_grad": 0, "poo_risk_total": 0, "poo_risk_grad": 0, "poo_risk_mil_matern": 0,
+                # ВО
                 "vo_total": 0, "vo_grad": 0, "vo_risk_total": 0, "vo_risk_grad": 0, "vo_risk_mil_matern": 0,
-                "poo_total_2": 0, "poo_risk_total_2": 0, "vo_total_2": 0, "vo_risk_total_2": 0
             }
             
         scores, total_score = calculate_scores(row)
@@ -1231,29 +1258,27 @@ def _build_export_workbook(rows):
     if any(v[0] == "Прочие" for v in grouped_data.keys()):
         ordered_districts.append("Прочие")
         
-    current_row = 2
+    current_row = 7 # Данные начинаются с 7-й строки (после шапки)
     
     for district in ordered_districts:
         district_rows = [(k, v) for k, v in grouped_data.items() if k[0] == district]
         district_rows.sort(key=lambda x: x[1]["institution"])
         
         for (dist, inst), data in district_rows:
-            # Колонка A: Район (объединять визуально не будем, просто повторяем для каждой строки, 
-            # либо можно добавить логику объединения, но для выгрузки данных это избыточно)
-            report_ws.cell(row=current_row, column=1, value=district)
-            report_ws.cell(row=current_row, column=1).alignment = center_align
-            report_ws.cell(row=current_row, column=1).border = thin_border
+            # Колонка A: Район
+            cell_a = report_ws.cell(row=current_row, column=1, value=district)
+            cell_a.alignment = center_align
+            cell_a.border = thin_border
             
-            # Колонка B: Учебное заведение
-            report_ws.cell(row=current_row, column=2, value=inst)
-            report_ws.cell(row=current_row, column=2).alignment = center_align
-            report_ws.cell(row=current_row, column=2).border = thin_border
+            # Колонка B: Уч. заведение (сделаем поуже)
+            cell_b = report_ws.cell(row=current_row, column=2, value=inst)
+            cell_b.alignment = center_align
+            cell_b.border = thin_border
             
-            # Колонки C-N (индексы 3-16)
+            # Данные (колонки C-N, индексы 3-14)
             values = [
                 data["poo_total"], data["poo_grad"], data["poo_risk_total"], data["poo_risk_grad"], data["poo_risk_mil_matern"],
-                data["vo_total"], data["vo_grad"], data["vo_risk_total"], data["vo_risk_grad"], data["vo_risk_mil_matern"],
-                data["poo_total_2"], data["poo_risk_total_2"], data["vo_total_2"], data["vo_risk_total_2"]
+                data["vo_total"], data["vo_grad"], data["vo_risk_total"], data["vo_risk_grad"], data["vo_risk_mil_matern"]
             ]
             
             for col_idx, val in enumerate(values, start=3):
@@ -1263,134 +1288,32 @@ def _build_export_workbook(rows):
                 
             current_row += 1
             
-    # Автоподбор ширины колонок (B-N)
-    for col in range(2, 17):
-        max_length = 0
-        col_letter = get_column_letter(col)
-        for cell in report_ws[col_letter]:
-            try:
-                if len(str(cell.value)) > max_length:
-                    max_length = len(str(cell.value))
-            except:
-                pass
-        adjusted_width = (max_length + 2) if max_length > 0 else 12
-        report_ws.column_dimensions[col_letter].width = adjusted_width
+    # --- Добавляем серые крестики (х) на сером фоне, как в исходнике ---
+    # Проходим по всем строкам с данными
+    for r in range(7, current_row):
+        # Колонки с 3 по 14 (C-N)
+        for c in range(3, 15):
+            cell = report_ws.cell(row=r, column=c)
+            if cell.value in [None, 0, ""]:
+                cell.value = "х"
+                cell.font = Font(color="808080") # Серый цвет шрифта
+                cell.fill = data_fill # Серый фон
+                cell.alignment = center_align
+                cell.border = thin_border
+                
+    # Автоподбор ширины
+    widths = {
+        'A': 12, 'B': 40, 'C': 10, 'D': 10, 'E': 12, 'F': 10, 'G': 10, 'H': 12, 'I': 10, 'J': 10, 'K': 12, 'L': 10, 'M': 10, 'N': 12
+    }
+    for col, width in widths.items():
+        report_ws.column_dimensions[col].width = width
 
-    # --- 3. Оставляем ваш существующий код создания районных листов (DISTRICTS) ---
-    # Он никак не конфликтует с новым листом "Отчет"
+    # --- 3. Листы по районам (оставляем как было) ---
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
         if district_rows:
             write_score_sheet(wb, district_name, district_rows)
             
-    other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
-    if other_rows:
-        write_score_sheet(wb, "Прочие", other_rows)
-
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    os.close(fd)
-    wb.save(path)
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        raise RuntimeError("Не удалось создать файл выгрузки.")
-    return path
-
-    # Сводная таблица Y:AE рядом с подробной выгрузкой.
-    def education_type(row):
-        institution = str(row.get("institution") or "").strip().casefold()
-        if not institution:
-            return "Не указано"
-        if any(marker in institution for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
-            return "ВО"
-        return "СПО"
-
-    grouped_rows = {"СПО": [], "ВО": [], "Не указано": []}
-    for row in rows:
-        grouped_rows[education_type(row)].append(row)
-
-    ws1["Y1"] = "Студенты"
-    ws1["Z1"] = (
-        "Количество студентов ПОО, в отношении которых проведена "
-        "оценка риска нетрудоустройства, чел."
-    )
-    ws1["AB1"] = "Число студентов ПОО, находящихся под риском нетрудоустройства, чел."
-    ws1["Z2"] = "Всего"
-    ws1["AA2"] = "Из них"
-    ws1["AA4"] = "Студентов выпускных курсов"
-    ws1["AB2"] = "Всего"
-    ws1["AC2"] = "Из них"
-    ws1["AC3"] = (
-        "Студентов, призывающихся на военную службу или собирающихся "
-        "осуществлять уход за ребенком"
-    )
-    ws1["AD3"] = "Студентов выпускных курсов"
-    ws1["AE3"] = "Из них"
-    ws1["AE4"] = (
-        "Студентов, призывающихся на военную службу или собирающихся "
-        "осуществлять уход за ребенком"
-    )
-    for merged_range in (
-        "Y1:Y4", "Z1:AA1", "Z2:Z4", "AA2:AA3", "AB1:AE1", "AB2:AB4",
-        "AC2:AE2", "AC3:AC4", "AD3:AD4"
-    ):
-        ws1.merge_cells(merged_range)
-
-    thin_border = Border(
-        left=Side(style="thin", color="000000"),
-        right=Side(style="thin", color="000000"),
-        top=Side(style="thin", color="000000"),
-        bottom=Side(style="thin", color="000000")
-    )
-    summary_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    for row in ws1.iter_rows(min_row=1, max_row=4, min_col=25, max_col=31):
-        for cell in row:
-            cell.font = Font(bold=True, size=10)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.fill = summary_header_fill
-            cell.border = thin_border
-
-    def has_special_circumstances(row):
-        return any(
-            str(row.get(field) or "").strip().casefold().startswith("да")
-            for field in ("military", "maternity")
-        )
-
-    summary_levels = ["СПО", "ВО"]
-    if grouped_rows["Не указано"]:
-        summary_levels.append("Не указано")
-    for row_idx, level in enumerate(summary_levels, start=5):
-        level_rows = grouped_rows[level]
-        risk_rows = [r for r in level_rows if calculate_scores(dict(r))[1] >= 5]
-        graduate_rows = [r for r in level_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
-        risk_graduates = [r for r in risk_rows if str(r.get("graduate") or "").strip().casefold().startswith("да")]
-        values = (
-            level,
-            len(level_rows),
-            len(graduate_rows),
-            len(risk_rows),
-            sum(1 for r in risk_rows if has_special_circumstances(r)),
-            len(risk_graduates),
-            sum(1 for r in risk_graduates if has_special_circumstances(r))
-        )
-        for col_idx, value in enumerate(values, start=25):
-            cell = ws1.cell(row=row_idx, column=col_idx, value=value)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
-
-    ws1.row_dimensions[1].height = 60
-    ws1.row_dimensions[2].height = 32
-    ws1.row_dimensions[3].height = 75
-    ws1.row_dimensions[4].height = 75
-    for col_idx in range(1, ws1.max_column + 1):
-        ws1.column_dimensions[get_column_letter(col_idx)].width = 25
-    for column, width in {
-        "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
-    }.items():
-        ws1.column_dimensions[column].width = width
-
-    for district_name in DISTRICTS_UNIVERSITIES:
-        district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
-        if district_rows:
-            write_score_sheet(wb, district_name, district_rows)
     other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)

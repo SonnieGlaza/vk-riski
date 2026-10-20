@@ -2457,10 +2457,7 @@ REMINDER_BATCH = int(os.getenv("REMINDER_BATCH", "20"))
 REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "60"))
 REMINDER_SEND_DELAY = float(os.getenv("REMINDER_SEND_DELAY", "1.0"))
 
-REMINDER_TEXT = (
-    "⏰ Напоминаю: анкета пока не завершена. Ответьте на вопрос ниже, "
-    "чтобы мы могли подобрать для вас работу и стажировку."
-)
+REMINDER_TEXT = "⏰ Напоминаю: анкета пока не завершена. Ответьте на вопрос ниже."
 
 
 def _fetch_reminder_targets(limit=REMINDER_BATCH):

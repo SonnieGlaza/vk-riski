@@ -2,6 +2,7 @@ import asyncio
 from contextlib import contextmanager
 import vk_api
 from vk_api.utils import get_random_id
+import difflib
 import re
 import os
 import json
@@ -216,6 +217,11 @@ def init_db():
                 uni_page INTEGER DEFAULT 0,
                 started INTEGER DEFAULT 0)""")
         c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS started_at TIMESTAMP")
+        # Напоминания о незавершённой анкете: когда человек последний раз отвечал,
+        # когда бот последний раз напоминал и сколько раз уже напомнил.
+        c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS last_activity TIMESTAMP")
+        c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS reminded_at TIMESTAMP")
+        c.execute("ALTER TABLE progress ADD COLUMN IF NOT EXISTS remind_count INTEGER DEFAULT 0")
         c.execute("CREATE INDEX IF NOT EXISTS idx_progress_user_id ON progress(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_answers_user_id ON answers(user_id)")
         c.execute("""CREATE TABLE IF NOT EXISTS bot_inbox (
@@ -352,7 +358,8 @@ def set_progress_cached(user_id, step_index, uni_page=0, started=1):
             c.execute(
                 "INSERT INTO progress (user_id, step_index, uni_page, started) "
                 "VALUES (%s,%s,%s,%s) "
-                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s",
+                "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
+                "reminded_at=NULL, remind_count=0",
                 (user_id, step_index, uni_page, started, step_index, uni_page, started)
             )
         conn.commit()
@@ -626,6 +633,79 @@ for _district, _unis in DISTRICTS_UNIVERSITIES.items():
     for _uni in _unis:
         INSTITUTION_TO_DISTRICT[_uni] = _district
 
+
+def _normalize_institution_name(name):
+    """Привести название заведения к сравнимому виду.
+
+    В анкетах встречаются лишние пробелы, «ё/е», «им.» вместо «имени»,
+    другие кавычки и точки, а также слипшиеся названия («филиалГлазовский»),
+    поэтому сравниваем нормализованные строки.
+    """
+    text = str(name or "").replace("ё", "е").replace("Ё", "Е")
+    # Слипшиеся названия: «филиалГлазовский» -> «филиал Глазовский».
+    text = re.sub(r"(?<=[а-яеА-ЯЕa-zA-Z])(?=[А-ЯЁA-Z])", " ", text)
+    text = text.casefold()
+    text = text.replace("им.", "имени")
+    text = re.sub(r"[«»\"'()\.,;:!?]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+# Как заведение могло сохраниться в старой анкете -> название из справочника.
+INSTITUTION_ALIASES = {
+    (
+        "Камбарский машиностроительный колледж. Филиал Ижевского государственного "
+        "технического университета им. М.Т. Калашникова."
+    ): "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» Камбарский филиал",
+    "Камбарский машиностроительный колледж": "Камбарский Машиностроительный Колледж (филиал)",
+    "Камбарский филиал ИжГТУ имени М.Т. Калашникова": (
+        "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» "
+        "Камбарский филиал"
+    ),
+    # Слипшееся название из старых анкет: Камбарский филиал + Глазовский институт.
+    (
+        "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» "
+        "Камбарский филиалГлазовский инженерно-экономический институт(филиал) ФГБОУ ВО "
+        "«ИжГТУ имени М.Т. Калашникова»"
+    ): "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. Калашникова» Камбарский филиал",
+}
+
+INSTITUTION_ALIASES_NORMALIZED = {
+    _normalize_institution_name(alias): target for alias, target in INSTITUTION_ALIASES.items()
+}
+
+INSTITUTION_TO_DISTRICT_NORMALIZED = {
+    _normalize_institution_name(name): district
+    for name, district in INSTITUTION_TO_DISTRICT.items()
+}
+
+
+def resolve_district(institution):
+    """Район учебного заведения из анкеты; терпимо к написанию названия."""
+    if not institution:
+        return None
+    district = INSTITUTION_TO_DISTRICT.get(institution)
+    if district:
+        return district
+    key = _normalize_institution_name(institution)
+    district = INSTITUTION_TO_DISTRICT_NORMALIZED.get(key)
+    if district:
+        return district
+    alias_target = INSTITUTION_ALIASES_NORMALIZED.get(key)
+    if alias_target:
+        return INSTITUTION_TO_DISTRICT.get(alias_target)
+    close = difflib.get_close_matches(
+        key, INSTITUTION_TO_DISTRICT_NORMALIZED, n=1, cutoff=0.9
+    )
+    if close:
+        district = INSTITUTION_TO_DISTRICT_NORMALIZED[close[0]]
+        log.warning(
+            "Заведение %r нет в справочнике дословно; считаю его как %r (район «%s»)",
+            institution, close[0], district
+        )
+        return district
+    return None
+
 # ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
     "fio", "consent", "institution", "specialty", "study_group",
@@ -767,7 +847,7 @@ MESSAGES = {
 
 # ----------------- ОТПРАВКА И ВОПРОСЫ -----------------
 
-def ask_university_page(user_id, page):
+def ask_university_page(user_id, page, prefix=None):
     page = page if isinstance(page, int) else 0
     start = page * ITEMS_PER_PAGE
     end = min(start + ITEMS_PER_PAGE, len(UNIVERSITIES))
@@ -783,13 +863,15 @@ def ask_university_page(user_id, page):
     if nav_text:
         message += f"\n\n{nav_text}"
     message += "\n\nВведите номер вашего учебного заведения."
-    send_message(user_id, message)
+    if prefix:
+        message = f"{prefix}\n\n{message}"
+    return send_message(user_id, message)
 
-def ask_step(user_id, step_key, uni_page=0, fio_text=None):
+def ask_step(user_id, step_key, uni_page=0, fio_text=None, prefix=None):
     uni_page = uni_page if isinstance(uni_page, int) else 0
     if step_key == "institution":
-        ask_university_page(user_id, uni_page)
-    elif step_key == "consent":
+        return ask_university_page(user_id, uni_page, prefix=prefix)
+    if step_key == "consent":
         if fio_text is None:
             conn = get_db()
             try:
@@ -803,7 +885,7 @@ def ask_step(user_id, step_key, uni_page=0, fio_text=None):
         opts = OPTIONS["consent"]
         list_text = format_numbered_list(opts, truncate=False)
         hint = "Напишите номер выбранного варианта (1 или 2)."
-        send_message(user_id, f"{message}\n\n{list_text}\n\n{hint}")
+        message = f"{message}\n\n{list_text}\n\n{hint}"
     elif step_key in OPTIONS:
         opts = OPTIONS[step_key]
         list_text = format_numbered_list(opts, truncate=False)
@@ -812,9 +894,11 @@ def ask_step(user_id, step_key, uni_page=0, fio_text=None):
         else:
             hint = "Напишите номер выбранного варианта (например: 1)."
         message = f"{QUESTIONS[step_key]}\n\n{list_text}\n\n{hint}"
-        send_message(user_id, message)
     else:
-        send_message(user_id, QUESTIONS[step_key])
+        message = QUESTIONS[step_key]
+    if prefix:
+        message = f"{prefix}\n\n{message}"
+    return send_message(user_id, message)
 
 # ----------------- СОХРАНЕНИЕ ОТВЕТА + СДВИГ ПРОГРЕССА В ОДНОЙ ТРАНЗАКЦИИ -----------------
 def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=None):
@@ -840,24 +924,25 @@ def save_and_advance(user_id, field, value, step_index, uni_page=0, fio_text=Non
             )
         # Сдвигаем прогресс
         next_idx = step_index + 1
+        now = datetime.now()
         if next_idx >= len(STEPS):
             # Анкета завершена
-            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (datetime.now(), user_id))
+            c.execute("UPDATE answers SET created_at=%s WHERE user_id=%s", (now, user_id))
             c.execute(
-                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
-                "VALUES (%s,%s,%s,%s,%s) "
+                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at, last_activity) "
+                "VALUES (%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
-                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
-                (user_id, next_idx, 0, 2, datetime.now(), next_idx, 0, 2)
+                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at), last_activity=%s",
+                (user_id, next_idx, 0, 2, now, now, next_idx, 0, 2, now)
             )
             conn.commit()
         else:
             c.execute(
-                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at) "
-                "VALUES (%s,%s,%s,%s,%s) "
+                "INSERT INTO progress (user_id, step_index, uni_page, started, started_at, last_activity) "
+                "VALUES (%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (user_id) DO UPDATE SET step_index=%s, uni_page=%s, started=%s, "
-                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at)",
-                (user_id, next_idx, 0, 1, datetime.now(), next_idx, 0, 1)
+                "started_at=COALESCE(progress.started_at, EXCLUDED.started_at), last_activity=%s",
+                (user_id, next_idx, 0, 1, now, now, next_idx, 0, 1, now)
             )
             conn.commit()
         _update_progress_cache(
@@ -1068,7 +1153,11 @@ def detect_education_level(row):
     institution = str(row.get("institution") or "").strip().casefold()
     if not institution:
         return "Не указано"
-    if any(marker in institution for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
+    # «Колледж»/«техникум» важнее слов «университет»/«институт»: у колледжей
+    # в официальном названии часто есть «… филиал … университета».
+    if any(marker in institution for marker in ("колледж", "техникум", "училище")):
+        return "СПО"
+    if any(marker in institution for marker in ("фгбоу во", "вгу", "университет", "академия", "институт", "юстиции")):
         return "ВО"
     return "СПО"
 
@@ -1225,11 +1314,16 @@ def _build_export_workbook(rows):
         ws1.column_dimensions[column].width = width
 
     for district_name in DISTRICTS_UNIVERSITIES:
-        district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
+        district_rows = [r for r in rows if resolve_district(r.get("institution")) == district_name]
         if district_rows:
             write_score_sheet(wb, district_name, district_rows)
-    other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
+    other_rows = [r for r in rows if r.get("institution") and resolve_district(r.get("institution")) is None]
     if other_rows:
+        unknown = sorted({str(r.get("institution") or "не указано") for r in other_rows})
+        log.warning(
+            "Выгрузка: заведения вне справочника районов (%s), попадут в «Прочие»: %s",
+            len(unknown), "; ".join(unknown)
+        )
         write_score_sheet(wb, "Прочие", other_rows)
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
@@ -1290,12 +1384,12 @@ def _upload_export_document(path, title, admin_id):
 def _export_message_text(rows, today_only, part_index=1, part_count=1):
     sheet_list = []
     for district_name in DISTRICTS_UNIVERSITIES:
-        count = sum(1 for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name)
+        count = sum(1 for r in rows if resolve_district(r.get("institution")) == district_name)
         if count:
             sheet_list.append(f"  • «{district_name}» — {count} чел.")
     other_count = sum(
         1 for r in rows
-        if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None
+        if r.get("institution") and resolve_district(r.get("institution")) is None
     )
     if other_count:
         sheet_list.append(f"  • «Прочие» — {other_count} чел.")
@@ -1744,6 +1838,8 @@ REPORT_FORM_ROWS = (
         "СПО",
         (
             "Камбарский Машиностроительный Колледж (филиал)",
+            "Камбарский машиностроительный колледж. Филиал Ижевского государственного "
+            "технического университета им. М.Т. Калашникова.",
             "Камбарский филиал ФГБОУ ВО «Ижевский государственный технический университет "
             "имени М.Т. Калашникова»",
             "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. "
@@ -1821,16 +1917,32 @@ REPORT_FORM_ROWS = (
 )
 
 
-def _normalize_institution_name(name):
-    """Привести название заведения к сравнимому виду (пробелы в формах разные)."""
-    return re.sub(r"\s+", " ", str(name or "")).strip().casefold()
-
-
 # Название заведения из анкеты -> номер строки формы.
 REPORT_INSTITUTION_TO_FORM = {}
 for _form_index, (_form_district, _form_name, _form_level, _form_sources) in enumerate(REPORT_FORM_ROWS):
     for _form_source in _form_sources:
         REPORT_INSTITUTION_TO_FORM[_normalize_institution_name(_form_source)] = _form_index
+
+
+def _resolve_form_index(institution):
+    """Номер строки формы для заведения из анкеты; терпимо к написанию названия."""
+    key = _normalize_institution_name(institution)
+    if not key:
+        return None
+    form_index = REPORT_INSTITUTION_TO_FORM.get(key)
+    if form_index is not None:
+        return form_index
+    alias_target = INSTITUTION_ALIASES_NORMALIZED.get(key)
+    if alias_target:
+        return REPORT_INSTITUTION_TO_FORM.get(_normalize_institution_name(alias_target))
+    close = difflib.get_close_matches(key, REPORT_INSTITUTION_TO_FORM, n=1, cutoff=0.9)
+    if close:
+        form_index = REPORT_INSTITUTION_TO_FORM[close[0]]
+        log.warning(
+            "Заведение %r отнесено к строке формы %r", institution, REPORT_FORM_ROWS[form_index][1]
+        )
+        return form_index
+    return None
 
 
 def _form_level_metrics(level_rows):
@@ -1860,16 +1972,51 @@ def _form_metrics_values(metrics):
 
 
 def _collect_form_stats(rows):
-    """Разложить анкеты по строкам формы; анкеты вне формы не учитываются."""
+    """Разложить анкеты по строкам формы; анкеты вне формы не учитываются.
+
+    Уровень берём из самой формы (графы ПОО или ОО ВО), а не из названия
+    заведения: так цифры всегда попадают в те графы, что размечены в шаблоне.
+    """
     stats = [{"СПО": [], "ВО": [], "Не указано": []} for _ in REPORT_FORM_ROWS]
     for row in rows:
-        form_index = REPORT_INSTITUTION_TO_FORM.get(
-            _normalize_institution_name(row.get("institution"))
-        )
+        form_index = _resolve_form_index(row.get("institution"))
         if form_index is None:
             continue
-        stats[form_index][detect_education_level(row)].append(row)
+        stats[form_index][REPORT_FORM_ROWS[form_index][2]].append(row)
     return stats
+
+
+def _count_rows_outside_form(rows):
+    """Сколько анкет не нашло себе строку в форме (такого заведения в перечне нет)."""
+    return sum(
+        1 for row in rows
+        if _resolve_form_index(row.get("institution")) is None
+    )
+
+
+def _count_unfinished_surveys(today_only=False):
+    """Сколько человек начали анкету, но так и не дошли до конца.
+
+    Учтены только те, кто ни разу не завершил анкету: если человек уже
+    заполнил её когда-то (есть created_at), он в форму попадает.
+    """
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        sql = (
+            "SELECT COUNT(*) FROM progress p "
+            "LEFT JOIN answers a ON a.user_id = p.user_id "
+            "WHERE p.started <> 2 AND p.step_index < %s AND a.created_at IS NULL"
+        )
+        params = [len(STEPS)]
+        if today_only:
+            sql += " AND p.started_at::date = %s"
+            params.append(date.today())
+        c.execute(sql, tuple(params))
+        row = c.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        release_db(conn)
 
 
 def _write_report_form_sheet(ws, stats):
@@ -1949,8 +2096,8 @@ def _write_report_form_sheet(ws, stats):
     ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
 
-def _write_report_summary_sheet(ws, stats, today_only):
-    """Сводка по уровням обучения: только те анкеты, что попали в форму."""
+def _write_report_summary_sheet(ws, stats, skipped, today_only):
+    """Сводка по уровням обучения и сколько человек не попало в форму."""
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -2004,21 +2151,45 @@ def _write_report_summary_sheet(ws, stats, today_only):
             if level == "ИТОГО":
                 cell.font = Font(bold=True)
 
+    # Сколько человек осталось за рамками формы: не завершили анкету или их
+    # заведения нет в перечне.
+    excel_row += 2
+    ws.cell(row=excel_row, column=1, value="Не попали в форму отчёта").font = Font(
+        bold=True, size=11
+    )
+    for label, value in (
+        ("Начали, но не завершили анкету, чел.", skipped["unfinished"]),
+        ("Анкет с заведением, которого нет в форме, чел.", skipped["outside_form"]),
+    ):
+        excel_row += 1
+        label_cell = ws.cell(row=excel_row, column=1, value=label)
+        label_cell.alignment = Alignment(
+            horizontal="left", vertical="center", wrap_text=True
+        )
+        label_cell.border = border
+        value_cell = ws.cell(row=excel_row, column=2, value=value)
+        value_cell.alignment = center
+        value_cell.border = border
+
     for column, width in {
         "A": 46, "B": 12, "C": 14, "D": 20, "E": 26, "F": 16, "G": 26
     }.items():
         ws.column_dimensions[column].width = width
 
 
-def _build_report_workbook(rows, today_only=False):
+def _build_report_workbook(rows, today_only=False, unfinished_count=0):
     """Собрать книгу отчёта (заполненная форма и сводка) и вернуть путь к файлу."""
     stats = _collect_form_stats(rows)
+    skipped = {
+        "unfinished": unfinished_count,
+        "outside_form": _count_rows_outside_form(rows),
+    }
     wb = Workbook()
     form_ws = wb.active
     form_ws.title = REPORT_FORM_SHEET
     _write_report_form_sheet(form_ws, stats)
     _write_report_summary_sheet(
-        wb.create_sheet(title=REPORT_SUMMARY_SHEET), stats, today_only
+        wb.create_sheet(title=REPORT_SUMMARY_SHEET), stats, skipped, today_only
     )
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
@@ -2065,9 +2236,10 @@ def report_to_template(admin_id, today_only=False, inbox_id=None):
         return True
 
     stats = _collect_form_stats(rows)
+    unfinished_count = _count_unfinished_surveys(today_only)
     path = None
     try:
-        path = _build_report_workbook(rows, today_only)
+        path = _build_report_workbook(rows, today_only, unfinished_count)
         size = os.path.getsize(path)
         if size > EXPORT_MAX_DOC_BYTES:
             log.warning("Отчёт: файл %s байт больше лимита ВК", size)
@@ -2272,6 +2444,283 @@ def _unread_recovery_worker():
             log.exception("Ошибка периодического восстановления непрочитанных")
         time.sleep(60)
 
+# ----------------- НАПОМИНАНИЯ О НЕЗАВЕРШЁННЫХ АНКЕТАХ -----------------
+#
+# Если человек начал анкету и остановился на каком-то шаге, бот повторяет
+# последний вопрос. Напоминания идут фоном и уступают живым сообщениям:
+# как только в очередях появляется чья-то анкета или ответ, рассылка останавливается.
+
+REMINDER_PAUSE_MINUTES = int(os.getenv("REMINDER_PAUSE_MINUTES", "30"))
+REMINDER_REPEAT_MINUTES = int(os.getenv("REMINDER_REPEAT_MINUTES", "120"))
+REMINDER_MAX_COUNT = int(os.getenv("REMINDER_MAX_COUNT", "2"))
+REMINDER_BATCH = int(os.getenv("REMINDER_BATCH", "20"))
+REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "60"))
+REMINDER_SEND_DELAY = float(os.getenv("REMINDER_SEND_DELAY", "1.0"))
+
+REMINDER_TEXT = (
+    "⏰ Напоминаю: анкета пока не завершена. Ответьте на вопрос ниже, "
+    "чтобы мы могли подобрать для вас работу и стажировку."
+)
+
+
+def _fetch_reminder_targets(limit=REMINDER_BATCH):
+    """Кому пора напомнить: анкета не завершена и человек давно не отвечал."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT p.user_id, p.step_index, p.uni_page FROM progress p "
+            "LEFT JOIN answers a ON a.user_id = p.user_id "
+            "WHERE p.started <> 2 AND p.step_index < %s AND a.created_at IS NULL "
+            "AND COALESCE(p.last_activity, p.started_at) IS NOT NULL "
+            "AND COALESCE(p.last_activity, p.started_at) < now() - make_interval(mins => %s) "
+            "AND (p.reminded_at IS NULL OR p.reminded_at < now() - make_interval(mins => %s)) "
+            "AND COALESCE(p.remind_count, 0) < %s "
+            "ORDER BY COALESCE(p.last_activity, p.started_at) ASC "
+            "LIMIT %s",
+            (
+                len(STEPS), REMINDER_PAUSE_MINUTES, REMINDER_REPEAT_MINUTES,
+                REMINDER_MAX_COUNT, limit
+            )
+        )
+        return c.fetchall()
+    finally:
+        release_db(conn)
+
+
+def _mark_reminded(user_id):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE progress SET reminded_at=now(), "
+            "remind_count=COALESCE(remind_count, 0) + 1 WHERE user_id=%s",
+            (user_id,)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def _live_messages_waiting():
+    """Есть ли в очередях живые сообщения: они важнее любых напоминаний."""
+    try:
+        return _count_ready_inbox() > 0 or _count_ready_outbox() > 0
+    except Exception:
+        log.exception("Не удалось проверить очереди перед напоминанием")
+        return True
+
+
+def _send_reminders():
+    """Повторить последний вопрос тем, кто остановился на середине анкеты."""
+    targets = _fetch_reminder_targets()
+    if not targets:
+        return 0
+    sent = 0
+    for user_id, step_index, _saved_page in targets:
+        if _live_messages_waiting():
+            log.info("Напоминания: в очередях есть живые сообщения, круг прерван")
+            break
+        if step_index is None or not 0 <= step_index < len(STEPS):
+            continue
+        try:
+            with _lock_user(user_id):
+                current_step, current_page, started = get_progress_cached(user_id)
+                if started == 2 or current_step != step_index:
+                    # Человек уже ответил или закончил анкету — не мешаем.
+                    continue
+                if _live_messages_waiting():
+                    log.info("Напоминания: в очередях есть живые сообщения, круг прерван")
+                    break
+                ask_step(
+                    user_id,
+                    STEPS[current_step],
+                    current_page if isinstance(current_page, int) else 0,
+                    prefix=REMINDER_TEXT
+                )
+                _mark_reminded(user_id)
+                sent += 1
+                log.info(
+                    "Напоминание отправлено user=%s step=%s", user_id, STEPS[current_step]
+                )
+        except Exception:
+            log.exception("Не удалось отправить напоминание user=%s", user_id)
+            continue
+        time.sleep(REMINDER_SEND_DELAY)
+    return sent
+
+
+def _reminder_worker():
+    log.info(
+        "Напоминания включены: пауза %s мин, повтор %s мин, не больше %s раз, "
+        "проверка каждые %s с",
+        REMINDER_PAUSE_MINUTES, REMINDER_REPEAT_MINUTES, REMINDER_MAX_COUNT,
+        REMINDER_POLL_SECONDS
+    )
+    while True:
+        try:
+            sent = _send_reminders()
+            if sent:
+                log.info("Напоминания разосланы: %s", sent)
+        except Exception:
+            log.exception("Ошибка рассылки напоминаний")
+        time.sleep(REMINDER_POLL_SECONDS)
+
+
+# --- Разовая рассылка всем, кто не дошёл до конца анкеты (команда /рассылка) ---
+
+REMINDER_BROADCAST_LIMIT = int(os.getenv("REMINDER_BROADCAST_LIMIT", "5000"))
+REMINDER_BROADCAST_DELAY = float(os.getenv("REMINDER_BROADCAST_DELAY", "0.2"))
+REMINDER_BROADCAST_PROGRESS_EVERY = int(os.getenv("REMINDER_BROADCAST_PROGRESS_EVERY", "100"))
+REMINDER_BROADCAST_YIELD_SECONDS = float(os.getenv("REMINDER_BROADCAST_YIELD_SECONDS", "20"))
+
+_broadcast_guard = threading.Lock()
+
+
+def _fetch_unfinished_for_broadcast(limit=REMINDER_BROADCAST_LIMIT):
+    """Все, кто начал анкету и не дошёл до конца (без порогов напоминаний).
+
+    Согласие на обработку данных проверяем: тем, кто в нём отказался, не пишем.
+    """
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT p.user_id, p.step_index, p.uni_page FROM progress p "
+            "LEFT JOIN answers a ON a.user_id = p.user_id "
+            "WHERE p.started <> 2 AND p.step_index < %s AND a.created_at IS NULL "
+            "AND (a.consent_status IS NULL OR a.consent_status = TRUE) "
+            "ORDER BY p.user_id LIMIT %s",
+            (len(STEPS), limit)
+        )
+        return c.fetchall()
+    finally:
+        release_db(conn)
+
+
+def _wait_while_live_messages(max_wait=REMINDER_BROADCAST_YIELD_SECONDS):
+    """Уступить живым сообщениям: ждём, пока очереди опустеют."""
+    waited = 0.0
+    while waited < max_wait:
+        if not _live_messages_waiting():
+            return
+        time.sleep(1.0)
+        waited += 1.0
+
+
+def _broadcast_reminders(admin_id, inbox_id=None):
+    """Повторить вопрос всем незавершившим анкету (разово, без лимитов напоминаний)."""
+    if not _broadcast_guard.acquire(blocking=False):
+        _queue_export_reply(
+            admin_id, "📣 Рассылка уже идёт — дождитесь её окончания.", inbox_id
+        )
+        return
+    try:
+        targets = _fetch_unfinished_for_broadcast()
+        if not targets:
+            _queue_export_reply(
+                admin_id, "Незавершённых анкет нет: все, кто начинал, уже дошли до конца.",
+                inbox_id
+            )
+            return
+        log.info("Рассылка запущена admin=%s targets=%s", admin_id, len(targets))
+        _queue_export_reply(
+            admin_id,
+            f"📣 Рассылка запущена: {len(targets)} человек, которые не дошли до конца анкеты.",
+            inbox_id
+        )
+        sent = 0
+        failed = 0
+        skipped = 0
+        for index, (user_id, step_index, _saved_page) in enumerate(targets, start=1):
+            if step_index is None or not 0 <= step_index < len(STEPS):
+                skipped += 1
+                continue
+            _wait_while_live_messages()
+            try:
+                with _lock_user(user_id):
+                    current_step, current_page, started = get_progress_cached(user_id)
+                    if started == 2 or current_step != step_index:
+                        skipped += 1
+                        continue
+                    result = ask_step(
+                        user_id,
+                        STEPS[current_step],
+                        current_page if isinstance(current_page, int) else 0,
+                        prefix=REMINDER_TEXT
+                    )
+                if result:
+                    sent += 1
+                    _mark_reminded(user_id)
+                else:
+                    failed += 1
+            except Exception:
+                log.exception("Рассылка: не удалось написать user=%s", user_id)
+                failed += 1
+            if index % REMINDER_BROADCAST_PROGRESS_EVERY == 0:
+                log.info(
+                    "Рассылка: обработано %s из %s (отправлено %s, ошибок %s)",
+                    index, len(targets), sent, failed
+                )
+                _queue_export_reply(
+                    admin_id,
+                    f"📣 Рассылка: обработано {index} из {len(targets)} "
+                    f"(отправлено {sent}, ошибок {failed})…",
+                    inbox_id
+                )
+            time.sleep(REMINDER_BROADCAST_DELAY)
+        summary = (
+            "📣 Рассылка завершена.\n\n"
+            f"• Всего в списке: {len(targets)}\n"
+            f"• Отправлено: {sent}\n"
+            f"• Не доставлено (запретили сообщения или ошибка VK): {failed}\n"
+            f"• Пропущено (уже ответили или закончили анкету): {skipped}"
+        )
+        log.info(
+            "Рассылка завершена admin=%s targets=%s sent=%s failed=%s skipped=%s",
+            admin_id, len(targets), sent, failed, skipped
+        )
+        _queue_export_reply(admin_id, summary, inbox_id)
+    except Exception:
+        log.exception("Рассылка напоминаний упала admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id,
+                "❌ Рассылка прервалась из-за ошибки. Подробности записаны в журнал.",
+                inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось сообщить об ошибке рассылки admin=%s", admin_id)
+    finally:
+        _broadcast_guard.release()
+
+
+def _submit_broadcast(admin_id, inbox_id=None):
+    try:
+        if _executor_heavy is None:
+            raise RuntimeError("Фоновый исполнитель рассылки ещё не запущен")
+        _executor_heavy.submit(_broadcast_reminders, admin_id, inbox_id)
+        log.info("Задача рассылки поставлена в очередь admin=%s", admin_id)
+    except Exception:
+        log.exception("Не удалось запустить рассылку для admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id, "❌ Не удалось запустить рассылку. Попробуйте позже.", inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось сообщить о сбое запуска рассылки admin=%s", admin_id)
+
+
+def _schedule_broadcast(admin_id):
+    context = _current_inbox_context()
+    if context is not None:
+        context["broadcasts"].append((admin_id, context["inbox_id"]))
+        return
+    _submit_broadcast(admin_id)
+
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 _USER_LOCKS = {}
@@ -2365,6 +2814,20 @@ def handle_message(user_id, text):
                 "📋 Запрос на отчёт по форме за сегодня принят. Подготавливаю файл…"
             )
             _schedule_report(user_id, True)
+        else:
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    if text_lower in ["/рассылка", "/рассылка всем", "/напомнить всем", "/broadcast"]:
+        is_admin = user_id in ADMIN_IDS
+        log.info("Команда рассылки незавершённым user=%s is_admin=%s", user_id, is_admin)
+        if is_admin:
+            send_message(
+                user_id,
+                "📣 Запускаю рассылку: повторю последний вопрос всем, кто не завершил анкету. "
+                "О ходе и итогах сообщу отдельными сообщениями."
+            )
+            _schedule_broadcast(user_id)
         else:
             send_message(user_id, MESSAGES["admin_only"])
         return
@@ -2610,7 +3073,8 @@ def _process_one_inbox():
             "progress_updates": {},
             "replies": [],
             "exports": [],
-            "reports": []
+            "reports": [],
+            "broadcasts": []
         }
         _inbox_context.current = context
         with _lock_user(user_id):
@@ -2637,6 +3101,8 @@ def _process_one_inbox():
                 _submit_export(*export_job)
             for report_job in context["reports"]:
                 _submit_report(*report_job)
+            for broadcast_job in context["broadcasts"]:
+                _submit_broadcast(*broadcast_job)
             log.info("inbox_done id=%s user=%s replies=%s", inbox_id, user_id, len(context["replies"]))
         return True
     except Exception as e:
@@ -2877,6 +3343,7 @@ async def startup_event():
     _outbox_wake.set()
     log_msg("Бот запущен; очереди inbox/outbox готовы.")
     threading.Thread(target=_unread_recovery_worker, daemon=True).start()
+    threading.Thread(target=_reminder_worker, daemon=True).start()
 
 @app.post("/")
 async def vk_callback(request: Request):

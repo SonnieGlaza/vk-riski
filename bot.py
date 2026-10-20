@@ -1127,32 +1127,53 @@ def _build_export_workbook(rows):
     # --- 2. НОВЫЙ ЛИСТ «ОТЧЕТ» (по вашей структуре из Excel) ---
     report_ws = wb.create_sheet(title="Отчет")
     
-    # Заголовки колонок (соответствуют колонкам C-N в вашем Excel)
+    # Заголовки колонок (14 штук, соответствуют вашим данным)
     report_headers = [
-        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Всего",
-        "из них студентов выпускных курсов",
-        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел. - Всего",
-        "из них студентов выпускных курсов",
-        "из них студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком",
-        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Всего",
-        "из них студентов выпускных курсов",
-        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел. - Всего",
-        "из них студентов выпускных курсов",
-        "из них студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком",
-        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Из них (доп. уточнение)",
-        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел. - Из них (доп. уточнение)",
-        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел. - Из них (доп. уточнение)",
-        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел. - Из них (доп. уточнение)"
+        "Количество студентов ПОО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nВсего",
+        "из них\nстудентов\nвыпускных\nкурсов",
+        "Число студентов ПОО, находящихся под риском\nнетрудоустройства, чел.\nВсего",
+        "из них\nстудентов\nвыпускных\nкурсов",
+        "из них студентов, призывающихся на военную службу\nили собирающихся осуществлять уход за ребенком",
+        "Количество студентов ОО ВО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nВсего",
+        "из них\nстудентов\nвыпускных\nкурсов",
+        "Число студентов ОО ВО, находящихся под риском\nнетрудоустройства, чел.\nВсего",
+        "из них\nстудентов\nвыпускных\nкурсов",
+        "из них студентов, призывающихся на военную службу\nили собирающихся осуществлять уход за ребенком",
+        "Количество студентов ПОО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nИз них (доп. уточнение)",
+        "Число студентов ПОО, находящихся под риском\nнетрудоустройства, чел.\nИз них (доп. уточнение)",
+        "Количество студентов ОО ВО, в отношении которых\nпроведена оценка риска нетрудоустройства, чел.\nИз них (доп. уточнение)",
+        "Число студентов ОО ВО, находящихся под риском\nнетрудоустройства, чел.\nИз них (доп. уточнение)"
     ]
     
+    # Настройки стилей
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid") # Светло-голубая заливка как в Excel
+    thin_border = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000")
+    )
+    center_wrap_align = Alignment(
+        horizontal="center", 
+        vertical="center", 
+        wrap_text=True,
+        shrink_to_fit=False
+    )
+    center_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
+
     # Пишем заголовки в строку 1 (начиная со 2-го столбца, B)
     for idx, header in enumerate(report_headers, start=2):
         cell = report_ws.cell(row=1, column=idx, value=header)
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.fill = header_fill
+        cell.alignment = center_wrap_align
+        cell.border = thin_border
+    
+    # Настроим ширину первой колонки (Районы)
+    report_ws.column_dimensions['A'].width = 15
     
     # Словари для группировки данных
-    # Ключ: (район, учебное заведение)
     grouped_data = {}
     
     for row in rows:
@@ -1164,28 +1185,23 @@ def _build_export_workbook(rows):
         
         key = (district, institution)
         if key not in grouped_data:
-            # Инициализируем словарь с нулями для всех 14 числовых колонок
             grouped_data[key] = {
                 "district": district,
                 "institution": institution,
                 "poo_total": 0, "poo_grad": 0, "poo_risk_total": 0, "poo_risk_grad": 0, "poo_risk_mil_matern": 0,
                 "vo_total": 0, "vo_grad": 0, "vo_risk_total": 0, "vo_risk_grad": 0, "vo_risk_mil_matern": 0,
-                # Колонки 11-14 в вашем Excel часто дублируют или уточняют данные, заполним их аналогично
                 "poo_total_2": 0, "poo_risk_total_2": 0, "vo_total_2": 0, "vo_risk_total_2": 0
             }
             
-        # Логика подсчета баллов для определения "риска" (порог 5 взят из вашего кода)
         scores, total_score = calculate_scores(row)
         
-        # Определяем тип образования по названию учреждения
-        edu_type = "poo"  # По умолчанию СПО
+        edu_type = "poo"
         if any(marker in institution.lower() for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
             edu_type = "vo"
             
         is_graduate = str(row.get("graduate") or "").strip().lower().startswith("да")
         is_mil_matern = any(str(row.get(f) or "").strip().lower().startswith("да") for f in ("military", "maternity"))
         
-        # Заполняем данные в зависимости от типа образования
         if edu_type == "poo":
             grouped_data[key]["poo_total"] += 1
             if is_graduate:
@@ -1196,7 +1212,7 @@ def _build_export_workbook(rows):
                     grouped_data[key]["poo_risk_grad"] += 1
                 if is_mil_matern:
                     grouped_data[key]["poo_risk_mil_matern"] += 1
-        else: # VO
+        else:
             grouped_data[key]["vo_total"] += 1
             if is_graduate:
                 grouped_data[key]["vo_grad"] += 1
@@ -1207,8 +1223,7 @@ def _build_export_workbook(rows):
                 if is_mil_matern:
                     grouped_data[key]["vo_risk_mil_matern"] += 1
 
-    # --- Запись данных в лист «Отчет» с правильной сортировкой ---
-    # Сначала собираем уникальные районы в нужном порядке
+    # --- Запись данных в лист «Отчет» ---
     ordered_districts = []
     for d in DISTRICTS_UNIVERSITIES.keys():
         if any(v[0] == d for v in grouped_data.keys()):
@@ -1217,21 +1232,22 @@ def _build_export_workbook(rows):
         ordered_districts.append("Прочие")
         
     current_row = 2
-    thin_border = Border(left=Side(style="thin"), right=Side(style="thin"), 
-                         top=Side(style="thin"), bottom=Side(style="thin"))
     
     for district in ordered_districts:
-        # Фильтруем заведения текущего района
         district_rows = [(k, v) for k, v in grouped_data.items() if k[0] == district]
-        # Сортируем по названию учреждения
         district_rows.sort(key=lambda x: x[1]["institution"])
         
         for (dist, inst), data in district_rows:
-            # Колонка A: Район (записываем только для первого заведения района)
-            if current_row == 2 or report_ws.cell(row=current_row - 1, column=1).value != district:
-                report_ws.cell(row=current_row, column=1, value=district)
+            # Колонка A: Район (объединять визуально не будем, просто повторяем для каждой строки, 
+            # либо можно добавить логику объединения, но для выгрузки данных это избыточно)
+            report_ws.cell(row=current_row, column=1, value=district)
+            report_ws.cell(row=current_row, column=1).alignment = center_align
+            report_ws.cell(row=current_row, column=1).border = thin_border
+            
             # Колонка B: Учебное заведение
             report_ws.cell(row=current_row, column=2, value=inst)
+            report_ws.cell(row=current_row, column=2).alignment = center_align
+            report_ws.cell(row=current_row, column=2).border = thin_border
             
             # Колонки C-N (индексы 3-16)
             values = [
@@ -1242,13 +1258,13 @@ def _build_export_workbook(rows):
             
             for col_idx, val in enumerate(values, start=3):
                 cell = report_ws.cell(row=current_row, column=col_idx, value=val)
-                cell.alignment = Alignment(horizontal="center")
+                cell.alignment = center_align
                 cell.border = thin_border
                 
             current_row += 1
             
-    # Автоподбор ширины колонок
-    for col in range(1, 17):
+    # Автоподбор ширины колонок (B-N)
+    for col in range(2, 17):
         max_length = 0
         col_letter = get_column_letter(col)
         for cell in report_ws[col_letter]:
@@ -1257,7 +1273,7 @@ def _build_export_workbook(rows):
                     max_length = len(str(cell.value))
             except:
                 pass
-        adjusted_width = (max_length + 2) if max_length > 0 else 15
+        adjusted_width = (max_length + 2) if max_length > 0 else 12
         report_ws.column_dimensions[col_letter].width = adjusted_width
 
     # --- 3. Оставляем ваш существующий код создания районных листов (DISTRICTS) ---

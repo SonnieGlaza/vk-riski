@@ -21,6 +21,7 @@ import concurrent.futures
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.properties import PageSetupProperties
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -757,6 +758,8 @@ MESSAGES = {
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
     "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
+    "no_data_report": "Пока нет собранных анкет для отчёта.",
+    "no_data_report_today": "Сегодня пока нет новых анкет для отчёта.",
     "admin_only": "Эта команда доступна только администраторам.",
     "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку ниже.",
     "already_finished": "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже.",
@@ -1050,6 +1053,26 @@ SCORE_KEYS = [
 ]
 
 
+def _is_yes(value):
+    """Ответ анкеты начинается с «да» (выпускной курс, призыв, отпуск по уходу)."""
+    return str(value or "").strip().casefold().startswith("да")
+
+
+def _has_special_circumstances(row):
+    """Призыв на военную службу или уход за ребёнком."""
+    return any(_is_yes(row.get(field)) for field in ("military", "maternity"))
+
+
+def detect_education_level(row):
+    """Уровень обучения по названию заведения из анкеты: ПОО (СПО), ОО ВО или «Не указано»."""
+    institution = str(row.get("institution") or "").strip().casefold()
+    if not institution:
+        return "Не указано"
+    if any(marker in institution for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
+        return "ВО"
+    return "СПО"
+
+
 def _format_created_at(value):
     if value is None:
         return ""
@@ -1106,214 +1129,105 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
 def _build_export_workbook(rows):
     """Собрать книгу xlsx во временный файл и вернуть её путь."""
     wb = Workbook()
-    
-    # --- 1. Лист «Анкеты» (возвращаем красивое оформление) ---
     ws1 = wb.active
     ws1.title = "Анкеты"
     header_font = Font(bold=True)
     available = rows[0].keys()
     cols = [name for name in EXPORT_FULL_COLUMNS if name in available]
-    
     for col_idx, col_name in enumerate(cols, start=1):
         cell = ws1.cell(row=1, column=col_idx, value=EXPORT_HEADERS.get(col_name, col_name))
         cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    
+        cell.alignment = Alignment(horizontal="center")
     for row_idx, r in enumerate(rows, start=2):
         for col_idx, col_name in enumerate(cols, start=1):
             value = r[col_name]
             if col_name == "created_at" and value is not None:
                 value = _format_created_at(value)
             ws1.cell(row=row_idx, column=col_idx, value=value if value is not None else "")
-    
-    # Настройка ширины для Анкет
-    for col_idx in range(1, len(cols) + 1):
-        ws1.column_dimensions[get_column_letter(col_idx)].width = 25
-    ws1.column_dimensions['A'].width = 8 # ID пользователя
 
-    # --- 2. НОВЫЙ ЛИСТ «ОТЧЕТ» (точная копия вашего Excel) ---
-    report_ws = wb.create_sheet(title="Отчет")
-    
-    # Настройки стилей
-    header_font = Font(bold=True, size=10)
-    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid") # Серый фон заголовка
-    data_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid") # Серый фон для крестиков
+    # Сводная таблица Y:AE рядом с подробной выгрузкой.
+    grouped_rows = {"СПО": [], "ВО": [], "Не указано": []}
+    for row in rows:
+        grouped_rows[detect_education_level(row)].append(row)
+
+    ws1["Y1"] = "Студенты"
+    ws1["Z1"] = (
+        "Количество студентов ПОО, в отношении которых проведена "
+        "оценка риска нетрудоустройства, чел."
+    )
+    ws1["AB1"] = "Число студентов ПОО, находящихся под риском нетрудоустройства, чел."
+    ws1["Z2"] = "Всего"
+    ws1["AA2"] = "Из них"
+    ws1["AA4"] = "Студентов выпускных курсов"
+    ws1["AB2"] = "Всего"
+    ws1["AC2"] = "Из них"
+    ws1["AC3"] = (
+        "Студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    )
+    ws1["AD3"] = "Студентов выпускных курсов"
+    ws1["AE3"] = "Из них"
+    ws1["AE4"] = (
+        "Студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    )
+    for merged_range in (
+        "Y1:Y4", "Z1:AA1", "Z2:Z4", "AA2:AA3", "AB1:AE1", "AB2:AB4",
+        "AC2:AE2", "AC3:AC4", "AD3:AD4"
+    ):
+        ws1.merge_cells(merged_range)
+
     thin_border = Border(
         left=Side(style="thin", color="000000"),
         right=Side(style="thin", color="000000"),
         top=Side(style="thin", color="000000"),
         bottom=Side(style="thin", color="000000")
     )
-    center_align = Alignment(horizontal="center", vertical="center", wrap_text=False)
-    wrap_center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    
-    # Объединение ячеек в шапке (строка 1, колонки A-N)
-    # Это объединяет "Всего / из них / студентов выпускных курсов" в одну ячейку
-    for col in range(1, 15):
-        report_ws.merge_cells(start_row=1, start_column=col, end_row=4, end_column=col)
-        
-    # Заголовки (теперь они в 5-й строке, так как 1-4 объединены)
-    report_headers_row5 = [
-        "Место нахождение", "Наименование учебного заведения", 
-        "Количество студентов ПОО, в отношении которых проведена оценка риска нетрудоустройства, чел.", 
-        "Число студентов ПОО, находящихся под риском нетрудоустройства, чел.", 
-        "Количество студентов ОО ВО, в отношении которых проведена оценка риска нетрудоустройства, чел.", 
-        "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел."
-    ]
-    
-    # Подзаголовки для 3 и 4 строк (которые визуально находятся внутри объединенных ячеек 1-4)
-    # В Excel это выглядит как текст внутри большой рамки. В openpyxl мы пишем его в 3 и 4 строки.
-    # Но чтобы не усложнять, мы просто оставим 1-4 строки пустыми (объединенными), а данные начнем с 5-й.
-    # ВАЖНО: Судя по вашему файлу, данные начинаются с 5-й строки. 1-4 - это только шапка.
-    
-    # Заполняем 5-ю строку (настоящие заголовки колонок)
-    for idx, header in enumerate(report_headers_row5, start=1):
-        cell = report_ws.cell(row=5, column=idx, value=header)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = wrap_center_align
-        cell.border = thin_border
-        
-    # Подписи для колонок (строка 6, как в вашем образце: Всего / из них...)
-    sub_headers = [
-        ["Всего", "из них", "Всего", "из них", "Всего", "из них", "Всего", "из них"],
-        ["", "студентов выпускных курсов", "", "студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком", 
-         "", "студентов выпускных курсов", "", "студентов, призывающихся на военную службу или собирающихся осуществлять уход за ребенком"]
-    ]
-    
-    for r in range(2):
-        for c in range(8):
-            col_idx = 3 + c # Начинаем с колонки D (3+1)
-            cell = report_ws.cell(row=6 + r, column=col_idx, value=sub_headers[r][c])
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = center_align
+    summary_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    for row in ws1.iter_rows(min_row=1, max_row=4, min_col=25, max_col=31):
+        for cell in row:
+            cell.font = Font(bold=True, size=10)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.fill = summary_header_fill
             cell.border = thin_border
-            
-    # Колонки A и B в строках 1-6 тоже оформляем
-    for r in range(1, 7):
-        for c in range(1, 3):
-            cell = report_ws.cell(row=r, column=c)
+
+    summary_levels = ["СПО", "ВО"]
+    if grouped_rows["Не указано"]:
+        summary_levels.append("Не указано")
+    for row_idx, level in enumerate(summary_levels, start=5):
+        level_rows = grouped_rows[level]
+        risk_rows = [r for r in level_rows if calculate_scores(dict(r))[1] >= 5]
+        graduate_rows = [r for r in level_rows if _is_yes(r.get("graduate"))]
+        risk_graduates = [r for r in risk_rows if _is_yes(r.get("graduate"))]
+        values = (
+            level,
+            len(level_rows),
+            len(graduate_rows),
+            len(risk_rows),
+            sum(1 for r in risk_rows if _has_special_circumstances(r)),
+            len(risk_graduates),
+            sum(1 for r in risk_graduates if _has_special_circumstances(r))
+        )
+        for col_idx, value in enumerate(values, start=25):
+            cell = ws1.cell(row=row_idx, column=col_idx, value=value)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
             cell.border = thin_border
-            if r >= 5:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = center_align
-                
-    # Словари для группировки данных
-    grouped_data = {}
-    
-    for row in rows:
-        institution = (row.get("institution") or "").strip()
-        if not institution:
-            continue
-            
-        district = INSTITUTION_TO_DISTRICT.get(institution, "Прочие")
-        key = (district, institution)
-        if key not in grouped_data:
-            grouped_data[key] = {
-                "district": district,
-                "institution": institution,
-                # ПОО
-                "poo_total": 0, "poo_grad": 0, "poo_risk_total": 0, "poo_risk_grad": 0, "poo_risk_mil_matern": 0,
-                # ВО
-                "vo_total": 0, "vo_grad": 0, "vo_risk_total": 0, "vo_risk_grad": 0, "vo_risk_mil_matern": 0,
-            }
-            
-        scores, total_score = calculate_scores(row)
-        
-        edu_type = "poo"
-        if any(marker in institution.lower() for marker in ("фгбоу во", "вгу", "университет", "академия", "институт")):
-            edu_type = "vo"
-            
-        is_graduate = str(row.get("graduate") or "").strip().lower().startswith("да")
-        is_mil_matern = any(str(row.get(f) or "").strip().lower().startswith("да") for f in ("military", "maternity"))
-        
-        if edu_type == "poo":
-            grouped_data[key]["poo_total"] += 1
-            if is_graduate:
-                grouped_data[key]["poo_grad"] += 1
-            if total_score >= 5:
-                grouped_data[key]["poo_risk_total"] += 1
-                if is_graduate:
-                    grouped_data[key]["poo_risk_grad"] += 1
-                if is_mil_matern:
-                    grouped_data[key]["poo_risk_mil_matern"] += 1
-        else:
-            grouped_data[key]["vo_total"] += 1
-            if is_graduate:
-                grouped_data[key]["vo_grad"] += 1
-            if total_score >= 5:
-                grouped_data[key]["vo_risk_total"] += 1
-                if is_graduate:
-                    grouped_data[key]["vo_risk_grad"] += 1
-                if is_mil_matern:
-                    grouped_data[key]["vo_risk_mil_matern"] += 1
 
-    # --- Запись данных в лист «Отчет» ---
-    ordered_districts = []
-    for d in DISTRICTS_UNIVERSITIES.keys():
-        if any(v[0] == d for v in grouped_data.keys()):
-            ordered_districts.append(d)
-    if any(v[0] == "Прочие" for v in grouped_data.keys()):
-        ordered_districts.append("Прочие")
-        
-    current_row = 7 # Данные начинаются с 7-й строки (после шапки)
-    
-    for district in ordered_districts:
-        district_rows = [(k, v) for k, v in grouped_data.items() if k[0] == district]
-        district_rows.sort(key=lambda x: x[1]["institution"])
-        
-        for (dist, inst), data in district_rows:
-            # Колонка A: Район
-            cell_a = report_ws.cell(row=current_row, column=1, value=district)
-            cell_a.alignment = center_align
-            cell_a.border = thin_border
-            
-            # Колонка B: Уч. заведение (сделаем поуже)
-            cell_b = report_ws.cell(row=current_row, column=2, value=inst)
-            cell_b.alignment = center_align
-            cell_b.border = thin_border
-            
-            # Данные (колонки C-N, индексы 3-14)
-            values = [
-                data["poo_total"], data["poo_grad"], data["poo_risk_total"], data["poo_risk_grad"], data["poo_risk_mil_matern"],
-                data["vo_total"], data["vo_grad"], data["vo_risk_total"], data["vo_risk_grad"], data["vo_risk_mil_matern"]
-            ]
-            
-            for col_idx, val in enumerate(values, start=3):
-                cell = report_ws.cell(row=current_row, column=col_idx, value=val)
-                cell.alignment = center_align
-                cell.border = thin_border
-                
-            current_row += 1
-            
-    # --- Добавляем серые крестики (х) на сером фоне, как в исходнике ---
-    # Проходим по всем строкам с данными
-    for r in range(7, current_row):
-        # Колонки с 3 по 14 (C-N)
-        for c in range(3, 15):
-            cell = report_ws.cell(row=r, column=c)
-            if cell.value in [None, 0, ""]:
-                cell.value = "х"
-                cell.font = Font(color="808080") # Серый цвет шрифта
-                cell.fill = data_fill # Серый фон
-                cell.alignment = center_align
-                cell.border = thin_border
-                
-    # Автоподбор ширины
-    widths = {
-        'A': 12, 'B': 40, 'C': 10, 'D': 10, 'E': 12, 'F': 10, 'G': 10, 'H': 12, 'I': 10, 'J': 10, 'K': 12, 'L': 10, 'M': 10, 'N': 12
-    }
-    for col, width in widths.items():
-        report_ws.column_dimensions[col].width = width
+    ws1.row_dimensions[1].height = 60
+    ws1.row_dimensions[2].height = 32
+    ws1.row_dimensions[3].height = 75
+    ws1.row_dimensions[4].height = 75
+    for col_idx in range(1, ws1.max_column + 1):
+        ws1.column_dimensions[get_column_letter(col_idx)].width = 25
+    for column, width in {
+        "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
+    }.items():
+        ws1.column_dimensions[column].width = width
 
-    # --- 3. Листы по районам (оставляем как было) ---
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if INSTITUTION_TO_DISTRICT.get(r.get("institution")) == district_name]
         if district_rows:
             write_score_sheet(wb, district_name, district_rows)
-            
     other_rows = [r for r in rows if r.get("institution") and INSTITUTION_TO_DISTRICT.get(r.get("institution")) is None]
     if other_rows:
         write_score_sheet(wb, "Прочие", other_rows)
@@ -1405,7 +1319,8 @@ def _split_rows(rows, part_count):
     return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
 
-def export_to_table(admin_id, today_only=False, inbox_id=None):
+def _fetch_answers(today_only=False):
+    """Все анкеты (или только за сегодня) в порядке прохождения анкеты."""
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
@@ -1414,9 +1329,13 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
             c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
         else:
             c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
-        rows = c.fetchall()
+        return c.fetchall()
     finally:
         release_db(conn)
+
+
+def export_to_table(admin_id, today_only=False, inbox_id=None):
+    rows = _fetch_answers(today_only)
 
     if not rows:
         log.info("Выгрузка: в таблице answers нет строк — отправляю только текст 'нет анкет' admin=%s", admin_id)
@@ -1524,6 +1443,745 @@ def _schedule_export(admin_id, today_only):
         context["exports"].append((admin_id, today_only, context["inbox_id"]))
         return
     _submit_export(admin_id, today_only)
+
+
+# ----------------- ОТЧЁТ ПО ФОРМЕ «ОЦЕНКА РИСКА НЕТРУДОУСТРОЙСТВА» -----------------
+#
+# Команда /отчет формирует уже заполненную форму «Оценка риска нетрудоустройства
+# (уч. год 2026-2027).xlsx»: те же заголовки и объединённые ячейки (строки 1-4),
+# та же нумерация граф (строка 5), тот же перечень заведений по районам,
+# те же пометки «х» в неприменимых графах.
+
+REPORT_TITLE = "Оценка риска нетрудоустройства (уч. год 2026-2027)"
+REPORT_FORM_SHEET = "Лист1"
+REPORT_SUMMARY_SHEET = "Сводка"
+REPORT_HEADER_ROWS = 5
+REPORT_RISK_THRESHOLD = 5
+
+REPORT_FORM_HEADERS = {
+    "A1": "Место на-хождение",
+    "B1": "Наименование учебного заведения",
+    "C1": (
+        "Количество студентов ПОО, в отношении которых проведена оценка "
+        "риска нетрудоустройства, чел."
+    ),
+    "C2": "Всего",
+    "D2": "из них",
+    "D3": "студентов выпускных курсов",
+    "E1": "Число студентов ПОО, находящихся под риском нетрудоустройства, чел.",
+    "E2": "Всего",
+    "F2": "из них",
+    "F3": (
+        "студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    ),
+    "G3": "студентов выпускных курсов",
+    "H3": "из них",
+    "H4": (
+        "студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    ),
+    "I1": (
+        "Количество студентов ОО ВО, в отношении которых проведена оценка "
+        "риска нетрудоустройства, чел."
+    ),
+    "I2": "Всего",
+    "J2": "из них",
+    "J3": "студентов выпускных курсов",
+    "K1": "Число студентов ОО ВО, находящихся под риском нетрудоустройства, чел.",
+    "K2": "Всего",
+    "L2": "из них",
+    "L3": (
+        "студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    ),
+    "M3": "студентов выпускных курсов",
+    "N3": "из них",
+    "N4": (
+        "студентов, призывающихся на военную службу или собирающихся "
+        "осуществлять уход за ребенком"
+    ),
+}
+
+REPORT_FORM_MERGES = (
+    "A1:A4", "B1:B4", "C1:D1", "C2:C4", "D3:D4",
+    "E1:H1", "E2:E4", "F2:H2", "F3:F4", "G3:G4",
+    "I1:J1", "I2:I4", "J3:J4",
+    "K1:N1", "K2:K4", "L2:N2", "L3:L4", "M3:M4",
+)
+
+# Нумерация граф из строки 5 шаблона.
+REPORT_COLUMN_LABELS = (
+    "1", "1а", "2", "2а", "2б", "2в",
+    "3", "3а", "4", "4а", "4б", "4в",
+)
+
+REPORT_FORM_WIDTHS = {
+    "A": 13.4, "B": 38.4, "C": 11.0, "D": 15.7, "E": 11.0, "F": 16.7, "G": 9.7,
+    "H": 16.9, "I": 11.0, "J": 15.4, "K": 11.0, "L": 16.0, "M": 11.1, "N": 19.1,
+}
+
+# Строки формы (строка 6 и далее в шаблоне):
+# (место нахождения, наименование в форме, уровень графы, названия заведений в анкете).
+REPORT_FORM_ROWS = (
+    (
+        "Алнаши", "БПОУ УР «Асановский аграрно-технический техникум»", "СПО",
+        ("БПОУ УР «Асановский аграрно-технический техникум»",),
+    ),
+    (
+        "Воткинск", "БПОУ УР «Воткинский промышленный техникум»", "СПО",
+        ("БПОУ УР «Воткинский промышленный техникум»",),
+    ),
+    (
+        "Воткинск",
+        "БПОУ УР «Воткинский музыкально-педагогический колледж  имени П.И. Чайковского»",
+        "СПО",
+        ("БПОУ УР «Воткинский музыкально-педагогический колледж имени П.И. Чайковского»",),
+    ),
+    (
+        "Воткинск", "БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",
+        "СПО",
+        ("БПОУ УР «Воткинский машиностроительный техникум имени В.Г.Садовникова»",),
+    ),
+    (
+        "Воткинск", "УдГУ филиал в г. Воткинске", "ВО",
+        ("ФГБОУ ВО «Удмуртский государственный университет» филиал в г.Воткинске",),
+    ),
+    ("Воткинск", "ВФ ФГБОУ ВО им. Калашникова филиал в г.Воткинске", "ВО", ()),
+    (
+        "Воткинск", "Воткинский медицинский колледж", "СПО",
+        (
+            "Воткинский филиал АПОУ УР «Республиканский медицинский колледж имени Героя "
+            "Советского Союза Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        ),
+    ),
+    (
+        "Глазов", "АПОУ УР «Глазовский аграрно-промышленный техникум»", "СПО",
+        ("АПОУ УР «Глазовский аграрно-промышленный техникум»",),
+    ),
+    (
+        "Глазов", "БПОУ УР «Глазовский технический колледж»", "СПО",
+        ("БПОУ УР «Глазовский технический колледж»",),
+    ),
+    (
+        "Глазов", "БПОУ УР «Глазовский политехнический колледж»", "СПО",
+        ("БПОУ УР «Глазовский политехнический колледж»",),
+    ),
+    (
+        "Глазов", "ГИПУ", "ВО",
+        (
+            "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет "
+            "имени В.Г. Короленко»",
+            "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет "
+            "имени В. Г. Короленко»",
+            "ФГБОУ ВО «Глазовский государственный инженерно-педагогический университет "
+            "имени В. Г. Корененко»",
+        ),
+    ),
+    (
+        "Глазов", "Глазовский филиал Республиканского медицинского колледжа", "СПО",
+        (
+            "Республиканский медицинский колледж имени Героя Советского Союза "
+            "Ф.А. Пушиной, Глазовский филиал",
+        ),
+    ),
+    (
+        "Глазов", "ВУЗ «ИжГТУ имени М. Т. Калашникова, филиал»", "ВО",
+        (
+            "Глазовский инженерно-экономический институт(филиал) ФГБОУ ВО «ИжГТУ имени "
+            "М.Т. Калашникова»",
+        ),
+    ),
+    (
+        "Дебесы", "БПОУ «Дебесский политехникум»", "СПО",
+        ("БПОУ «Дебесский политехникум»",),
+    ),
+    (
+        "Игра", "БПОУР «Игринский политехнический техникум»", "СПО",
+        ("БПОУР «Игринский политехнический техникум»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский торгово-экономический техникум»", "СПО",
+        ("БПОУ УР «Ижевский торгово-экономический техникум»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский монтажный техникум»", "СПО",
+        ("БПОУ УР «Ижевский монтажный техникум»",),
+    ),
+    (
+        "Ижевск", "БПОУ «Ижевский агростроительный техникум»", "СПО",
+        ("БПОУ «Ижевский агростроительный техникум»",),
+    ),
+    ("Ижевск", "ЧПОО «Нефтяной техникум»", "СПО", ("ЧПОО «Нефтяной техникум»",)),
+    (
+        "Ижевск", "БПОУ УР «Ижевский политехнический колледж»", "СПО",
+        ("БПОУ УР «Ижевский политехнический колледж»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский промышленно-экономический колледж»", "СПО",
+        ("БПОУ УР «Ижевский промышленно-экономический колледж»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»", "СПО",
+        ("БПОУ УР «Ижевский машиностроительный техникум им. С.Н. Борина»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Радиомеханический техникум имени В.А. Шутова»", "СПО",
+        ("БПОУ УР «Радиомеханический техникум имени В.А. Шутова»",),
+    ),
+    (
+        "Ижевск", "АПОУ УР «Экономико-технологический колледж»", "СПО",
+        ("АПОУ УР «Экономико-технологический колледж»",),
+    ),
+    (
+        "Ижевск", "АПОУ УР «Топливно-энергетический колледж»", "СПО",
+        ("АПОУ УР «Топливно-энергетический колледж»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский техникум индустрии питания»", "СПО",
+        ("БПОУ УР «Ижевский техникум индустрии питания»",),
+    ),
+    (
+        "Ижевск", "КПОУ УР «Удмуртский республиканский колледж культуры»", "СПО",
+        ("КПОУ УР «Удмуртский республиканский колледж культуры»",),
+    ),
+    (
+        "Ижевск", "АНПОО «Международный Восточно-Европейский колледж»", "СПО",
+        ("АНПОО «Международный Восточно-Европейский колледж»",),
+    ),
+    (
+        "Ижевск",
+        "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. Воскресенского»",
+        "СПО",
+        (
+            "АПОУ УР «Техникум радиоэлектроники и информационных технологий им. А.В. "
+            "Воскресенского»",
+        ),
+    ),
+    (
+        "Ижевск",
+        "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза Ф.А. "
+        "Пушиной Министерства здравоохранения Удмуртской Республики»",
+        "СПО",
+        (
+            "АПОУ УР «Республиканский медицинский колледж имени Героя Советского Союза "
+            "Ф.А. Пушиной Министерства здравоохранения Удмуртской Республики»",
+        ),
+    ),
+    (
+        "Ижевск",
+        "ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",
+        "СПО",
+        ("ПОЧУ «Ижевский техникум экономики, управления и права Удмуртпотребсоюза»",),
+    ),
+    (
+        "Ижевск", "АНПОО СПО «Ижевский финансово-юридический колледж»", "СПО",
+        ("АНПОО СПО «Ижевский финансово-юридический колледж»",),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",
+        "СПО",
+        ("БПОУ УР «Удмуртский республиканский социально-педагогический колледж»",),
+    ),
+    (
+        "Ижевск", "АПОУ УР «Строительный техникум»", "СПО",
+        ("АПОУ УР «Строительный техникум»",),
+    ),
+    (
+        "Ижевск", "ФГБОУ ВО «Ижевская государственная медицинский университет»", "ВО",
+        ("ФГБОУ ВО «Ижевская государственная медицинская академия»",),
+    ),
+    (
+        "Ижевск", "КПОУ УР Республиканский музыкальный колледж»", "СПО",
+        ("КПОУ УР «Республиканский музыкальный колледж»",),
+    ),
+    (
+        "Ижевск",
+        "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича Драгунова»",
+        "СПО",
+        (
+            "БПОУ УР «Ижевский индустриальный техникум имени Евгения Фёдоровича "
+            "Драгунова»",
+        ),
+    ),
+    (
+        "Ижевск",
+        "Ижевский институт (филиал) Всероссийского государственного университета юстиции "
+        "(РПА Минюста России)",
+        "ВО",
+        (
+            "Ижевский институт (филиал) ВГУЮ (РПА Минюста России)",
+            "Министерство юстиции Российской Федерации",
+        ),
+    ),
+    (
+        "Ижевск", "УдГУ", "ВО",
+        ("ФГБОУ ВО «Удмуртский государственный университет»",),
+    ),
+    (
+        "Ижевск", "УдГАУ", "ВО",
+        ("ФГБОУ ВО «Удмуртский государственный аграрный университет»",),
+    ),
+    (
+        "Ижевск", "ИжГТУ", "ВО",
+        (
+            "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. "
+            "Калашникова»",
+        ),
+    ),
+    (
+        "Ижевск", "БПОУ УР «Ижевский автотранспортный техникум»", "СПО",
+        ("БПОУ УР «Ижевский автотранспортный техникум»",),
+    ),
+    (
+        "Ижевск", "ФГБОУ ВО «Приволжский государственный университет путей сообщения»", "ВО",
+        ("ФГБОУ ВО «Приволжский государственный университет путей сообщения»",),
+    ),
+    (
+        "Камбарка",
+        "Камбарский машиностроительный колледж. Филиал Ижевского государственного "
+        "технического университета им. М.Т. Калашникова.",
+        "СПО",
+        (
+            "Камбарский Машиностроительный Колледж (филиал)",
+            "Камбарский филиал ФГБОУ ВО «Ижевский государственный технический университет "
+            "имени М.Т. Калашникова»",
+            "ФГБОУ ВО «Ижевский государственный технический университет имени М.Т. "
+            "Калашникова» Камбарский филиал",
+            "Камбарский филиал ФГБОУ ВО «Ижевский государственный технический университет "
+            "имени М.Т. Калашникова»Глазовский инженерно-экономический институт(филиал) "
+            "ФГБОУ ВО «ИжГТУ имени М.Т. Калашникова»",
+        ),
+    ),
+    (
+        "Кез", 'БПОУ УР "Дебесский политехникум"', "СПО",
+        ("Филиал БПОУ УР «Дебесский политехникум» п. Кез",),
+    ),
+    (
+        "Можга", "БПОУ УР «Ижевский промышленно-экономический колледж» в г.Можга", "СПО",
+        (
+            "Филиал АПОУ УР Ижевский промышленно-экономический колледж в г.Можга",
+            "БПОУ УР «Ижевский промышленно-экономический колледж» в г. Можга",
+        ),
+    ),
+    (
+        "Можга", "БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»", "СПО",
+        ("БПОУ УР «Можгинский педагогический колледж имени Т.К. Борисова»",),
+    ),
+    (
+        "Можга", "БПОУ УР «Можгинский агропромышленный колледж»", "СПО",
+        ("БПОУ УР «Можгинский агропромышленный колледж»",),
+    ),
+    (
+        "Можга", "Можгинский филиал Республиканского медицинского колледжа", "СПО",
+        (
+            "Можгинский филиал АПОУ УР Республиканский медицинский колледж имени Героя "
+            "Советского Союза Ф.А. Пушиной",
+        ),
+    ),
+    (
+        "Сарапул", "Сарапульский техникум машиностроения и информационных технологий", "СПО",
+        ("Сарапульский техникум машиностроения и информационных технологий",),
+    ),
+    (
+        "Сарапул", "БПОУ УР «Сарапульский политехнический техникум»", "СПО",
+        ("БПОУ УР «Сарапульский политехнический техникум»",),
+    ),
+    (
+        "Сарапул", "БПОУ УР «Сарапульский многопрофильный колледж»", "СПО",
+        ("БПОУ УР «Сарапульский многопрофильный колледж»",),
+    ),
+    (
+        "Сарапул",
+        "БПОУ УР «Сарапульский колледж социально-педагогических технологий сервис»",
+        "СПО",
+        (
+            "БПОУ УР «Сарапульский колледж социально-педагогических технологий и сервиса»",
+        ),
+    ),
+    (
+        "Сарапул", "Медицинский колледж филиал в г.Сарапуле", "СПО",
+        (
+            "Сарапульский филиал АПОУ УР Республиканский медицинский колледж имени Героя "
+            "Советского Союза Ф.А. Пушиной",
+        ),
+    ),
+    (
+        "Сюмси", "БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»", "СПО",
+        ("БПОУ УР «Сюмсинский техникум лесного и сельского хозяйства»",),
+    ),
+    (
+        "Ува", "БПОУ УР «Увинский профессиональный колледж»", "СПО",
+        ("БПОУ УР «Увинский профессиональный колледж»",),
+    ),
+    (
+        "Яр", "БПОУ УР «Ярский политехникум»", "СПО",
+        ("БПОУ УР «Ярский политехникум»",),
+    ),
+)
+
+
+def _normalize_institution_name(name):
+    """Привести название заведения к сравнимому виду (пробелы в формах разные)."""
+    return re.sub(r"\s+", " ", str(name or "")).strip().casefold()
+
+
+# Название заведения из анкеты -> номер строки формы.
+REPORT_INSTITUTION_TO_FORM = {}
+for _form_index, (_form_district, _form_name, _form_level, _form_sources) in enumerate(REPORT_FORM_ROWS):
+    for _form_source in _form_sources:
+        REPORT_INSTITUTION_TO_FORM[_normalize_institution_name(_form_source)] = _form_index
+
+
+def _form_level_metrics(level_rows):
+    """Показатели графы формы для одной группы студентов (ПОО или ВО)."""
+    risk_rows = [r for r in level_rows if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD]
+    graduate_rows = [r for r in level_rows if _is_yes(r.get("graduate"))]
+    risk_graduate_rows = [r for r in risk_rows if _is_yes(r.get("graduate"))]
+    return {
+        "assessed": len(level_rows),
+        "graduates": len(graduate_rows),
+        "risk": len(risk_rows),
+        "risk_special": sum(1 for r in risk_rows if _has_special_circumstances(r)),
+        "risk_graduates": len(risk_graduate_rows),
+        "risk_graduates_special": sum(
+            1 for r in risk_graduate_rows if _has_special_circumstances(r)
+        ),
+    }
+
+
+def _form_metrics_values(metrics):
+    """Шесть чисел графы: всего, из них выпускники, под риском и далее по форме."""
+    return [
+        metrics["assessed"], metrics["graduates"], metrics["risk"],
+        metrics["risk_special"], metrics["risk_graduates"],
+        metrics["risk_graduates_special"],
+    ]
+
+
+def _collect_form_stats(rows):
+    """Разложить анкеты по строкам формы; вернуть показатели и анкеты вне формы."""
+    stats = [{"СПО": [], "ВО": [], "Не указано": []} for _ in REPORT_FORM_ROWS]
+    other_rows = []
+    for row in rows:
+        form_index = REPORT_INSTITUTION_TO_FORM.get(
+            _normalize_institution_name(row.get("institution"))
+        )
+        if form_index is None:
+            other_rows.append(row)
+            continue
+        stats[form_index][detect_education_level(row)].append(row)
+    return stats, other_rows
+
+
+def _write_report_form_sheet(ws, stats):
+    """Лист с заполненной формой: шапка шаблона, номера граф и строки заведений."""
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_font = Font(bold=True, size=10)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for coordinate, text in REPORT_FORM_HEADERS.items():
+        cell = ws[coordinate]
+        cell.value = text
+    for merged_range in REPORT_FORM_MERGES:
+        ws.merge_cells(merged_range)
+
+    for col_idx, label in enumerate(REPORT_COLUMN_LABELS, start=3):
+        ws.cell(row=REPORT_HEADER_ROWS, column=col_idx, value=label)
+
+    first_data_row = REPORT_HEADER_ROWS + 1
+    for offset, (district, name, form_level, _sources) in enumerate(REPORT_FORM_ROWS):
+        excel_row = first_data_row + offset
+        ws.cell(row=excel_row, column=1, value=district)
+        ws.cell(row=excel_row, column=2, value=name)
+        spo_values = _form_metrics_values(_form_level_metrics(stats[offset]["СПО"]))
+        vo_values = _form_metrics_values(_form_level_metrics(stats[offset]["ВО"]))
+        empty_marker = ["х"] * 6
+        if form_level == "ВО":
+            # ВУЗу нечего показывать в графах ПОО, если среди его анкет нет студентов ПОО.
+            spo_cells = spo_values if stats[offset]["СПО"] else empty_marker
+            vo_cells = vo_values
+        else:
+            spo_cells = spo_values
+            vo_cells = vo_values if stats[offset]["ВО"] else empty_marker
+        for col_idx, value in enumerate(list(spo_cells) + list(vo_cells), start=3):
+            ws.cell(row=excel_row, column=col_idx, value=value)
+        name_lines = max(1, -(-len(name) // 38))
+        ws.row_dimensions[excel_row].height = max(31.5, 15.0 * name_lines + 3)
+
+    last_data_row = first_data_row + len(REPORT_FORM_ROWS) - 1
+
+    # «Место на-хождение» объединяем по группам одного района, как в шаблоне.
+    group_start = 0
+    districts = [form_row[0] for form_row in REPORT_FORM_ROWS]
+    for index in range(1, len(districts) + 1):
+        if index == len(districts) or districts[index] != districts[group_start]:
+            if index - group_start > 1:
+                ws.merge_cells(
+                    start_row=first_data_row + group_start, start_column=1,
+                    end_row=first_data_row + index - 1, end_column=1
+                )
+            group_start = index
+
+    for cells_row in ws.iter_rows(
+        min_row=1, max_row=last_data_row, min_col=1, max_col=14
+    ):
+        for cell in cells_row:
+            cell.border = border
+            if cell.row <= REPORT_HEADER_ROWS:
+                cell.font = header_font
+                cell.alignment = center
+            elif cell.column == 2:
+                cell.alignment = Alignment(
+                    horizontal="justify", vertical="center", wrap_text=True
+                )
+            else:
+                cell.alignment = center
+
+    ws.row_dimensions[1].height = 56.25
+    ws.row_dimensions[4].height = 77.25
+    for column, width in REPORT_FORM_WIDTHS.items():
+        ws.column_dimensions[column].width = width
+
+    ws.print_title_rows = f"1:{REPORT_HEADER_ROWS}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+
+def _write_report_summary_sheet(ws, rows, other_rows, today_only):
+    """Сводка по уровням обучения и анкеты, которых нет в форме."""
+    thin = Side(style="thin", color="000000")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+    ws["A1"] = f"Сводка к отчёту «{REPORT_TITLE}»"
+    ws["A1"].font = Font(bold=True, size=12)
+    ws["A2"] = f"Дата формирования: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+    ws["A3"] = (
+        f"Учтены анкеты за {date.today().strftime('%d.%m.%Y')}"
+        if today_only else "Учтены все анкеты из базы"
+    )
+
+    headers = (
+        "Уровень обучения",
+        "Анкет, чел.",
+        "Из них выпускных курсов",
+        "Под риском нетрудоустройства (5 и более баллов)",
+        "из них призывающихся на военную службу или собирающихся осуществлять "
+        "уход за ребенком",
+        "из них студентов выпускных курсов",
+        "из них призывающихся на военную службу или собирающихся осуществлять "
+        "уход за ребенком",
+    )
+    header_row = 5
+    for col_idx, header in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=header)
+        cell.font = Font(bold=True, size=10)
+        cell.alignment = center
+        cell.border = border
+        cell.fill = header_fill
+
+    grouped = {"СПО": [], "ВО": [], "Не указано": []}
+    for row in rows:
+        grouped[detect_education_level(row)].append(row)
+    levels = ["СПО", "ВО"]
+    if grouped["Не указано"]:
+        levels.append("Не указано")
+
+    excel_row = header_row
+    for level in levels + ["ИТОГО"]:
+        excel_row += 1
+        level_rows = rows if level == "ИТОГО" else grouped[level]
+        values = [level] + _form_metrics_values(_form_level_metrics(level_rows))
+        for col_idx, value in enumerate(values, start=1):
+            cell = ws.cell(row=excel_row, column=col_idx, value=value)
+            cell.alignment = center
+            cell.border = border
+            if level == "ИТОГО":
+                cell.font = Font(bold=True)
+
+    excel_row += 2
+    ws.cell(
+        row=excel_row, column=1, value="Анкеты, которых нет в форме отчёта"
+    ).font = Font(bold=True)
+    excel_row += 1
+    if not other_rows:
+        ws.cell(row=excel_row, column=1, value="Нет")
+    else:
+        for col_idx, header in enumerate(
+            ("Учебное заведение", "Уровень", "Анкет, чел.", "Под риском, чел."), start=1
+        ):
+            cell = ws.cell(row=excel_row, column=col_idx, value=header)
+            cell.font = Font(bold=True, size=10)
+            cell.alignment = center
+            cell.border = border
+            cell.fill = header_fill
+        aggregated = {}
+        for row in other_rows:
+            key = (
+                str(row.get("institution") or "не указано").strip(),
+                detect_education_level(row),
+            )
+            aggregated.setdefault(key, []).append(row)
+        for (institution, level), institution_rows in sorted(aggregated.items()):
+            excel_row += 1
+            risk_count = sum(
+                1 for r in institution_rows
+                if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
+            )
+            values = (institution, level, len(institution_rows), risk_count)
+            for col_idx, value in enumerate(values, start=1):
+                cell = ws.cell(row=excel_row, column=col_idx, value=value)
+                cell.border = border
+                cell.alignment = Alignment(
+                    horizontal="left" if col_idx == 1 else "center",
+                    vertical="center",
+                    wrap_text=True,
+                )
+
+    for column, width in {
+        "A": 46, "B": 12, "C": 14, "D": 20, "E": 26, "F": 16, "G": 26
+    }.items():
+        ws.column_dimensions[column].width = width
+
+
+def _build_report_workbook(rows, today_only=False):
+    """Собрать книгу отчёта (заполненная форма и сводка) и вернуть путь к файлу."""
+    stats, other_rows = _collect_form_stats(rows)
+    wb = Workbook()
+    form_ws = wb.active
+    form_ws.title = REPORT_FORM_SHEET
+    _write_report_form_sheet(form_ws, stats)
+    _write_report_summary_sheet(
+        wb.create_sheet(title=REPORT_SUMMARY_SHEET), rows, other_rows, today_only
+    )
+
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    os.close(fd)
+    wb.save(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        raise RuntimeError("Не удалось создать файл отчёта.")
+    return path
+
+
+def _report_message_text(rows, stats, other_rows, today_only):
+    spo_count = sum(1 for r in rows if detect_education_level(r) == "СПО")
+    vo_count = sum(1 for r in rows if detect_education_level(r) == "ВО")
+    risk_count = sum(
+        1 for r in rows if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
+    )
+    filled_count = sum(1 for level_rows in stats if level_rows["СПО"] or level_rows["ВО"])
+    period = "за сегодня" if today_only else "за весь период"
+    lines = [
+        f"📋 Отчёт по форме «{REPORT_TITLE}» {period} готов.",
+        "",
+        f"• Всего анкет: {len(rows)} (ПОО — {spo_count}, ВО — {vo_count})",
+        f"• Под риском нетрудоустройства (5 и более баллов): {risk_count}",
+        f"• Заведений в форме: {len(REPORT_FORM_ROWS)}, из них с анкетами: {filled_count}",
+    ]
+    if other_rows:
+        lines.append(
+            f"• Анкет вне формы: {len(other_rows)} (см. лист «{REPORT_SUMMARY_SHEET}»)"
+        )
+    lines.append("")
+    lines.append(
+        f"Лист «{REPORT_FORM_SHEET}» — форма с заполненными графами, "
+        f"лист «{REPORT_SUMMARY_SHEET}» — сводка по уровням обучения."
+    )
+    return "\n".join(lines)
+
+
+def report_to_template(admin_id, today_only=False, inbox_id=None):
+    """Сформировать и отправить администратору заполненную форму отчёта."""
+    rows = _fetch_answers(today_only)
+
+    if not rows:
+        log.info("Отчёт: в таблице answers нет строк — отправляю только текст admin=%s", admin_id)
+        _queue_export_reply(
+            admin_id,
+            MESSAGES["no_data_report_today"] if today_only else MESSAGES["no_data_report"],
+            inbox_id
+        )
+        return True
+
+    stats, other_rows = _collect_form_stats(rows)
+    path = None
+    try:
+        path = _build_report_workbook(rows, today_only)
+        size = os.path.getsize(path)
+        if size > EXPORT_MAX_DOC_BYTES:
+            log.warning("Отчёт: файл %s байт больше лимита ВК", size)
+        title = (
+            f"Отчёт за {date.today().strftime('%d.%m.%Y')}"
+            if today_only else "Отчёт о риске нетрудоустройства"
+        )
+        attachment = _upload_export_document(path, title, admin_id)
+        log.info("Отчёт: файл загружен admin=%s rows=%s size=%s байт", admin_id, len(rows), size)
+        _queue_export_reply(
+            admin_id,
+            _report_message_text(rows, stats, other_rows, today_only),
+            inbox_id,
+            attachment
+        )
+        return True
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                log.warning("Не удалось удалить временный файл отчёта: %s", path)
+
+
+def _run_report_task(admin_id, today_only, inbox_id=None):
+    log.info("Запуск задачи отчёта по форме admin=%s today_only=%s", admin_id, today_only)
+    try:
+        report_to_template(admin_id, today_only, inbox_id)
+        log.info("Задача отчёта по форме завершена admin=%s today_only=%s", admin_id, today_only)
+    except Exception as exc:
+        log.exception("Не удалось подготовить отчёт для admin=%s", admin_id)
+        if "no_free_space" in str(exc).casefold():
+            failure_message = (
+                "VK сформировал отказ из-за отсутствия свободного места на сервере загрузки. "
+                "Отчёт не удалось передать; попробуйте повторить позже."
+            )
+        else:
+            failure_message = (
+                "❌ Не удалось сформировать или отправить отчёт. Подробности записаны в журнал."
+            )
+        try:
+            _queue_export_reply(admin_id, failure_message, inbox_id)
+        except Exception:
+            log.exception("Не удалось поставить сообщение об ошибке отчёта в outbox admin=%s", admin_id)
+
+
+def _submit_report(admin_id, today_only, inbox_id=None):
+    try:
+        if _executor_heavy is None:
+            raise RuntimeError("Фоновый исполнитель отчёта ещё не запущен")
+        _executor_heavy.submit(_run_report_task, admin_id, today_only, inbox_id)
+        log.info("Задача отчёта поставлена в очередь admin=%s today_only=%s", admin_id, today_only)
+    except Exception:
+        log.exception("Не удалось запустить отчёт для admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id,
+                "❌ Не удалось запустить формирование отчёта. Попробуйте позже.",
+                inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось поставить сообщение о запуске отчёта в outbox admin=%s", admin_id)
+
+
+def _schedule_report(admin_id, today_only):
+    context = _current_inbox_context()
+    if context is not None:
+        context["reports"].append((admin_id, today_only, context["inbox_id"]))
+        return
+    _submit_report(admin_id, today_only)
 
 
 # ----------------- ДОЛГОВЕЧНАЯ ОЧЕРЕДЬ ВХОДЯЩИХ -----------------
@@ -1725,6 +2383,32 @@ def handle_message(user_id, text):
         if is_admin:
             send_message(user_id, "📊 Запрос на выгрузку за сегодня принят. Подготавливаю файл…")
             _schedule_export(user_id, True)
+        else:
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    if text_lower in ["/отчет", "/отчёт", "/report"]:
+        is_admin = user_id in ADMIN_IDS
+        log.info("Команда отчёта по форме user=%s is_admin=%s", user_id, is_admin)
+        if is_admin:
+            send_message(
+                user_id,
+                "📋 Запрос на отчёт по форме принят. Подготавливаю файл…"
+            )
+            _schedule_report(user_id, False)
+        else:
+            send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    if text_lower in ["/отчет сегодня", "/отчёт сегодня", "/report today"]:
+        is_admin = user_id in ADMIN_IDS
+        log.info("Команда отчёта по форме за сегодня user=%s is_admin=%s", user_id, is_admin)
+        if is_admin:
+            send_message(
+                user_id,
+                "📋 Запрос на отчёт по форме за сегодня принят. Подготавливаю файл…"
+            )
+            _schedule_report(user_id, True)
         else:
             send_message(user_id, MESSAGES["admin_only"])
         return
@@ -1969,7 +2653,8 @@ def _process_one_inbox():
             "borrowed_connection": _BorrowedConnection(conn),
             "progress_updates": {},
             "replies": [],
-            "exports": []
+            "exports": [],
+            "reports": []
         }
         _inbox_context.current = context
         with _lock_user(user_id):
@@ -1994,6 +2679,8 @@ def _process_one_inbox():
                 _outbox_wake.set()
             for export_job in context["exports"]:
                 _submit_export(*export_job)
+            for report_job in context["reports"]:
+                _submit_report(*report_job)
             log.info("inbox_done id=%s user=%s replies=%s", inbox_id, user_id, len(context["replies"]))
         return True
     except Exception as e:

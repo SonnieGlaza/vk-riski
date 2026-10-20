@@ -1860,18 +1860,16 @@ def _form_metrics_values(metrics):
 
 
 def _collect_form_stats(rows):
-    """Разложить анкеты по строкам формы; вернуть показатели и анкеты вне формы."""
+    """Разложить анкеты по строкам формы; анкеты вне формы не учитываются."""
     stats = [{"СПО": [], "ВО": [], "Не указано": []} for _ in REPORT_FORM_ROWS]
-    other_rows = []
     for row in rows:
         form_index = REPORT_INSTITUTION_TO_FORM.get(
             _normalize_institution_name(row.get("institution"))
         )
         if form_index is None:
-            other_rows.append(row)
             continue
         stats[form_index][detect_education_level(row)].append(row)
-    return stats, other_rows
+    return stats
 
 
 def _write_report_form_sheet(ws, stats):
@@ -1951,8 +1949,8 @@ def _write_report_form_sheet(ws, stats):
     ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
 
 
-def _write_report_summary_sheet(ws, rows, other_rows, today_only):
-    """Сводка по уровням обучения и анкеты, которых нет в форме."""
+def _write_report_summary_sheet(ws, stats, today_only):
+    """Сводка по уровням обучения: только те анкеты, что попали в форму."""
     thin = Side(style="thin", color="000000")
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -1986,8 +1984,10 @@ def _write_report_summary_sheet(ws, rows, other_rows, today_only):
         cell.fill = header_fill
 
     grouped = {"СПО": [], "ВО": [], "Не указано": []}
-    for row in rows:
-        grouped[detect_education_level(row)].append(row)
+    for row_stats in stats:
+        for level, level_rows in row_stats.items():
+            grouped[level].extend(level_rows)
+    totals = grouped["СПО"] + grouped["ВО"] + grouped["Не указано"]
     levels = ["СПО", "ВО"]
     if grouped["Не указано"]:
         levels.append("Не указано")
@@ -1995,7 +1995,7 @@ def _write_report_summary_sheet(ws, rows, other_rows, today_only):
     excel_row = header_row
     for level in levels + ["ИТОГО"]:
         excel_row += 1
-        level_rows = rows if level == "ИТОГО" else grouped[level]
+        level_rows = totals if level == "ИТОГО" else grouped[level]
         values = [level] + _form_metrics_values(_form_level_metrics(level_rows))
         for col_idx, value in enumerate(values, start=1):
             cell = ws.cell(row=excel_row, column=col_idx, value=value)
@@ -2003,45 +2003,6 @@ def _write_report_summary_sheet(ws, rows, other_rows, today_only):
             cell.border = border
             if level == "ИТОГО":
                 cell.font = Font(bold=True)
-
-    excel_row += 2
-    ws.cell(
-        row=excel_row, column=1, value="Анкеты, которых нет в форме отчёта"
-    ).font = Font(bold=True)
-    excel_row += 1
-    if not other_rows:
-        ws.cell(row=excel_row, column=1, value="Нет")
-    else:
-        for col_idx, header in enumerate(
-            ("Учебное заведение", "Уровень", "Анкет, чел.", "Под риском, чел."), start=1
-        ):
-            cell = ws.cell(row=excel_row, column=col_idx, value=header)
-            cell.font = Font(bold=True, size=10)
-            cell.alignment = center
-            cell.border = border
-            cell.fill = header_fill
-        aggregated = {}
-        for row in other_rows:
-            key = (
-                str(row.get("institution") or "не указано").strip(),
-                detect_education_level(row),
-            )
-            aggregated.setdefault(key, []).append(row)
-        for (institution, level), institution_rows in sorted(aggregated.items()):
-            excel_row += 1
-            risk_count = sum(
-                1 for r in institution_rows
-                if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
-            )
-            values = (institution, level, len(institution_rows), risk_count)
-            for col_idx, value in enumerate(values, start=1):
-                cell = ws.cell(row=excel_row, column=col_idx, value=value)
-                cell.border = border
-                cell.alignment = Alignment(
-                    horizontal="left" if col_idx == 1 else "center",
-                    vertical="center",
-                    wrap_text=True,
-                )
 
     for column, width in {
         "A": 46, "B": 12, "C": 14, "D": 20, "E": 26, "F": 16, "G": 26
@@ -2051,13 +2012,13 @@ def _write_report_summary_sheet(ws, rows, other_rows, today_only):
 
 def _build_report_workbook(rows, today_only=False):
     """Собрать книгу отчёта (заполненная форма и сводка) и вернуть путь к файлу."""
-    stats, other_rows = _collect_form_stats(rows)
+    stats = _collect_form_stats(rows)
     wb = Workbook()
     form_ws = wb.active
     form_ws.title = REPORT_FORM_SHEET
     _write_report_form_sheet(form_ws, stats)
     _write_report_summary_sheet(
-        wb.create_sheet(title=REPORT_SUMMARY_SHEET), rows, other_rows, today_only
+        wb.create_sheet(title=REPORT_SUMMARY_SHEET), stats, today_only
     )
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
@@ -2068,30 +2029,25 @@ def _build_report_workbook(rows, today_only=False):
     return path
 
 
-def _report_message_text(rows, stats, other_rows, today_only):
-    spo_count = sum(1 for r in rows if detect_education_level(r) == "СПО")
-    vo_count = sum(1 for r in rows if detect_education_level(r) == "ВО")
+def _report_message_text(stats, today_only):
+    spo_rows = [row for row_stats in stats for row in row_stats["СПО"]]
+    vo_rows = [row for row_stats in stats for row in row_stats["ВО"]]
+    form_rows = spo_rows + vo_rows
     risk_count = sum(
-        1 for r in rows if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
+        1 for r in form_rows if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
     )
     filled_count = sum(1 for level_rows in stats if level_rows["СПО"] or level_rows["ВО"])
     period = "за сегодня" if today_only else "за весь период"
     lines = [
         f"📋 Отчёт по форме «{REPORT_TITLE}» {period} готов.",
         "",
-        f"• Всего анкет: {len(rows)} (ПОО — {spo_count}, ВО — {vo_count})",
+        f"• Всего анкет: {len(form_rows)} (ПОО — {len(spo_rows)}, ВО — {len(vo_rows)})",
         f"• Под риском нетрудоустройства (5 и более баллов): {risk_count}",
         f"• Заведений в форме: {len(REPORT_FORM_ROWS)}, из них с анкетами: {filled_count}",
-    ]
-    if other_rows:
-        lines.append(
-            f"• Анкет вне формы: {len(other_rows)} (см. лист «{REPORT_SUMMARY_SHEET}»)"
-        )
-    lines.append("")
-    lines.append(
+        "",
         f"Лист «{REPORT_FORM_SHEET}» — форма с заполненными графами, "
         f"лист «{REPORT_SUMMARY_SHEET}» — сводка по уровням обучения."
-    )
+    ]
     return "\n".join(lines)
 
 
@@ -2108,7 +2064,7 @@ def report_to_template(admin_id, today_only=False, inbox_id=None):
         )
         return True
 
-    stats, other_rows = _collect_form_stats(rows)
+    stats = _collect_form_stats(rows)
     path = None
     try:
         path = _build_report_workbook(rows, today_only)
@@ -2123,7 +2079,7 @@ def report_to_template(admin_id, today_only=False, inbox_id=None):
         log.info("Отчёт: файл загружен admin=%s rows=%s size=%s байт", admin_id, len(rows), size)
         _queue_export_reply(
             admin_id,
-            _report_message_text(rows, stats, other_rows, today_only),
+            _report_message_text(stats, today_only),
             inbox_id,
             attachment
         )

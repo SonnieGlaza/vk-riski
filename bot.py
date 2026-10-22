@@ -33,12 +33,22 @@ def log_msg(msg):
 
 # --- РЕГЕКСЫ ---
 PHONE_PATTERN = re.compile(r'^(\+7|7|8)?[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}$')
+# Телефон в свободном тексте: «+7 (912) 345-67-89», «8 922 333 44 55» и т. п.
+PHONE_CANDIDATE_PATTERN = re.compile(r"\+?\d[\d\s().\-]{6,}\d")
+# Телефон с кодом страны/междугородним префиксом и любыми разделителями.
+PHONE_STRICT_PATTERN = re.compile(
+    r"(?<!\d)(?:\+7|8|7)[\s\-().]*\d{3}[\s\-().]*\d{3}[\s\-().]*\d{2}"
+    r"[\s\-().]*\d{2}(?!\d)"
+)
 EMAIL_PATTERN = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 NAME_PATTERN = re.compile(r"^[а-яёА-ЯЁa-zA-Z]+(?:['\-][а-яёА-ЯЁa-zA-Z]+)*$")
 
 # --- ПРЕДВЫЧИСЛЕННЫЕ КЛАВИАТУРЫ ---
 KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
-KB_RESTART = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]]})
+KB_RESTART = json.dumps({"one_time": False, "buttons": [
+    [{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}],
+    [{"action": {"type": "text", "label": "🔕 Не беспокоить"}, "color": "secondary"}]
+]})
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
@@ -92,25 +102,50 @@ def validate_fio(text):
     return True, normalized
 
 
+def _phone_from_digits(digits):
+    """+7XXXXXXXXXX из строки цифр (10 или 11 цифр с 7/8 в начале)."""
+    if len(digits) == 11 and digits[0] in "78":
+        return "+7" + digits[1:]
+    if len(digits) == 10:
+        return "+7" + digits
+    return None
+
+
+def _extract_phone(text):
+    """Первый телефон из текста: пробелы, скобки и дефисы допускаются."""
+    text = text or ""
+    # 1. Номер с префиксом 7/8 и любыми разделителями.
+    for match in PHONE_STRICT_PATTERN.finditer(text):
+        phone = _phone_from_digits(re.sub(r"\D", "", match.group(0)))
+        if phone:
+            return phone
+    # 2. Просто 10 цифр подряд (номер без кода страны).
+    for run in re.findall(r"(?<!\d)\d{10}(?!\d)", text):
+        phone = _phone_from_digits(run)
+        if phone:
+            return phone
+    # 3. Номер, разбитый на группы без префикса («912 111-22-33»).
+    for candidate in PHONE_CANDIDATE_PATTERN.findall(text):
+        phone = _phone_from_digits(re.sub(r"\D", "", candidate))
+        if phone:
+            return phone
+        for piece in re.split(r"\s+", candidate.strip()):
+            phone = _phone_from_digits(re.sub(r"\D", "", piece))
+            if phone:
+                return phone
+    return None
+
+
 def validate_contacts(text):
     text = text.strip()
-    parts = re.split(r'[\s,;]+', text)
-    phone = None
     email = None
-    for part in parts:
+    # Телефон ищем по всему тексту: «+7 (912) 345-67-89» — один телефон,
+    # а разбивка на слова его бы потеряла.
+    for part in re.split(r'[\s,;]+', text):
         part = part.strip()
-        if not part:
-            continue
-        if phone is None and PHONE_PATTERN.match(part):
-            digits = re.sub(r'\D', '', part)
-            if len(digits) == 11 and digits.startswith('8'):
-                digits = '7' + digits[1:]
-            elif len(digits) == 10:
-                digits = '7' + digits
-            if len(digits) == 11:
-                phone = '+7' + digits[-10:]
-        elif email is None and EMAIL_PATTERN.match(part):
+        if part and email is None and EMAIL_PATTERN.match(part):
             email = part.lower()
+    phone = _extract_phone(text)
     if phone or email:
         contacts = []
         if phone:
@@ -264,6 +299,68 @@ def init_db():
                   "last_error='Retrying previously failed send' WHERE status='failed'")
         c.execute("UPDATE bot_outbox SET status='pending', locked_at=NULL, available_at=now() "
                   "WHERE status='sending' AND locked_at < now() - interval '2 minutes'")
+        # «Не беспокоить»: по просьбе человека напоминания и рассылки ему не приходят.
+        # Таблица общая с email_campaign.py и call_campaign.py.
+        c.execute("""CREATE TABLE IF NOT EXISTS opt_out (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                email TEXT,
+                phone TEXT,
+                channel TEXT NOT NULL DEFAULT 'all',
+                source TEXT,
+                reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_opt_out_user "
+                  "ON opt_out(user_id) WHERE user_id IS NOT NULL")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_opt_out_email "
+                  "ON opt_out(lower(email)) WHERE email IS NOT NULL")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_opt_out_phone "
+                  "ON opt_out(phone) WHERE phone IS NOT NULL")
+        # Адресаты MAX-бота: MAX не отдаёт телефон, поэтому связь «анкета в VK ↔ чат в MAX»
+        # храним отдельно. Заполняется автоматически, когда человек пишет MAX-боту
+        # (см. max_bot.py), либо вручную SQL-запросом.
+        c.execute("""CREATE TABLE IF NOT EXISTS max_contacts (
+                user_id BIGINT PRIMARY KEY,
+                max_chat_id BIGINT,
+                max_user_id BIGINT,
+                fio TEXT,
+                phone TEXT,
+                email TEXT,
+                source TEXT,
+                linked_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_max_contacts_chat "
+                  "ON max_contacts(max_chat_id)")
+        # Черновик рассылки по городу: админ задаёт город и текст, бот показывает
+        # предпросмотр и ждёт подтверждения. Черновик живёт только в базе.
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_drafts (
+                admin_id BIGINT PRIMARY KEY,
+                city TEXT NOT NULL,
+                message TEXT NOT NULL,
+                channels TEXT NOT NULL DEFAULT 'vk',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        # Журнал рассылок по городу: что, когда, кому и с каким итогом.
+        c.execute("""CREATE TABLE IF NOT EXISTS broadcast_log (
+                id BIGSERIAL PRIMARY KEY,
+                admin_id BIGINT,
+                city TEXT,
+                channel TEXT,
+                target_id BIGINT,
+                status TEXT,
+                error TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_broadcast_log_created "
+                  "ON broadcast_log(created_at)")
+        # Отчёт о проделанной работе по человеку: что именно мы сделали и когда.
+        # Заполняется автоматически при рассылках и может дополняться вручную.
+        c.execute("""CREATE TABLE IF NOT EXISTS outreach_actions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT,
+                city TEXT,
+                channel TEXT,
+                action TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_outreach_actions_user "
+                  "ON outreach_actions(user_id, created_at)")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -841,7 +938,20 @@ MESSAGES = {
     "no_data_report": "Пока нет собранных анкет для отчёта.",
     "no_data_report_today": "Сегодня пока нет новых анкет для отчёта.",
     "admin_only": "Эта команда доступна только администраторам.",
-    "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку ниже.",
+    "opt_out_done": (
+        "🔕 Готово: больше не будем присылать напоминания и рассылки.\n\n"
+        "Анкету можно продолжить в любой момент — просто ответьте на вопрос.\n\n"
+        "Передумаете — отправьте /подписаться."
+    ),
+    "opt_out_already": (
+        "🔕 Вы уже в списке «не беспокоить»: напоминания и рассылки вам не приходят.\n\n"
+        "Вернуть их можно командой /подписаться."
+    ),
+    "opt_out_resumed": (
+        "🔔 Готово: напоминания и рассылки снова будут приходить. "
+        "Спасибо, что остаётесь на связи!"
+    ),
+    "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку «Пройти заново».\nЕсли не хотите получать напоминания и рассылки — нажмите «🔕 Не беспокоить».",
     "already_finished": "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже.",
 }
 
@@ -1124,6 +1234,8 @@ DISTRICT_HEADERS = [
     "Особый статус",
     "Военный призыв",
     "Сумма баллов",
+    # Колонка сразу после баллов: в ней видно, что уже сделано по человеку.
+    "Какая работа проведена",
     "Реализуется индивидуальный план карьерного развития (ПКР) (да/нет)",
     "Получивший хотя бы один сервис из ПКР, (да/нет)",
     "Полностью получивший сервисы из ПКР, (да/нет)",
@@ -1170,12 +1282,18 @@ def _format_created_at(value):
     return str(value)
 
 
-def write_score_sheet(workbook, sheet_name, sheet_rows):
-    """Лист района: ФИО, вуз, контакты, согласие, курс, группа, дата, баллы, сводка."""
+def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
+    """Лист района: ФИО, вуз, контакты, согласие, курс, группа, дата, баллы, сводка.
+
+    actions — история работы по людям (user_id -> список строк), выводится в
+    колонке «Какая работа проведена».
+    """
+    actions = actions or {}
     ws = workbook.create_sheet(title=sheet_name)
     header_font = Font(bold=True)
     bold_font = Font(bold=True)
     total_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+    action_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
 
     for col_idx, header in enumerate(DISTRICT_HEADERS, start=1):
         cell = ws.cell(row=1, column=col_idx, value=header)
@@ -1202,7 +1320,37 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
         total_cell.font = bold_font
         total_cell.fill = total_fill
         total_cell.alignment = Alignment(horizontal="center")
+        # «Какая работа проведена» — история по этому человеку из outreach_actions.
+        history = actions.get(r.get("user_id")) or []
+        if history:
+            action_cell = ws.cell(row=row_idx, column=18, value="\n".join(history))
+            action_cell.alignment = Alignment(vertical="top", wrap_text=True)
+            action_cell.fill = action_fill
         row_idx += 1
+
+    # Итоговые строки под таблицей: сколько людей в работе и что уже сделано.
+    row_idx += 1
+    workers_cell = ws.cell(row=row_idx, column=1, value="Кто работает")
+    workers_cell.font = bold_font
+    workers_cell.fill = action_fill
+    workers_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+    worked_cell = ws.cell(row=row_idx, column=2, value="Какая работа проведена")
+    worked_cell.font = bold_font
+    worked_cell.fill = action_fill
+    worked_cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    row_idx += 1
+    summary_cell = ws.cell(row=row_idx, column=1, value=f"Студентов в листе: {len(sorted_rows)}")
+    summary_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    performed = [text for texts in actions.values() for text in texts]
+    performed_text = (
+        "\n".join(performed) if performed
+        else "рассылок и другой работы по этому городу пока не зафиксировано"
+    )
+    performed_cell = ws.cell(row=row_idx, column=2, value=performed_text)
+    performed_cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    if performed:
+        performed_cell.fill = action_fill
 
     for col_idx in range(1, len(DISTRICT_HEADERS) + 1):
         width = 25
@@ -1212,11 +1360,16 @@ def write_score_sheet(workbook, sheet_name, sheet_rows):
             width = 15   # Учебная группа
         elif col_idx == 7:
             width = 18   # Дата заполнения
+        elif col_idx == 18:
+            width = 45   # Какая работа проведена
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
 
 def _build_export_workbook(rows):
-    """Собрать книгу xlsx во временный файл и вернуть её путь."""
+    """Собрать книгу xlsx во временный файл и вернуть её путь.
+
+    Строки уже отфильтрованы вызывающим кодом (например, по городу — см. _fetch_answers).
+    """
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "Анкеты"
@@ -1316,7 +1469,10 @@ def _build_export_workbook(rows):
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if resolve_district(r.get("institution")) == district_name]
         if district_rows:
-            write_score_sheet(wb, district_name, district_rows)
+            write_score_sheet(
+                wb, district_name, district_rows,
+                _outreach_actions_for_users([r.get("user_id") for r in district_rows])
+            )
     other_rows = [r for r in rows if r.get("institution") and resolve_district(r.get("institution")) is None]
     if other_rows:
         unknown = sorted({str(r.get("institution") or "не указано") for r in other_rows})
@@ -1324,7 +1480,10 @@ def _build_export_workbook(rows):
             "Выгрузка: заведения вне справочника районов (%s), попадут в «Прочие»: %s",
             len(unknown), "; ".join(unknown)
         )
-        write_score_sheet(wb, "Прочие", other_rows)
+        write_score_sheet(
+            wb, "Прочие", other_rows,
+            _outreach_actions_for_users([r.get("user_id") for r in other_rows])
+        )
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
     os.close(fd)
@@ -1381,7 +1540,7 @@ def _upload_export_document(path, title, admin_id):
     return attachment
 
 
-def _export_message_text(rows, today_only, part_index=1, part_count=1):
+def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None):
     sheet_list = []
     for district_name in DISTRICTS_UNIVERSITIES:
         count = sum(1 for r in rows if resolve_district(r.get("institution")) == district_name)
@@ -1394,7 +1553,9 @@ def _export_message_text(rows, today_only, part_index=1, part_count=1):
     if other_count:
         sheet_list.append(f"  • «Прочие» — {other_count} чел.")
     sheets_text = "\n".join(sheet_list)
-    if today_only:
+    if city:
+        header = f"📊 Выгрузка по городу «{city}»:\n\n"
+    elif today_only:
         header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n"
     else:
         header = "📊 Вот полная выгрузка анкет:\n\n"
@@ -1413,8 +1574,11 @@ def _split_rows(rows, part_count):
     return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
 
-def _fetch_answers(today_only=False):
-    """Все анкеты (или только за сегодня) в порядке прохождения анкеты."""
+def _fetch_answers(today_only=False, city=None):
+    """Все анкеты (или только за сегодня) в порядке прохождения анкеты.
+
+    city — если задан, остаются только анкеты заведений этого города.
+    """
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
@@ -1423,21 +1587,35 @@ def _fetch_answers(today_only=False):
             c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
         else:
             c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
-        return c.fetchall()
+        rows = c.fetchall()
     finally:
         release_db(conn)
+    if city:
+        institutions = set(_institutions_for_city(city))
+        rows = [r for r in rows if (r.get("institution") or "") in institutions]
+    return rows
 
 
-def export_to_table(admin_id, today_only=False, inbox_id=None):
-    rows = _fetch_answers(today_only)
+def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
+    rows = _fetch_answers(today_only, city=city)
 
     if not rows:
-        log.info("Выгрузка: в таблице answers нет строк — отправляю только текст 'нет анкет' admin=%s", admin_id)
-        _queue_export_reply(
-            admin_id,
-            MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
-            inbox_id
+        log.info(
+            "Выгрузка: нет строк (today_only=%s city=%s) admin=%s",
+            today_only, city, admin_id
         )
+        if city:
+            _queue_export_reply(
+                admin_id,
+                f"В «{city}» нет анкет для выгрузки.",
+                inbox_id
+            )
+        else:
+            _queue_export_reply(
+                admin_id,
+                MESSAGES["no_data_today"] if today_only else MESSAGES["no_data"],
+                inbox_id
+            )
         return True
 
     paths = []
@@ -1466,13 +1644,17 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
                 size, len(parts), sizes
             )
 
-        base_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
+        base_title = (
+            f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
+        )
+        if city:
+            base_title = f"{city} — {base_title.lower()}"
         for index, (path, chunk) in enumerate(parts, start=1):
             title = base_title if len(parts) == 1 else f"{base_title} (часть {index} из {len(parts)})"
             attachment = _upload_export_document(path, title, admin_id)
             _queue_export_reply(
                 admin_id,
-                _export_message_text(chunk, today_only, index, len(parts)),
+                _export_message_text(chunk, today_only, index, len(parts), city=city),
                 inbox_id,
                 attachment
             )
@@ -1489,11 +1671,11 @@ def export_to_table(admin_id, today_only=False, inbox_id=None):
                 log.warning("Не удалось удалить временный файл выгрузки: %s", path)
 
 
-def _run_export_task(admin_id, today_only, inbox_id=None):
-    log.info("Запуск задачи выгрузки admin=%s today_only=%s", admin_id, today_only)
+def _run_export_task(admin_id, today_only, inbox_id=None, city=None):
+    log.info("Запуск задачи выгрузки admin=%s today_only=%s city=%s", admin_id, today_only, city)
     try:
-        export_to_table(admin_id, today_only, inbox_id)
-        log.info("Задача выгрузки завершена admin=%s today_only=%s", admin_id, today_only)
+        export_to_table(admin_id, today_only, inbox_id, city=city)
+        log.info("Задача выгрузки завершена admin=%s today_only=%s city=%s", admin_id, today_only, city)
     except Exception as exc:
         log.exception("Не удалось подготовить выгрузку для admin=%s", admin_id)
         if "no_free_space" in str(exc).casefold():
@@ -1513,12 +1695,15 @@ def _run_export_task(admin_id, today_only, inbox_id=None):
             log.exception("Не удалось поставить сообщение об ошибке выгрузки в outbox admin=%s", admin_id)
 
 
-def _submit_export(admin_id, today_only, inbox_id=None):
+def _submit_export(admin_id, today_only, inbox_id=None, city=None):
     try:
         if _executor_heavy is None:
             raise RuntimeError("Фоновый исполнитель выгрузки ещё не запущен")
-        _executor_heavy.submit(_run_export_task, admin_id, today_only, inbox_id)
-        log.info("Задача выгрузки поставлена в очередь admin=%s today_only=%s", admin_id, today_only)
+        _executor_heavy.submit(_run_export_task, admin_id, today_only, inbox_id, city)
+        log.info(
+            "Задача выгрузки поставлена в очередь admin=%s today_only=%s city=%s",
+            admin_id, today_only, city
+        )
     except Exception:
         log.exception("Не удалось запустить выгрузку для admin=%s", admin_id)
         try:
@@ -1531,12 +1716,12 @@ def _submit_export(admin_id, today_only, inbox_id=None):
             log.exception("Не удалось поставить сообщение о запуске выгрузки в outbox admin=%s", admin_id)
 
 
-def _schedule_export(admin_id, today_only):
+def _schedule_export(admin_id, today_only, city=None):
     context = _current_inbox_context()
     if context is not None:
-        context["exports"].append((admin_id, today_only, context["inbox_id"]))
+        context["exports"].append((admin_id, today_only, context["inbox_id"], city))
         return
-    _submit_export(admin_id, today_only)
+    _submit_export(admin_id, today_only, city=city)
 
 
 # ----------------- ОТЧЁТ ПО ФОРМЕ «ОЦЕНКА РИСКА НЕТРУДОУСТРОЙСТВА» -----------------
@@ -2468,6 +2653,105 @@ REMINDER_BATCH = int(os.getenv("REMINDER_BATCH", "20"))
 REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "60"))
 REMINDER_SEND_DELAY = float(os.getenv("REMINDER_SEND_DELAY", "1.0"))
 
+# --- «НЕ БЕСПОКОИТЬ»: КНОПКА В БОТЕ И УЧЁТ В РАССЫЛКАХ ---
+
+OPT_OUT_BUTTON = "🔕 Не беспокоить"
+OPT_IN_BUTTON = "🔔 Вернуть рассылки"
+
+# Команды и кнопки, которыми человек просит больше ему не писать.
+OPT_OUT_COMMANDS = {
+    OPT_OUT_BUTTON.lower(),
+    "/не беспокоить", "/не_беспокоить", "/небеспокоить",
+    "не беспокоить", "отписаться", "/отписаться", "/отписка",
+    "/стоп", "стоп", "/stop", "stop", "/unsubscribe", "unsubscribe",
+}
+
+OPT_IN_COMMANDS = {
+    OPT_IN_BUTTON.lower(),
+    "/подписаться", "подписаться", "/вернуть рассылки", "/вернуть_рассылки",
+    "/subscribe", "subscribe",
+}
+
+
+def _contacts_for_user(user_id):
+    """Телефон и e-mail из анкеты — чтобы отписка касалась и рассылок по почте."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT contacts FROM answers WHERE user_id=%s", (user_id,))
+        row = c.fetchone()
+    finally:
+        release_db(conn)
+    text = row[0] if row and row[0] else ""
+    ok, parsed = validate_contacts(text)
+    if not ok or not parsed:
+        return None, None
+    parts = [part.strip() for part in parsed.split(";") if part.strip()]
+    phone = next((part for part in parts if part.startswith("+")), None)
+    email = next((part for part in parts if "@" in part), None)
+    return phone, email
+
+
+def is_opted_out(user_id):
+    """Стоит ли человек в списке «не беспокоить»."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM opt_out WHERE user_id=%s LIMIT 1", (user_id,))
+        return c.fetchone() is not None
+    finally:
+        release_db(conn)
+
+
+def register_opt_out(user_id, reason=None):
+    """Добавляет человека в список «не беспокоить». True — если запись новая."""
+    phone, email = _contacts_for_user(user_id)
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM opt_out WHERE user_id=%s LIMIT 1", (user_id,))
+        existed = c.fetchone() is not None
+        if email:
+            # Отписка могла прийти из письма или от оператора без user_id — связываем.
+            c.execute(
+                "UPDATE opt_out SET user_id=%s WHERE user_id IS NULL AND lower(email)=lower(%s)",
+                (user_id, email)
+            )
+        c.execute(
+            "INSERT INTO opt_out (user_id, email, phone, channel, source, reason) "
+            "VALUES (%s, %s, %s, 'all', 'bot_button', %s) ON CONFLICT DO NOTHING",
+            (user_id, email, phone, reason)
+        )
+        c.execute(
+            "UPDATE opt_out SET email=COALESCE(%s, email), phone=COALESCE(%s, phone), "
+            "channel='all', source='bot_button', reason=COALESCE(%s, reason) WHERE user_id=%s",
+            (email, phone, reason, user_id)
+        )
+        conn.commit()
+        return not existed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def unregister_opt_out(user_id):
+    """Возвращает человека в рассылки (если он передумал). True — если что-то удалили."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM opt_out WHERE user_id=%s", (user_id,))
+        removed = c.rowcount or 0
+        conn.commit()
+        return removed > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
 REMINDER_TEXT = "⏰ Напоминаю: анкета пока не завершена. Ответьте на вопрос ниже."
 
 
@@ -2479,7 +2763,9 @@ def _fetch_reminder_targets(limit=REMINDER_BATCH):
         c.execute(
             "SELECT p.user_id, p.step_index, p.uni_page FROM progress p "
             "LEFT JOIN answers a ON a.user_id = p.user_id "
+            "LEFT JOIN opt_out o ON o.user_id = p.user_id "
             "WHERE p.started <> 2 AND p.step_index < %s AND a.created_at IS NULL "
+            "AND o.user_id IS NULL "
             "AND COALESCE(p.last_activity, p.started_at) IS NOT NULL "
             "AND COALESCE(p.last_activity, p.started_at) < now() - make_interval(mins => %s) "
             "AND (p.reminded_at IS NULL OR p.reminded_at < now() - make_interval(mins => %s)) "
@@ -2543,6 +2829,12 @@ def _send_reminders():
                 if _live_messages_waiting():
                     log.info("Напоминания: в очередях есть живые сообщения, круг прерван")
                     break
+                # Пока список формировался, человек мог нажать «не беспокоить».
+                try:
+                    if is_opted_out(user_id):
+                        continue
+                except Exception:
+                    log.exception("Не удалось проверить «не беспокоить» user=%s", user_id)
                 ask_step(
                     user_id,
                     STEPS[current_step],
@@ -2599,7 +2891,9 @@ def _fetch_unfinished_for_broadcast(limit=REMINDER_BROADCAST_LIMIT):
         c.execute(
             "SELECT p.user_id, p.step_index, p.uni_page FROM progress p "
             "LEFT JOIN answers a ON a.user_id = p.user_id "
+            "LEFT JOIN opt_out o ON o.user_id = p.user_id "
             "WHERE p.started <> 2 AND p.step_index < %s AND a.created_at IS NULL "
+            "AND o.user_id IS NULL "
             "AND (a.consent_status IS NULL OR a.consent_status = TRUE) "
             "ORDER BY p.user_id LIMIT %s",
             (len(STEPS), limit)
@@ -2654,6 +2948,12 @@ def _broadcast_reminders(admin_id, inbox_id=None):
                     if started == 2 or current_step != step_index:
                         skipped += 1
                         continue
+                    try:
+                        if is_opted_out(user_id):
+                            skipped += 1
+                            continue
+                    except Exception:
+                        log.exception("Не удалось проверить «не беспокоить» user=%s", user_id)
                     result = ask_step(
                         user_id,
                         STEPS[current_step],
@@ -2729,6 +3029,589 @@ def _schedule_broadcast(admin_id):
         return
     _submit_broadcast(admin_id)
 
+
+# --- РАССЫЛКА ПО ГОРОДУ СО СВОИМ ТЕКСТОМ (VK + MAX) ---
+#
+# Админ запускает её из VK-бота командой «/рассылка_город Ижевск», затем пишет текст.
+# Бот показывает предпросмотр (сколько человек, в каких каналах) и ждёт «отправить».
+# Отбор: анкета завершена (progress.started = 2, answers.created_at заполнен),
+# согласие дано, человек не в opt_out, заведение относится к выбранному городу.
+
+BROADCAST_CHANNELS = ("vk", "max")
+BROADCAST_CITY_COMMANDS = {"/рассылка_город", "/город", "/рассылка город"}
+BROADCAST_CITY_PREFIXES = ("/город_", "/рассылка_город_")
+BROADCAST_CITY_ALIASES = {
+    "ижевск": "Ижевск", "воткинск": "Воткинск", "глазов": "Глазов",
+    "можга": "Можга", "сарапул": "Сарапул", "алнаши": "Алнаши",
+    "дебесы": "Дебесы", "игра": "Игра", "сюмси": "Сюмси",
+    "кез": "Кез", "камбарка": "Камбарка", "ува": "Ува", "яр": "Яр",
+}
+BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.2"))
+BROADCAST_PROGRESS_EVERY = int(os.getenv("BROADCAST_PROGRESS_EVERY", "100"))
+BROADCAST_MAX_TEXT = int(os.getenv("BROADCAST_MAX_TEXT", "3500"))
+BROADCAST_MAX_SEND = os.getenv("BROADCAST_MAX_SEND", "1") not in ("0", "false", "no")
+MAX_API_BASE = os.getenv("MAX_API_BASE", "https://platform-api2.max.ru")
+
+
+def _is_city_export_command(text):
+    """Это «/Ижевск» или «/город Ижевск» — выгрузка по городу, а не рассылка?
+
+    Отличаем от диалога рассылки: там голое «/город» без названия и команды
+    «/рассылка_город». Здесь город обязателен и указан в самой команде.
+    """
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return False
+    head = parts[0].lstrip("/").strip().lower()
+    if not head:
+        return False
+    if head in ("город", "выгрузить_город", "export_city", "город_выгрузка"):
+        return bool(parts[1].strip()) if len(parts) > 1 else False
+    if head in ("рассылка_город", "рассылка"):
+        return False
+    return _resolve_city(head) is not None
+
+
+def _city_from_export_command(text):
+    """Город из команды «/Ижевск» или «/город Ижевск»."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if not parts:
+        return None
+    head = parts[0].lstrip("/").strip().lower()
+    if head in ("город", "выгрузить_город", "export_city", "город_выгрузка"):
+        return _resolve_city(parts[1]) if len(parts) > 1 else None
+    return _resolve_city(head)
+
+
+def _city_export_help_text():
+    cities = ", ".join(f"/{name}" for name in DISTRICTS_UNIVERSITIES)
+    return (
+        "📊 Выгрузка по городу\n\n"
+        "Отправьте «/Ижевск» (или другой город) — придёт файл только с анкетами "
+        "этого города: лист города с колонкой «Какая работа проведена» и лист «Анкеты».\n\n"
+        f"Города: {cities}."
+    )
+
+
+def _resolve_city(raw):
+    """Название города из справочника районов; терпимо к регистру и лишним пробелам."""
+    key = " ".join((raw or "").strip().lower().split())
+    if not key:
+        return None
+    for city in DISTRICTS_UNIVERSITIES:
+        if city.lower() == key:
+            return city
+    return BROADCAST_CITY_ALIASES.get(key)
+
+
+def _institutions_for_city(city):
+    """Заведения выбранного города по справочнику DISTRICTS_UNIVERSITIES."""
+    return list(DISTRICTS_UNIVERSITIES.get(city) or [])
+
+
+def _fetch_city_recipients(city):
+    """Кто прошёл анкету и учится в заведениях этого города.
+
+    Возвращает (список VK-получателей, список MAX-получателей). Оба списка —
+    словари с user_id, fio, institution, max_chat_id/max_user_id.
+    """
+    institutions = _institutions_for_city(city)
+    if not institutions:
+        return [], []
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute(
+            "SELECT a.user_id, a.fio, a.institution, a.contacts, a.created_at, "
+            "m.max_chat_id, m.max_user_id "
+            "FROM answers a "
+            "JOIN progress p ON p.user_id = a.user_id "
+            "LEFT JOIN opt_out o ON o.user_id = a.user_id "
+            "LEFT JOIN max_contacts m ON m.user_id = a.user_id "
+            "WHERE p.started = 2 AND a.created_at IS NOT NULL "
+            "AND a.consent_status IS TRUE AND o.user_id IS NULL "
+            "AND a.institution = ANY(%s) "
+            "ORDER BY a.user_id",
+            (institutions,)
+        )
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
+
+    vk_targets = []
+    max_targets = []
+    for row in rows:
+        item = {
+            "user_id": row["user_id"],
+            "fio": (row["fio"] or "").strip(),
+            "institution": (row["institution"] or "").strip(),
+        }
+        vk_targets.append(dict(item))
+        chat_id = row.get("max_chat_id")
+        max_user_id = row.get("max_user_id")
+        if chat_id or max_user_id:
+            max_item = dict(item)
+            max_item["max_chat_id"] = chat_id
+            max_item["max_user_id"] = max_user_id
+            max_targets.append(max_item)
+    return vk_targets, max_targets
+
+
+def _max_is_configured():
+    return bool(os.getenv("MAX_TOKEN", "").strip())
+
+
+def _send_max_message(text, max_chat_id=None, max_user_id=None, timeout=15):
+    """Отправить сообщение в MAX. True — принято, False — ошибка, None — MAX не настроен.
+
+    Текст читаем из окружения в момент отправки: MAX_TOKEN нужен только для
+    рассылки в MAX, без него VK-часть продолжает работать.
+    """
+    token = os.getenv("MAX_TOKEN", "").strip()
+    if not token:
+        return None
+    params = {}
+    if max_user_id:
+        params["user_id"] = max_user_id
+    elif max_chat_id:
+        params["chat_id"] = max_chat_id
+    else:
+        return False
+    try:
+        response = requests.post(
+            f"{MAX_API_BASE}/messages",
+            params=params,
+            headers={"Authorization": token, "Content-Type": "application/json"},
+            json={"text": text},
+            timeout=timeout
+        )
+    except Exception as exc:
+        log.warning("MAX: не удалось отправить в %s: %s", params, exc)
+        return False
+    if response.status_code == 200:
+        return True
+    log.warning("MAX: ответ %s на отправку %s: %s", response.status_code, params, response.text[:300])
+    return False
+
+
+def _log_broadcast(admin_id, city, channel, target_id, status, error=None):
+    """Журнал рассылки: чтобы потом было видно, кому и что ушло."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO broadcast_log "
+            "(admin_id, city, channel, target_id, status, error) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            (admin_id, city, channel, target_id, status, (error or "")[:500] or None)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Не удалось записать строку журнала рассылки")
+    finally:
+        release_db(conn)
+
+
+def record_outreach_action(user_id, city, channel, action):
+    """Запомнить, какая работа проведена с человеком (для листа «Ижевск» и др.)."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO outreach_actions (user_id, city, channel, action) "
+            "VALUES (%s,%s,%s,%s)",
+            (user_id, city, channel, action)
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        log.exception("Не удалось записать действие по user=%s", user_id)
+    finally:
+        release_db(conn)
+
+
+def _outreach_actions_for_users(user_ids):
+    """История работы по людям: user_id -> список строк «дата — что сделано»."""
+    user_ids = [uid for uid in user_ids if uid is not None]
+    if not user_ids:
+        return {}
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT user_id, created_at, action FROM outreach_actions "
+            "WHERE user_id = ANY(%s) ORDER BY created_at ASC, id ASC",
+            (user_ids,)
+        )
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
+    history = {}
+    for user_id, created_at, action in rows:
+        when = created_at.strftime("%d.%m.%Y") if hasattr(created_at, "strftime") else str(created_at)
+        history.setdefault(user_id, []).append(f"{when} {action}")
+    return history
+
+
+def _outreach_channel_phrase(channel, sent=0):
+    """Формулировка для колонки «Какая работа проведена»."""
+    channel = (channel or "").lower()
+    if channel == "vk":
+        return f"отправлено письмо в ВК ({sent} чел.)"
+    if channel == "max":
+        return f"отправлено письмо в Макс ({sent} чел.)"
+    if channel in ("vk+max", "max+vk", "оба"):
+        return f"отправлено письмо в ВК и Макс ({sent} чел.)"
+    return f"проведена рассылка ({channel or 'канал не указан'})"
+
+
+def _broadcast_city(admin_id, city, message, channels, inbox_id=None):
+    """Разослать свой текст прошедшим анкету из города — в VK и/или в MAX."""
+    if not _broadcast_guard.acquire(blocking=False):
+        _queue_export_reply(
+            admin_id, "📣 Другая рассылка уже идёт — дождитесь её окончания.", inbox_id
+        )
+        return
+    try:
+        channels = [ch for ch in channels if ch in BROADCAST_CHANNELS] or ["vk"]
+        vk_targets, max_targets = _fetch_city_recipients(city)
+        if "vk" not in channels:
+            vk_targets = []
+        if "max" not in channels:
+            max_targets = []
+        total = len(vk_targets) + len(max_targets)
+        if not total:
+            _queue_export_reply(
+                admin_id,
+                f"В «{city}» нет подходящих получателей: нужны завершённая анкета, "
+                "согласие на обработку данных и отсутствие «не беспокоить».",
+                inbox_id
+            )
+            return
+        max_note = ""
+        if "max" in channels and not _max_is_configured():
+            max_note = "\n\n⚠️ MAX_TOKEN не задан — сообщения в MAX отправляться не будут."
+        log.info(
+            "Рассылка по городу: admin=%s city=%s vk=%s max=%s channels=%s",
+            admin_id, city, len(vk_targets), len(max_targets), channels
+        )
+        _queue_export_reply(
+            admin_id,
+            f"📣 Рассылка по городу «{city}» запущена.\n"
+            f"• VK: {len(vk_targets)} чел.\n"
+            f"• MAX: {len(max_targets)} чел.{max_note}",
+            inbox_id
+        )
+        vk_sent = vk_failed = 0
+        max_sent = max_failed = max_skipped = 0
+        processed = 0
+        for target in vk_targets:
+            processed += 1
+            _wait_while_live_messages()
+            user_id = target["user_id"]
+            try:
+                with _lock_user(user_id):
+                    try:
+                        if is_opted_out(user_id):
+                            vk_failed += 0
+                            _log_broadcast(admin_id, city, "vk", user_id, "skipped", "opt_out")
+                            continue
+                    except Exception:
+                        log.exception("Рассылка: не удалось проверить «не беспокоить» user=%s", user_id)
+                    result = send_message(user_id, message)
+                if result:
+                    vk_sent += 1
+                    _log_broadcast(admin_id, city, "vk", user_id, "sent")
+                    record_outreach_action(user_id, city, "vk", "отправлено письмо в ВК")
+                else:
+                    vk_failed += 1
+                    _log_broadcast(admin_id, city, "vk", user_id, "failed", "VK отклонил отправку")
+            except Exception as exc:
+                vk_failed += 1
+                log.exception("Рассылка по городу: не удалось написать в VK user=%s", user_id)
+                _log_broadcast(admin_id, city, "vk", user_id, "failed", str(exc))
+            if processed % BROADCAST_PROGRESS_EVERY == 0:
+                _queue_export_reply(
+                    admin_id,
+                    f"📣 Рассылка «{city}»: VK — {processed} из {len(vk_targets)} "
+                    f"(отправлено {vk_sent}, ошибок {vk_failed})…",
+                    inbox_id
+                )
+            time.sleep(BROADCAST_DELAY)
+        for target in max_targets:
+            processed += 1
+            user_id = target["user_id"]
+            try:
+                if is_opted_out(user_id):
+                    max_skipped += 1
+                    _log_broadcast(admin_id, city, "max", user_id, "skipped", "opt_out")
+                    continue
+            except Exception:
+                log.exception("Рассылка: не удалось проверить «не беспокоить» user=%s", user_id)
+            result = _send_max_message(
+                message, target.get("max_chat_id"), target.get("max_user_id")
+            )
+            if result is True:
+                max_sent += 1
+                _log_broadcast(admin_id, city, "max", user_id, "sent")
+                record_outreach_action(user_id, city, "max", "отправлено письмо в Макс")
+            elif result is None:
+                max_skipped += 1
+                _log_broadcast(admin_id, city, "max", user_id, "skipped", "MAX_TOKEN не задан")
+            else:
+                max_failed += 1
+                _log_broadcast(admin_id, city, "max", user_id, "failed", "MAX отклонил отправку")
+            time.sleep(BROADCAST_DELAY)
+        summary = (
+            f"📣 Рассылка по городу «{city}» завершена.\n\n"
+            f"• VK: отправлено {vk_sent}, не доставлено {vk_failed} "
+            f"(из {len(vk_targets)})\n"
+            f"• MAX: отправлено {max_sent}, не доставлено {max_failed}, "
+            f"пропущено {max_skipped} (из {len(max_targets)})"
+        )
+        log.info(
+            "Рассылка по городу завершена admin=%s city=%s vk_sent=%s vk_failed=%s "
+            "max_sent=%s max_failed=%s max_skipped=%s",
+            admin_id, city, vk_sent, vk_failed, max_sent, max_failed, max_skipped
+        )
+        _queue_export_reply(admin_id, summary, inbox_id)
+    except Exception:
+        log.exception("Рассылка по городу упала admin=%s city=%s", admin_id, city)
+        try:
+            _queue_export_reply(
+                admin_id,
+                "❌ Рассылка по городу прервалась из-за ошибки. Подробности в журнале.",
+                inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось сообщить об ошибке рассылки по городу admin=%s", admin_id)
+    finally:
+        _broadcast_guard.release()
+
+
+def _submit_city_broadcast(admin_id, city, message, channels, inbox_id=None):
+    try:
+        if _executor_heavy is None:
+            raise RuntimeError("Фоновый исполнитель рассылки ещё не запущен")
+        _executor_heavy.submit(_broadcast_city, admin_id, city, message, channels, inbox_id)
+        log.info(
+            "Задача рассылки по городу поставлена в очередь admin=%s city=%s channels=%s",
+            admin_id, city, channels
+        )
+    except Exception:
+        log.exception("Не удалось запустить рассылку по городу admin=%s", admin_id)
+        try:
+            _queue_export_reply(
+                admin_id, "❌ Не удалось запустить рассылку. Попробуйте позже.", inbox_id
+            )
+        except Exception:
+            log.exception("Не удалось сообщить о сбое запуска рассылки admin=%s", admin_id)
+
+
+def _schedule_city_broadcast(admin_id, city, message, channels):
+    context = _current_inbox_context()
+    if context is not None:
+        context["city_broadcasts"].append(
+            (admin_id, city, message, channels, context["inbox_id"])
+        )
+        return
+    _submit_city_broadcast(admin_id, city, message, channels)
+
+
+def _save_broadcast_draft(admin_id, city, message, channels):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO broadcast_drafts (admin_id, city, message, channels, created_at) "
+            "VALUES (%s,%s,%s,%s, now()) "
+            "ON CONFLICT (admin_id) DO UPDATE SET city=EXCLUDED.city, "
+            "message=EXCLUDED.message, channels=EXCLUDED.channels, created_at=now()",
+            (admin_id, city, message, ",".join(channels))
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def _get_broadcast_draft(admin_id):
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute(
+            "SELECT admin_id, city, message, channels, created_at FROM broadcast_drafts "
+            "WHERE admin_id=%s",
+            (admin_id,)
+        )
+        return c.fetchone()
+    finally:
+        release_db(conn)
+
+
+def _clear_broadcast_draft(admin_id):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM broadcast_drafts WHERE admin_id=%s", (admin_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def _broadcast_preview(admin_id, draft, inbox_id=None):
+    """Предпросмотр: сколько получателей и что именно уйдёт."""
+    channels = [ch for ch in (draft["channels"] or "vk").split(",") if ch in BROADCAST_CHANNELS]
+    if not channels:
+        channels = ["vk"]
+    vk_targets, max_targets = _fetch_city_recipients(draft["city"])
+    vk_count = len(vk_targets) if "vk" in channels else 0
+    max_count = len(max_targets) if "max" in channels else 0
+    max_note = ""
+    if "max" in channels:
+        if not _max_is_configured():
+            max_note = "\n⚠️ MAX_TOKEN не задан — отправка в MAX не сработает."
+        elif not max_count:
+            max_note = (
+                "\n⚠️ Связи с MAX нет ни у кого: попросите людей написать MAX-боту "
+                "(тогда связь появится автоматически)."
+            )
+    _queue_export_reply(
+        admin_id,
+        "📣 Предпросмотр рассылки\n\n"
+        f"• Город: {draft['city']}\n"
+        f"• Каналы: {', '.join(ch.upper() for ch in channels)}\n"
+        f"• Получателей: VK — {vk_count}, MAX — {max_count}{max_note}\n\n"
+        "Текст:\n"
+        f"{draft['message']}\n\n"
+        "Отправьте «отправить», чтобы запустить, или «отмена», чтобы отказаться.",
+        inbox_id
+    )
+
+
+def _broadcast_help_text():
+    cities = ", ".join(DISTRICTS_UNIVERSITIES)
+    return (
+        "📣 Рассылка по городу со своим текстом\n\n"
+        "1. «/рассылка_город Ижевск» — выбрать город.\n"
+        "2. Следующим сообщением — текст рассылки.\n"
+        "3. Проверить предпросмотр и отправить «отправить».\n\n"
+        f"Города: {cities}.\n"
+        "Кому уйдёт: тем, кто полностью заполнил анкету, дал согласие на обработку "
+        "данных и не нажимал «🔕 Не беспокоить», из заведений выбранного города.\n"
+        "Каналы: «/каналы вк», «/каналы макс», «/каналы оба»."
+    )
+
+
+def _handle_city_broadcast_command(user_id, text_lower, text, normalized):
+    """Диалог рассылки по городу. True — сообщение обработано этой командой."""
+    parts = text.strip().split(maxsplit=1)
+    head = parts[0].lower() if parts else ""
+
+    if head in BROADCAST_CITY_COMMANDS or head.startswith(BROADCAST_CITY_PREFIXES):
+        if user_id not in ADMIN_IDS:
+            send_message(user_id, MESSAGES["admin_only"])
+            return True
+        if head in BROADCAST_CITY_COMMANDS:
+            raw_city = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            for prefix in BROADCAST_CITY_PREFIXES:
+                if head.startswith(prefix):
+                    raw_city = parts[0][len(prefix):].strip()
+                    break
+            else:
+                raw_city = ""
+        city = _resolve_city(raw_city)
+        if not city:
+            send_message(user_id, "Не узнал город.\n\n" + _broadcast_help_text())
+            return True
+        _save_broadcast_draft(user_id, city, "", "vk")
+        send_message(
+            user_id,
+            f"📣 Город: {city}.\n\nТеперь отправьте текст рассылки одним сообщением."
+        )
+        return True
+
+    if head in ("/каналы", "/канал"):
+        if user_id not in ADMIN_IDS:
+            send_message(user_id, MESSAGES["admin_only"])
+            return True
+        draft = _get_broadcast_draft(user_id)
+        if not draft:
+            send_message(user_id, "Сначала выберите город: «/рассылка_город Ижевск».")
+            return True
+        choice = " ".join(parts[1:]).strip().lower() if len(parts) > 1 else ""
+        mapping = {
+            "вк": ["vk"], "vk": ["vk"], "вконтакте": ["vk"],
+            "макс": ["max"], "max": ["max"], "мессенджер макс": ["max"],
+            "оба": ["vk", "max"], "все": ["vk", "max"], "both": ["vk", "max"],
+        }
+        channels = mapping.get(choice)
+        if not channels:
+            send_message(user_id, "Укажите канал: «/каналы вк», «/каналы макс» или «/каналы оба».")
+            return True
+        _save_broadcast_draft(user_id, draft["city"], draft["message"], channels)
+        send_message(
+            user_id,
+            f"Каналы: {', '.join(ch.upper() for ch in channels)}."
+            + ("" if draft["message"] else "\n\nТеперь отправьте текст рассылки.")
+        )
+        return True
+
+    draft = _get_broadcast_draft(user_id)
+    if not draft:
+        return False
+
+    if normalized in ("отмена", "/отмена", "cancel"):
+        _clear_broadcast_draft(user_id)
+        send_message(user_id, "Рассылка отменена, черновик удалён.")
+        return True
+
+    if normalized in ("отправить", "отправляй", "/отправить", "send"):
+        if user_id not in ADMIN_IDS:
+            send_message(user_id, MESSAGES["admin_only"])
+            return True
+        if not draft["message"].strip():
+            send_message(user_id, "Сначала пришлите текст рассылки.")
+            return True
+        channels = [ch for ch in (draft["channels"] or "vk").split(",") if ch in BROADCAST_CHANNELS]
+        if not channels:
+            channels = ["vk"]
+        _clear_broadcast_draft(user_id)
+        _schedule_city_broadcast(user_id, draft["city"], draft["message"], channels)
+        return True
+
+    # Любой другой текст от админа с открытым черновиком считаем текстом рассылки.
+    if user_id not in ADMIN_IDS:
+        return False
+    message = text.strip()
+    if not message:
+        return False
+    if len(message) > BROADCAST_MAX_TEXT:
+        send_message(
+            user_id,
+            f"Текст слишком длинный ({len(message)} символов). "
+            f"Сократите до {BROADCAST_MAX_TEXT}."
+        )
+        return True
+    _save_broadcast_draft(user_id, draft["city"], message, draft["channels"])
+    _broadcast_preview(user_id, {**draft, "message": message})
+    return True
+
+
+def _schedule_broadcast(admin_id):
+    context = _current_inbox_context()
+    if context is not None:
+        context["broadcasts"].append((admin_id, context["inbox_id"]))
+        return
+    _submit_broadcast(admin_id)
+
 # ----------------- ОСНОВНАЯ ЛОГИКА -----------------
 
 _USER_LOCKS = {}
@@ -2779,6 +3662,23 @@ def handle_message(user_id, text):
             ask_step(user_id, STEPS[max(0, step_index)], uni_page)
         return
     text_lower = text.lower()
+    normalized = " ".join(text_lower.split())
+
+    # «Не беспокоить» и возврат в рассылки — до всех остальных команд.
+    if normalized in OPT_OUT_COMMANDS:
+        newly = register_opt_out(user_id)
+        log.info("Команда «не беспокоить» user=%s new=%s", user_id, newly)
+        send_message(
+            user_id,
+            MESSAGES["opt_out_done"] if newly else MESSAGES["opt_out_already"]
+        )
+        return
+
+    if normalized in OPT_IN_COMMANDS:
+        restored = unregister_opt_out(user_id)
+        log.info("Возврат в рассылки user=%s restored=%s", user_id, restored)
+        send_message(user_id, MESSAGES["opt_out_resumed"])
+        return
 
     if text_lower in ["/export", "/выгрузить"]:
         is_admin = user_id in ADMIN_IDS
@@ -2788,6 +3688,24 @@ def handle_message(user_id, text):
             _schedule_export(user_id, False)
         else:
             send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    # «/Ижевск» и другие города: выгрузка только по этому городу (лист города
+    # плюс лист «Анкеты»), с колонкой «Какая работа проведена».
+    if _is_city_export_command(text):
+        is_admin = user_id in ADMIN_IDS
+        city = _city_from_export_command(text)
+        log.info("Команда выгрузки по городу user=%s city=%s is_admin=%s", user_id, city, is_admin)
+        if not is_admin:
+            send_message(user_id, MESSAGES["admin_only"])
+        elif not city:
+            send_message(user_id, "Не узнал город.\n\n" + _city_export_help_text())
+        else:
+            send_message(
+                user_id,
+                f"📊 Запрос на выгрузку по городу «{city}» принят. Подготавливаю файл…"
+            )
+            _schedule_export(user_id, False, city=city)
         return
 
     if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
@@ -2824,6 +3742,14 @@ def handle_message(user_id, text):
             _schedule_report(user_id, True)
         else:
             send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    # Рассылка по городу со своим текстом: диалог «город → текст → предпросмотр».
+    # Стоит выше остальных команд, потому что перехватывает и обычный текст,
+    # пока у админа открыт черновик.
+    if _handle_city_broadcast_command(user_id, text_lower, text, normalized):
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step=city_broadcast duration={t_total:.3f}s")
         return
 
     if text_lower in ["/рассылка", "/рассылка всем", "/напомнить всем", "/broadcast"]:
@@ -3082,7 +4008,8 @@ def _process_one_inbox():
             "replies": [],
             "exports": [],
             "reports": [],
-            "broadcasts": []
+            "broadcasts": [],
+            "city_broadcasts": []
         }
         _inbox_context.current = context
         with _lock_user(user_id):
@@ -3111,6 +4038,8 @@ def _process_one_inbox():
                 _submit_report(*report_job)
             for broadcast_job in context["broadcasts"]:
                 _submit_broadcast(*broadcast_job)
+            for city_job in context["city_broadcasts"]:
+                _submit_city_broadcast(*city_job)
             log.info("inbox_done id=%s user=%s replies=%s", inbox_id, user_id, len(context["replies"]))
         return True
     except Exception as e:

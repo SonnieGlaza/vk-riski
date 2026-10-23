@@ -4278,6 +4278,7 @@ async def startup_event():
     ).start()
     _inbox_wake.set()
     _outbox_wake.set()
+    print("Бот запущен", flush=True)
     log_msg("Бот запущен; очереди inbox/outbox готовы.")
     threading.Thread(target=_unread_recovery_worker, daemon=True).start()
     threading.Thread(target=_reminder_worker, daemon=True).start()

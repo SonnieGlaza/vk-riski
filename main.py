@@ -46,8 +46,7 @@ NAME_PATTERN = re.compile(r"^[а-яёА-ЯЁa-zA-Z]+(?:['\-][а-яёА-ЯЁa-zA-
 # --- ПРЕДВЫЧИСЛЕННЫЕ КЛАВИАТУРЫ ---
 KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text", "label": "Начать анкету"}, "color": "positive"}]]})
 KB_RESTART = json.dumps({"one_time": False, "buttons": [
-    [{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}],
-    [{"action": {"type": "text", "label": "🔕 Не беспокоить"}, "color": "secondary"}]
+    [{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]
 ]})
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
@@ -951,7 +950,7 @@ MESSAGES = {
         "🔔 Готово: напоминания и рассылки снова будут приходить. "
         "Спасибо, что остаётесь на связи!"
     ),
-    "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку «Пройти заново».\nЕсли не хотите получать напоминания и рассылки — нажмите «🔕 Не беспокоить».",
+    "finished": "✅ Спасибо! Анкета заполнена.\n\nПредоставленная вами информация позволит нам детально проанализировать ситуацию и предложить оптимальное решение.\n\nЕсли хотите пройти анкету заново — нажмите кнопку «Пройти заново».",
     "already_finished": "✅ Вы уже заполнили анкету ранее. Если хотите пройти заново — нажмите кнопку ниже.",
 }
 
@@ -2653,7 +2652,11 @@ REMINDER_BATCH = int(os.getenv("REMINDER_BATCH", "20"))
 REMINDER_POLL_SECONDS = int(os.getenv("REMINDER_POLL_SECONDS", "60"))
 REMINDER_SEND_DELAY = float(os.getenv("REMINDER_SEND_DELAY", "1.0"))
 
-# --- «НЕ БЕСПОКОИТЬ»: КНОПКА В БОТЕ И УЧЁТ В РАССЫЛКАХ ---
+# --- «НЕ БЕСПОКОИТЬ»: УЧЁТ В РАССЫЛКАХ ---
+#
+# Кнопки «🔕 Не беспокоить» в клавиатурах больше нет: человек не видит, как отписаться.
+# Сама просьба по-прежнему распознаётся, если написать её текстом (OPT_OUT_COMMANDS),
+# и все, кто отписался раньше, в рассылки не попадают.
 
 OPT_OUT_BUTTON = "🔕 Не беспокоить"
 OPT_IN_BUTTON = "🔔 Вернуть рассылки"
@@ -2754,6 +2757,10 @@ def unregister_opt_out(user_id):
 
 REMINDER_TEXT = "⏰ Напоминаю: анкета пока не завершена. Ответьте на вопрос ниже."
 
+# Что попадает в колонку «Какая работа проведена», когда бот шлёт напоминание.
+AUTO_REMINDER_ACTION = "отправлено автоматическое напоминание (анкета не завершена)"
+REMINDER_BROADCAST_ACTION = "отправлено напоминание (рассылка по незавершённым анкетам)"
+
 
 def _fetch_reminder_targets(limit=REMINDER_BATCH):
     """Кому пора напомнить: анкета не завершена и человек давно не отвечал."""
@@ -2835,7 +2842,7 @@ def _send_reminders():
                         continue
                 except Exception:
                     log.exception("Не удалось проверить «не беспокоить» user=%s", user_id)
-                ask_step(
+                delivered = ask_step(
                     user_id,
                     STEPS[current_step],
                     current_page if isinstance(current_page, int) else 0,
@@ -2843,6 +2850,8 @@ def _send_reminders():
                 )
                 _mark_reminded(user_id)
                 sent += 1
+                if delivered:
+                    record_outreach_action(user_id, None, "vk", AUTO_REMINDER_ACTION)
                 log.info(
                     "Напоминание отправлено user=%s step=%s", user_id, STEPS[current_step]
                 )
@@ -2963,6 +2972,7 @@ def _broadcast_reminders(admin_id, inbox_id=None):
                 if result:
                     sent += 1
                     _mark_reminded(user_id)
+                    record_outreach_action(user_id, None, "vk", REMINDER_BROADCAST_ACTION)
                 else:
                     failed += 1
             except Exception:
@@ -3034,8 +3044,9 @@ def _schedule_broadcast(admin_id):
 #
 # Админ запускает её из VK-бота командой «/рассылка_город Ижевск», затем пишет текст.
 # Бот показывает предпросмотр (сколько человек, в каких каналах) и ждёт «отправить».
-# Отбор: анкета завершена (progress.started = 2, answers.created_at заполнен),
-# согласие дано, человек не в opt_out, заведение относится к выбранному городу.
+# Отбор: анкета завершена (progress.started = 2, answers.created_at заполнен), человек не в
+# opt_out, заведение относится к выбранному городу, дано согласие на обработку данных,
+# сумма баллов больше BROADCAST_MIN_SCORE и выбран хотя бы один сервис кадрового центра.
 
 BROADCAST_CHANNELS = ("vk", "max")
 BROADCAST_CITY_COMMANDS = {"/рассылка_город", "/город", "/рассылка город"}
@@ -3109,27 +3120,74 @@ def _institutions_for_city(city):
     return list(DISTRICTS_UNIVERSITIES.get(city) or [])
 
 
-def _fetch_city_recipients(city):
-    """Кто прошёл анкету и учится в заведениях этого города.
+# Кому уходит рассылка по городу: согласие на обработку данных, сумма баллов больше
+# порога и интерес хотя бы к одному сервису кадрового центра (вопрос «Нужная помощь»).
+BROADCAST_MIN_SCORE = int(os.getenv("BROADCAST_MIN_SCORE", "5"))
+# Вариант «Другое (укажите)» сам по себе о сервисах ничего не говорит — его не считаем.
+OTHER_SERVICE_LABEL = "Другое (укажите)"
+BROADCAST_SERVICE_LABELS = tuple(
+    label for label in OPTIONS["help_needed"] if label != OTHER_SERVICE_LABEL
+)
 
-    Возвращает (список VK-получателей, список MAX-получателей). Оба списка —
-    словари с user_id, fio, institution, max_chat_id/max_user_id.
+
+def _services_interest(row):
+    """Выбрал ли человек хотя бы один конкретный сервис кадрового центра."""
+    answer = str(row.get("help_needed") or "").casefold()
+    if not answer.strip():
+        return False
+    return any(label.casefold() in answer for label in BROADCAST_SERVICE_LABELS)
+
+
+def _broadcast_filter_reason(row):
+    """Почему человек не попадает в рассылку; None — подходит."""
+    if row.get("consent_status") is not True:
+        return "no_consent"
+    if not _services_interest(row):
+        return "no_interest"
+    _scores, total = calculate_scores(dict(row))
+    if total <= BROADCAST_MIN_SCORE:
+        return "low_score"
+    return None
+
+
+def _broadcast_filter_note(stats):
+    """Строка «кто не подошёл по условиям» для предпросмотра и отчётов."""
+    if not stats:
+        return ""
+    skipped = (
+        stats.get("no_consent", 0) + stats.get("low_score", 0) + stats.get("no_interest", 0)
+    )
+    if not skipped:
+        return ""
+    return (
+        f"  – баллов ≤ {BROADCAST_MIN_SCORE}: {stats.get('low_score', 0)}\n"
+        f"  – без интереса к сервисам центра: {stats.get('no_interest', 0)}\n"
+        f"  – без согласия на обработку данных: {stats.get('no_consent', 0)}"
+    )
+
+
+def _fetch_city_recipients(city):
+    """Кто подходит для рассылки по городу.
+
+    Кроме города и «не беспокоить» проверяем условия: согласие на обработку данных,
+    сумма баллов больше BROADCAST_MIN_SCORE и выбранный сервис кадрового центра.
+
+    Возвращает (список VK-получателей, список MAX-получателей, статистику отсева).
     """
     institutions = _institutions_for_city(city)
     if not institutions:
-        return [], []
+        return [], [], {}
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
         c.execute(
-            "SELECT a.user_id, a.fio, a.institution, a.contacts, a.created_at, "
-            "m.max_chat_id, m.max_user_id "
+            "SELECT a.*, m.max_chat_id, m.max_user_id "
             "FROM answers a "
             "JOIN progress p ON p.user_id = a.user_id "
             "LEFT JOIN opt_out o ON o.user_id = a.user_id "
             "LEFT JOIN max_contacts m ON m.user_id = a.user_id "
             "WHERE p.started = 2 AND a.created_at IS NOT NULL "
-            "AND a.consent_status IS TRUE AND o.user_id IS NULL "
+            "AND o.user_id IS NULL "
             "AND a.institution = ANY(%s) "
             "ORDER BY a.user_id",
             (institutions,)
@@ -3138,9 +3196,18 @@ def _fetch_city_recipients(city):
     finally:
         release_db(conn)
 
+    stats = {
+        "candidates": len(rows), "suitable": 0,
+        "no_consent": 0, "low_score": 0, "no_interest": 0,
+    }
     vk_targets = []
     max_targets = []
     for row in rows:
+        reason = _broadcast_filter_reason(row)
+        if reason:
+            stats[reason] += 1
+            continue
+        stats["suitable"] += 1
         item = {
             "user_id": row["user_id"],
             "fio": (row["fio"] or "").strip(),
@@ -3154,7 +3221,14 @@ def _fetch_city_recipients(city):
             max_item["max_chat_id"] = chat_id
             max_item["max_user_id"] = max_user_id
             max_targets.append(max_item)
-    return vk_targets, max_targets
+    if stats["candidates"] != stats["suitable"]:
+        log.info(
+            "Рассылка по городу %s: подходит %s из %s (без согласия %s, баллов ≤ %s у %s, "
+            "без интереса к сервисам %s)",
+            city, stats["suitable"], stats["candidates"], stats["no_consent"],
+            BROADCAST_MIN_SCORE, stats["low_score"], stats["no_interest"]
+        )
+    return vk_targets, max_targets, stats
 
 
 def _max_is_configured():
@@ -3266,6 +3340,122 @@ def _outreach_channel_phrase(channel, sent=0):
     return f"проведена рассылка ({channel or 'канал не указан'})"
 
 
+# ----------------- ЗВОНКИ (VOXIMPLANT) -----------------
+#
+# Сценарий outbound_survey.js после звонка присылает результат POST-запросом на
+# /voximplant/call (адрес задаётся VOXIMPLANT_RESULT_WEBHOOK, см. VOXIMPLANT.md).
+# Человека ищем в анкетах по номеру телефона и дописываем результат в историю
+# работы — он попадает в колонку «Какая работа проведена» вместе с рассылками.
+
+VOXIMPLANT_WEBHOOK_TOKEN = os.getenv("VOXIMPLANT_WEBHOOK_TOKEN", "").strip()
+PHONE_INDEX_TTL = float(os.getenv("PHONE_INDEX_TTL", "300"))
+
+# Статус звонка из сценария -> формулировка для истории работы.
+CALL_STATUS_ACTIONS = {
+    "answered": "звонок: разговор состоялся",
+    "rejected": "звонок: попросили больше не звонить (нажали «1»)",
+    "no_answer": "звонок: не ответили",
+    "failed": "звонок: не удалось дозвониться",
+}
+
+_phone_index = {"built_at": 0.0, "by_phone": {}}
+_phone_index_guard = threading.Lock()
+
+# Похоже на телефон: 10 и больше цифр, возможно с разделителями.
+_PHONE_RUN_PATTERN = re.compile(r"\d[\d\s().\-]{8,}\d")
+
+
+def _phone_digits(value):
+    """Только цифры: «+7 (912) 111-22-33» -> «79121112233»."""
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _phone_key(value):
+    """Ключ сравнения телефонов — последние 10 цифр первого номера в тексте.
+
+    «+7 912 111-22-33», «8-912-111-22-33» и «79121112233» дают один ключ, а
+    цифры из e-mail («user1990@mail.ru») в ключ не попадают.
+    """
+    for candidate in _PHONE_RUN_PATTERN.findall(str(value or "")):
+        digits = _phone_digits(candidate)
+        if len(digits) >= 10:
+            return digits[-10:]
+    return ""
+
+
+def _load_phone_index():
+    """Карта «последние 10 цифр телефона -> user_id и заведение», с кэшем."""
+    now = time.monotonic()
+    with _phone_index_guard:
+        if _phone_index["by_phone"] and now - _phone_index["built_at"] < PHONE_INDEX_TTL:
+            return _phone_index["by_phone"]
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT user_id, contacts, institution FROM answers "
+            "WHERE contacts IS NOT NULL"
+        )
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
+    index = {}
+    for user_id, contacts, institution in rows:
+        key = _phone_key(contacts)
+        if key:
+            index.setdefault(key, {"user_id": user_id, "institution": institution})
+    with _phone_index_guard:
+        _phone_index["by_phone"] = index
+        _phone_index["built_at"] = now
+    return index
+
+
+def _call_action_text(data):
+    """Строка для колонки «Какая работа проведена» по результату звонка."""
+    status = str(data.get("status") or "").strip().lower()
+    text = CALL_STATUS_ACTIONS.get(status) or f"звонок: результат «{status or 'не указан'}»"
+    duration = data.get("duration")
+    if status == "answered" and isinstance(duration, (int, float)) and duration:
+        text += f", {int(duration)} сек"
+    error = str(data.get("error") or "").strip()
+    if error:
+        text += f" ({error[:200]})"
+    campaign = str(data.get("campaign") or "").strip()
+    if campaign:
+        text += f" — кампания «{campaign}»"
+    recording = str(data.get("recording_url") or "").strip()
+    if recording:
+        text += f"\nзапись разговора: {recording}"
+    return text
+
+
+def record_call_result(data):
+    """Записать результат звонка в историю работы; вернуть отчёт для webhook."""
+    if not isinstance(data, dict):
+        log.warning("Звонок: отчёт не словарь, записывать нечего")
+        return {"ok": False, "matched": False, "reason": "invalid_payload"}
+    phone = _phone_key(data.get("phone"))
+    if not phone:
+        log.warning("Звонок: в отчёте нет телефона, записывать некуда")
+        return {"ok": False, "matched": False, "reason": "no_phone"}
+    entry = _load_phone_index().get(phone)
+    if not entry:
+        log.warning("Звонок: анкеты с телефоном …%s не нашлось", phone[-4:])
+        return {"ok": True, "matched": False, "reason": "not_found"}
+    user_id = entry["user_id"]
+    record_outreach_action(
+        user_id,
+        resolve_district(entry.get("institution")),
+        "call",
+        _call_action_text(data)
+    )
+    log.info(
+        "Звонок записан user=%s phone=…%s status=%s",
+        user_id, phone[-4:], data.get("status")
+    )
+    return {"ok": True, "matched": True, "user_id": user_id}
+
+
 def _broadcast_city(admin_id, city, message, channels, inbox_id=None):
     """Разослать свой текст прошедшим анкету из города — в VK и/или в MAX."""
     if not _broadcast_guard.acquire(blocking=False):
@@ -3275,17 +3465,24 @@ def _broadcast_city(admin_id, city, message, channels, inbox_id=None):
         return
     try:
         channels = [ch for ch in channels if ch in BROADCAST_CHANNELS] or ["vk"]
-        vk_targets, max_targets = _fetch_city_recipients(city)
+        vk_targets, max_targets, stats = _fetch_city_recipients(city)
         if "vk" not in channels:
             vk_targets = []
         if "max" not in channels:
             max_targets = []
         total = len(vk_targets) + len(max_targets)
         if not total:
+            filter_note = _broadcast_filter_note(stats)
+            details = ""
+            if filter_note:
+                details = (
+                    f"\n\nПросмотрено анкет: {stats.get('candidates', 0)}\n{filter_note}"
+                )
             _queue_export_reply(
                 admin_id,
-                f"В «{city}» нет подходящих получателей: нужны завершённая анкета, "
-                "согласие на обработку данных и отсутствие «не беспокоить».",
+                f"В «{city}» нет подходящих получателей: нужны завершённая анкета, согласие "
+                f"на обработку данных, баллы больше {BROADCAST_MIN_SCORE} и интерес хотя бы "
+                f"к одному сервису кадрового центра.{details}",
                 inbox_id
             )
             return
@@ -3470,7 +3667,7 @@ def _broadcast_preview(admin_id, draft, inbox_id=None):
     channels = [ch for ch in (draft["channels"] or "vk").split(",") if ch in BROADCAST_CHANNELS]
     if not channels:
         channels = ["vk"]
-    vk_targets, max_targets = _fetch_city_recipients(draft["city"])
+    vk_targets, max_targets, stats = _fetch_city_recipients(draft["city"])
     vk_count = len(vk_targets) if "vk" in channels else 0
     max_count = len(max_targets) if "max" in channels else 0
     max_note = ""
@@ -3482,12 +3679,23 @@ def _broadcast_preview(admin_id, draft, inbox_id=None):
                 "\n⚠️ Связи с MAX нет ни у кого: попросите людей написать MAX-боту "
                 "(тогда связь появится автоматически)."
             )
+    filter_note = _broadcast_filter_note(stats)
+    if filter_note:
+        skipped = (
+            stats.get("no_consent", 0) + stats.get("low_score", 0) + stats.get("no_interest", 0)
+        )
+        filter_note = (
+            f"\n• Не подошли ({skipped} из {stats.get('candidates', 0)}):\n{filter_note}"
+        )
     _queue_export_reply(
         admin_id,
         "📣 Предпросмотр рассылки\n\n"
         f"• Город: {draft['city']}\n"
         f"• Каналы: {', '.join(ch.upper() for ch in channels)}\n"
-        f"• Получателей: VK — {vk_count}, MAX — {max_count}{max_note}\n\n"
+        f"• Получателей: VK — {vk_count}, MAX — {max_count}{max_note}\n"
+        f"• Условия: согласие на обработку данных, баллы больше {BROADCAST_MIN_SCORE}, "
+        "интерес к сервисам кадрового центра"
+        f"{filter_note}\n\n"
         "Текст:\n"
         f"{draft['message']}\n\n"
         "Отправьте «отправить», чтобы запустить, или «отмена», чтобы отказаться.",
@@ -3503,8 +3711,10 @@ def _broadcast_help_text():
         "2. Следующим сообщением — текст рассылки.\n"
         "3. Проверить предпросмотр и отправить «отправить».\n\n"
         f"Города: {cities}.\n"
-        "Кому уйдёт: тем, кто полностью заполнил анкету, дал согласие на обработку "
-        "данных и не нажимал «🔕 Не беспокоить», из заведений выбранного города.\n"
+        "Кому уйдёт: тем, кто полностью заполнил анкету, дал согласие на обработку данных, "
+        f"набрал больше {BROADCAST_MIN_SCORE} баллов и выбрал хотя бы один сервис кадрового "
+        "центра в вопросе «Нужная помощь», из заведений выбранного города и не просил "
+        "больше не беспокоить.\n"
         "Каналы: «/каналы вк», «/каналы макс», «/каналы оба»."
     )
 
@@ -3668,6 +3878,8 @@ def handle_message(user_id, text):
     if normalized in OPT_OUT_COMMANDS:
         newly = register_opt_out(user_id)
         log.info("Команда «не беспокоить» user=%s new=%s", user_id, newly)
+        if newly:
+            record_outreach_action(user_id, None, "vk", "попросил больше не беспокоить")
         send_message(
             user_id,
             MESSAGES["opt_out_done"] if newly else MESSAGES["opt_out_already"]
@@ -3677,6 +3889,8 @@ def handle_message(user_id, text):
     if normalized in OPT_IN_COMMANDS:
         restored = unregister_opt_out(user_id)
         log.info("Возврат в рассылки user=%s restored=%s", user_id, restored)
+        if restored:
+            record_outreach_action(user_id, None, "vk", "вернулся в рассылки")
         send_message(user_id, MESSAGES["opt_out_resumed"])
         return
 
@@ -4320,6 +4534,34 @@ async def vk_callback(request: Request):
         return PlainTextResponse("ok")
 
     return PlainTextResponse("ok")
+
+@app.post("/voximplant/call")
+async def voximplant_call_result(request: Request):
+    """Результат звонка из сценария Voximplant — в колонку «Какая работа проведена».
+
+    Токен необязателен: если задан VOXIMPLANT_WEBHOOK_TOKEN, ждём его в заголовке
+    X-Webhook-Token или в параметре ?token=.
+    """
+    if VOXIMPLANT_WEBHOOK_TOKEN:
+        token = (
+            request.headers.get("X-Webhook-Token")
+            or request.query_params.get("token")
+            or ""
+        )
+        if token != VOXIMPLANT_WEBHOOK_TOKEN:
+            raise HTTPException(status_code=403, detail="Invalid token")
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    try:
+        return await asyncio.to_thread(record_call_result, data)
+    except Exception:
+        log.exception("Не удалось записать результат звонка")
+        raise HTTPException(status_code=503, detail="Call result not stored")
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -934,6 +934,12 @@ MESSAGES = {
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
     "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
+    "no_data_period": "За период {period} анкет нет.",
+    "invalid_period": (
+        "Не удалось разобрать период. Укажите две даты в формате День.Месяц.Год "
+        "(например: /выгрузить 01.01.2025 31.12.2025). Дата начала не должна быть "
+        "позже даты окончания."
+    ),
     "no_data_report": "Пока нет собранных анкет для отчёта.",
     "no_data_report_today": "Сегодня пока нет новых анкет для отчёта.",
     "admin_only": "Эта команда доступна только администраторам.",
@@ -1206,6 +1212,62 @@ def _queue_export_reply(admin_id, message, inbox_id=None, attachment=None):
 EXPORT_MAX_DOC_BYTES = 4_500_000
 EXPORT_SPLIT_TARGET_BYTES = 4_000_000
 
+# Выгрузка за произвольный период: даты вводятся как День.Месяц.Год.
+PERIOD_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(\d{4})(?!\d)")
+PERIOD_EXPORT_COMMANDS = {"/выгрузить", "/export", "/выгрузка"}
+PERIOD_MIN_YEAR = 2000
+PERIOD_MAX_YEAR = 2100
+
+
+def _format_period(date_from, date_to):
+    """Период для сообщений и названия файла: «01.01.2025» или «с … по …»."""
+    if date_from is None and date_to is None:
+        return ""
+    if date_from is not None and date_to is not None:
+        if date_from == date_to:
+            return date_from.strftime("%d.%m.%Y")
+        return f"с {date_from.strftime('%d.%m.%Y')} по {date_to.strftime('%d.%m.%Y')}"
+    if date_from is not None:
+        return f"с {date_from.strftime('%d.%m.%Y')}"
+    return f"по {date_to.strftime('%d.%m.%Y')}"
+
+
+def _parse_export_period(text):
+    """Даты периода из команды: (date_from, date_to) или None.
+
+    Поддерживаются «/выгрузить 01.01.2025 31.12.2025»,
+    «/export 01.01.2025-31.12.2025» и «/выгрузить с 01.01.2025 по 31.12.2025».
+    Одна дата означает выгрузку за этот день.
+    """
+    matches = PERIOD_DATE_PATTERN.findall(text or "")
+    if not matches or len(matches) > 2:
+        return None
+    dates = []
+    for day, month, year in matches:
+        try:
+            value = date(int(year), int(month), int(day))
+        except ValueError:
+            return None
+        if not PERIOD_MIN_YEAR <= value.year <= PERIOD_MAX_YEAR:
+            return None
+        dates.append(value)
+    if len(dates) == 1:
+        return dates[0], dates[0]
+    if dates[0] > dates[1]:
+        return None
+    return dates[0], dates[1]
+
+
+def _period_export_payload(text):
+    """Аргумент команды «/выгрузить <даты>»; None — это не команда периода."""
+    parts = (text or "").strip().split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    if parts[0].lower() not in PERIOD_EXPORT_COMMANDS:
+        return None
+    return parts[1].strip() or None
+
+
 # Лист «Анкеты»: ФИО оставляем, чтобы человека можно было найти. Поля, которые
 # уже есть на районных листах (контакты, согласие, курс, группа, дата), не дублируем.
 EXPORT_FULL_COLUMNS = (
@@ -1241,6 +1303,7 @@ DISTRICT_HEADERS = [
     "Получивший сервис «Подбор стажировки», (да/нет)",
     "Получивший сервис «Подбор практики», (да/нет)",
     "Получивший сервис «Целевое обучение», (да/нет)",
+    "ID пользователя",
 ]
 
 SCORE_KEYS = [
@@ -1325,6 +1388,12 @@ def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
             action_cell = ws.cell(row=row_idx, column=18, value="\n".join(history))
             action_cell.alignment = Alignment(vertical="top", wrap_text=True)
             action_cell.fill = action_fill
+        # ID пользователя — служебная колонка; на листе района она скрыта.
+        ws.cell(
+            row=row_idx,
+            column=len(DISTRICT_HEADERS),
+            value=r.get("user_id") if r.get("user_id") is not None else ""
+        )
         row_idx += 1
 
     # Итоговые строки под таблицей: сколько людей в работе и что уже сделано.
@@ -1362,6 +1431,8 @@ def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
         elif col_idx == 18:
             width = 45   # Какая работа проведена
         ws.column_dimensions[get_column_letter(col_idx)].width = width
+    # ID скрыт, но остаётся в файле: по нему можно сверять людей с базой.
+    ws.column_dimensions[get_column_letter(len(DISTRICT_HEADERS))].hidden = True
 
 
 def _build_export_workbook(rows):
@@ -1539,7 +1610,8 @@ def _upload_export_document(path, title, admin_id):
     return attachment
 
 
-def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None):
+def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None,
+                         date_from=None, date_to=None):
     sheet_list = []
     for district_name in DISTRICTS_UNIVERSITIES:
         count = sum(1 for r in rows if resolve_district(r.get("institution")) == district_name)
@@ -1552,8 +1624,14 @@ def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None
     if other_count:
         sheet_list.append(f"  • «Прочие» — {other_count} чел.")
     sheets_text = "\n".join(sheet_list)
-    if city:
+    period_text = _format_period(date_from, date_to)
+    has_period = date_from is not None or date_to is not None
+    if city and has_period:
+        header = f"📊 Выгрузка по городу «{city}» за период {period_text}:\n\n"
+    elif city:
         header = f"📊 Выгрузка по городу «{city}»:\n\n"
+    elif has_period:
+        header = f"📊 Выгрузка анкет за период {period_text}:\n\n"
     elif today_only:
         header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n"
     else:
@@ -1573,19 +1651,32 @@ def _split_rows(rows, part_count):
     return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
 
-def _fetch_answers(today_only=False, city=None):
-    """Все анкеты (или только за сегодня) в порядке прохождения анкеты.
+def _fetch_answers(today_only=False, city=None, date_from=None, date_to=None):
+    """Анкеты (все, за сегодня или за период) в порядке прохождения анкеты.
 
     city — если задан, остаются только анкеты заведений этого города.
+    date_from/date_to — границы периода включительно (date).
     """
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
+        where = []
+        params = []
         if today_only:
-            today = date.today()
-            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
-        else:
-            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
+            where.append("a.created_at::date = %s")
+            params.append(date.today())
+        if date_from is not None:
+            where.append("a.created_at::date >= %s")
+            params.append(date_from)
+        if date_to is not None:
+            where.append("a.created_at::date <= %s")
+            params.append(date_to)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        c.execute(
+            "SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id "
+            f"{where_sql} ORDER BY p.started_at ASC NULLS FIRST",
+            tuple(params)
+        )
         rows = c.fetchall()
     finally:
         release_db(conn)
@@ -1595,18 +1686,33 @@ def _fetch_answers(today_only=False, city=None):
     return rows
 
 
-def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
-    rows = _fetch_answers(today_only, city=city)
+def export_to_table(admin_id, today_only=False, inbox_id=None, city=None,
+                    date_from=None, date_to=None):
+    rows = _fetch_answers(
+        today_only, city=city, date_from=date_from, date_to=date_to
+    )
 
     if not rows:
         log.info(
-            "Выгрузка: нет строк (today_only=%s city=%s) admin=%s",
-            today_only, city, admin_id
+            "Выгрузка: нет строк (today_only=%s city=%s period=%s..%s) admin=%s",
+            today_only, city, date_from, date_to, admin_id
         )
         if city:
+            period_note = (
+                f" за период {_format_period(date_from, date_to)}"
+                if date_from is not None or date_to is not None else ""
+            )
             _queue_export_reply(
                 admin_id,
-                f"В «{city}» нет анкет для выгрузки.",
+                f"В «{city}»{period_note} нет анкет для выгрузки.",
+                inbox_id
+            )
+        elif date_from is not None or date_to is not None:
+            _queue_export_reply(
+                admin_id,
+                MESSAGES["no_data_period"].format(
+                    period=_format_period(date_from, date_to)
+                ),
                 inbox_id
             )
         else:
@@ -1643,9 +1749,12 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
                 size, len(parts), sizes
             )
 
-        base_title = (
-            f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
-        )
+        if date_from is not None or date_to is not None:
+            base_title = f"Выгрузка за период {_format_period(date_from, date_to)}"
+        elif today_only:
+            base_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}"
+        else:
+            base_title = "Выгрузка анкет"
         if city:
             base_title = f"{city} — {base_title.lower()}"
         for index, (path, chunk) in enumerate(parts, start=1):
@@ -1653,7 +1762,10 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
             attachment = _upload_export_document(path, title, admin_id)
             _queue_export_reply(
                 admin_id,
-                _export_message_text(chunk, today_only, index, len(parts), city=city),
+                _export_message_text(
+                    chunk, today_only, index, len(parts),
+                    city=city, date_from=date_from, date_to=date_to
+                ),
                 inbox_id,
                 attachment
             )
@@ -1670,11 +1782,21 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
                 log.warning("Не удалось удалить временный файл выгрузки: %s", path)
 
 
-def _run_export_task(admin_id, today_only, inbox_id=None, city=None):
-    log.info("Запуск задачи выгрузки admin=%s today_only=%s city=%s", admin_id, today_only, city)
+def _run_export_task(admin_id, today_only, inbox_id=None, city=None,
+                     date_from=None, date_to=None):
+    log.info(
+        "Запуск задачи выгрузки admin=%s today_only=%s city=%s period=%s..%s",
+        admin_id, today_only, city, date_from, date_to
+    )
     try:
-        export_to_table(admin_id, today_only, inbox_id, city=city)
-        log.info("Задача выгрузки завершена admin=%s today_only=%s city=%s", admin_id, today_only, city)
+        export_to_table(
+            admin_id, today_only, inbox_id, city=city,
+            date_from=date_from, date_to=date_to
+        )
+        log.info(
+            "Задача выгрузки завершена admin=%s today_only=%s city=%s period=%s..%s",
+            admin_id, today_only, city, date_from, date_to
+        )
     except Exception as exc:
         log.exception("Не удалось подготовить выгрузку для admin=%s", admin_id)
         if "no_free_space" in str(exc).casefold():
@@ -1685,23 +1807,23 @@ def _run_export_task(admin_id, today_only, inbox_id=None, city=None):
         else:
             failure_message = "❌ Не удалось сформировать или отправить выгрузку. Подробности записаны в журнал."
         try:
-            _queue_export_reply(
-                admin_id,
-                failure_message,
-                inbox_id
-            )
+            _queue_export_reply(admin_id, failure_message, inbox_id)
         except Exception:
             log.exception("Не удалось поставить сообщение об ошибке выгрузки в outbox admin=%s", admin_id)
 
 
-def _submit_export(admin_id, today_only, inbox_id=None, city=None):
+def _submit_export(admin_id, today_only, inbox_id=None, city=None,
+                   date_from=None, date_to=None):
     try:
         if _executor_heavy is None:
             raise RuntimeError("Фоновый исполнитель выгрузки ещё не запущен")
-        _executor_heavy.submit(_run_export_task, admin_id, today_only, inbox_id, city)
+        _executor_heavy.submit(
+            _run_export_task, admin_id, today_only, inbox_id, city,
+            date_from, date_to
+        )
         log.info(
-            "Задача выгрузки поставлена в очередь admin=%s today_only=%s city=%s",
-            admin_id, today_only, city
+            "Задача выгрузки поставлена в очередь admin=%s today_only=%s city=%s period=%s..%s",
+            admin_id, today_only, city, date_from, date_to
         )
     except Exception:
         log.exception("Не удалось запустить выгрузку для admin=%s", admin_id)
@@ -1715,12 +1837,16 @@ def _submit_export(admin_id, today_only, inbox_id=None, city=None):
             log.exception("Не удалось поставить сообщение о запуске выгрузки в outbox admin=%s", admin_id)
 
 
-def _schedule_export(admin_id, today_only, city=None):
+def _schedule_export(admin_id, today_only, city=None, date_from=None, date_to=None):
     context = _current_inbox_context()
     if context is not None:
-        context["exports"].append((admin_id, today_only, context["inbox_id"], city))
+        context["exports"].append(
+            (admin_id, today_only, context["inbox_id"], city, date_from, date_to)
+        )
         return
-    _submit_export(admin_id, today_only, city=city)
+    _submit_export(
+        admin_id, today_only, city=city, date_from=date_from, date_to=date_to
+    )
 
 
 # ----------------- ОТЧЁТ ПО ФОРМЕ «ОЦЕНКА РИСКА НЕТРУДОУСТРОЙСТВА» -----------------
@@ -3090,7 +3216,10 @@ def _city_from_export_command(text):
         return None
     head = parts[0].lstrip("/").strip().lower()
     if head in ("город", "выгрузить_город", "export_city", "город_выгрузка"):
-        return _resolve_city(parts[1]) if len(parts) > 1 else None
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if not rest:
+            return None
+        return _resolve_city(rest.split(maxsplit=1)[0])
     return _resolve_city(head)
 
 
@@ -3909,17 +4038,33 @@ def handle_message(user_id, text):
     if _is_city_export_command(text):
         is_admin = user_id in ADMIN_IDS
         city = _city_from_export_command(text)
-        log.info("Команда выгрузки по городу user=%s city=%s is_admin=%s", user_id, city, is_admin)
+        period = _parse_export_period(text)
+        has_period = PERIOD_DATE_PATTERN.search(text) is not None
+        log.info(
+            "Команда выгрузки по городу user=%s city=%s period=%s..%s is_admin=%s",
+            user_id, city, period[0] if period else None,
+            period[1] if period else None, is_admin
+        )
         if not is_admin:
             send_message(user_id, MESSAGES["admin_only"])
         elif not city:
             send_message(user_id, "Не узнал город.\n\n" + _city_export_help_text())
+        elif has_period and period is None:
+            send_message(user_id, MESSAGES["invalid_period"])
         else:
+            period_note = (
+                f" за период {_format_period(period[0], period[1])}" if period else ""
+            )
             send_message(
                 user_id,
-                f"📊 Запрос на выгрузку по городу «{city}» принят. Подготавливаю файл…"
+                f"📊 Запрос на выгрузку по городу «{city}»{period_note} принят. "
+                "Подготавливаю файл…"
             )
-            _schedule_export(user_id, False, city=city)
+            _schedule_export(
+                user_id, False, city=city,
+                date_from=period[0] if period else None,
+                date_to=period[1] if period else None
+            )
         return
 
     if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
@@ -3930,6 +4075,32 @@ def handle_message(user_id, text):
             _schedule_export(user_id, True)
         else:
             send_message(user_id, MESSAGES["admin_only"])
+        return
+
+    # Произвольный период: «/выгрузить 01.01.2025 31.12.2025»,
+    # «/export 01.01.2025-31.12.2025», «/выгрузить с 01.01.2025 по 31.12.2025».
+    period_payload = _period_export_payload(text)
+    if period_payload:
+        is_admin = user_id in ADMIN_IDS
+        period = _parse_export_period(period_payload)
+        log.info(
+            "Команда выгрузки за период user=%s payload=%r is_admin=%s",
+            user_id, period_payload, is_admin
+        )
+        if not is_admin:
+            send_message(user_id, MESSAGES["admin_only"])
+        elif period is None:
+            send_message(user_id, MESSAGES["invalid_period"])
+        else:
+            date_from, date_to = period
+            send_message(
+                user_id,
+                f"📊 Запрос на выгрузку за период {_format_period(date_from, date_to)} "
+                "принят. Подготавливаю файл…"
+            )
+            _schedule_export(
+                user_id, False, date_from=date_from, date_to=date_to
+            )
         return
 
     if text_lower in ["/отчет", "/отчёт", "/report"]:

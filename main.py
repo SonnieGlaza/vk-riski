@@ -30,7 +30,15 @@ except ImportError:  # pragma: no cover — файл рядом со скрип�
     import sys as _sys
 
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    import work_import
+    try:
+        import work_import
+    except ImportError:
+        # Файл не попал в сборку — из-за помощника бот падать не должен:
+        # анкеты, рассылки и выгрузки работают, а «/работа» честно скажет, что недоступна.
+        work_import = None
+        logging.getLogger("vk_bot").warning(
+            "work_import.py не найден: загрузка истории работы отключена"
+        )
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -3836,11 +3844,24 @@ def _handle_work_import_command(user_id, text, text_lower, normalized, attachmen
     """Диалог загрузки истории работы. True — сообщение обработано здесь."""
     documents = _message_documents(attachments)
     is_admin = user_id in ADMIN_IDS
-    draft = _get_work_draft(user_id) if is_admin else None
 
     parts = text.strip().split(maxsplit=1)
     head = parts[0].lower() if parts else ""
     rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if work_import is None:
+        # Модуль разбора не попал в сборку: команда отвечает честно, остальное живёт как раньше.
+        if head in WORK_IMPORT_COMMANDS:
+            send_message(
+                user_id,
+                "⚠️ Загрузка истории работы сейчас недоступна: на сервере нет файла "
+                "work_import.py. Остальное бот делает как обычно."
+                if is_admin else MESSAGES["admin_only"]
+            )
+            return True
+        return False
+
+    draft = _get_work_draft(user_id) if is_admin else None
 
     if not is_admin:
         if head in WORK_IMPORT_COMMANDS:

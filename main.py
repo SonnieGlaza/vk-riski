@@ -24,6 +24,14 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.properties import PageSetupProperties
 
+try:  # разбор «какой работы проведено» из файла или текста (см. work_import.py)
+    import work_import
+except ImportError:  # pragma: no cover — файл рядом со скриптом, а не в sys.path
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import work_import
+
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("vk_bot")
@@ -48,6 +56,11 @@ KB_START = json.dumps({"one_time": False, "buttons": [[{"action": {"type": "text
 KB_RESTART = json.dumps({"one_time": False, "buttons": [
     [{"action": {"type": "text", "label": "🔄 Пройти заново"}, "color": "negative"}]
 ]})
+# Подтверждение загрузки истории работы (см. «/работа»).
+KB_WORK_IMPORT = json.dumps({"one_time": True, "buttons": [[
+    {"action": {"type": "text", "label": "Загрузить"}, "color": "positive"},
+    {"action": {"type": "text", "label": "Отмена"}, "color": "negative"}
+]]})
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ---
 def format_numbered_list(items, start_from=1, truncate=True):
@@ -360,6 +373,15 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_outreach_actions_user "
                   "ON outreach_actions(user_id, created_at)")
+        # Вложения входящих сообщений: нужны, чтобы админ мог прислать боту файл
+        # (например, таблицу «какая работа проведена») — см. блок «ИМПОРТ ИСТОРИИ РАБОТЫ».
+        c.execute("ALTER TABLE bot_inbox ADD COLUMN IF NOT EXISTS attachments TEXT")
+        # Черновик загрузки истории работы: строки ждут подтверждения админа.
+        c.execute("""CREATE TABLE IF NOT EXISTS work_import_drafts (
+                admin_id BIGINT PRIMARY KEY,
+                source TEXT,
+                payload TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -934,12 +956,6 @@ MESSAGES = {
     "invalid_multi": "Пожалуйста, укажите номера вариантов через запятую (например: 1, 3, 5). Проверьте, что номера от 1 до {}.",
     "no_data": "Пока нет собранных анкет для выгрузки.",
     "no_data_today": "Сегодня пока нет новых анкет для выгрузки.",
-    "no_data_period": "За период {period} анкет нет.",
-    "invalid_period": (
-        "Не удалось разобрать период. Укажите две даты в формате День.Месяц.Год "
-        "(например: /выгрузить 01.01.2025 31.12.2025). Дата начала не должна быть "
-        "позже даты окончания."
-    ),
     "no_data_report": "Пока нет собранных анкет для отчёта.",
     "no_data_report_today": "Сегодня пока нет новых анкет для отчёта.",
     "admin_only": "Эта команда доступна только администраторам.",
@@ -1212,62 +1228,6 @@ def _queue_export_reply(admin_id, message, inbox_id=None, attachment=None):
 EXPORT_MAX_DOC_BYTES = 4_500_000
 EXPORT_SPLIT_TARGET_BYTES = 4_000_000
 
-# Выгрузка за произвольный период: даты вводятся как День.Месяц.Год.
-PERIOD_DATE_PATTERN = re.compile(r"(?<!\d)(\d{1,2})\.(\d{1,2})\.(\d{4})(?!\d)")
-PERIOD_EXPORT_COMMANDS = {"/выгрузить", "/export", "/выгрузка"}
-PERIOD_MIN_YEAR = 2000
-PERIOD_MAX_YEAR = 2100
-
-
-def _format_period(date_from, date_to):
-    """Период для сообщений и названия файла: «01.01.2025» или «с … по …»."""
-    if date_from is None and date_to is None:
-        return ""
-    if date_from is not None and date_to is not None:
-        if date_from == date_to:
-            return date_from.strftime("%d.%m.%Y")
-        return f"с {date_from.strftime('%d.%m.%Y')} по {date_to.strftime('%d.%m.%Y')}"
-    if date_from is not None:
-        return f"с {date_from.strftime('%d.%m.%Y')}"
-    return f"по {date_to.strftime('%d.%m.%Y')}"
-
-
-def _parse_export_period(text):
-    """Даты периода из команды: (date_from, date_to) или None.
-
-    Поддерживаются «/выгрузить 01.01.2025 31.12.2025»,
-    «/export 01.01.2025-31.12.2025» и «/выгрузить с 01.01.2025 по 31.12.2025».
-    Одна дата означает выгрузку за этот день.
-    """
-    matches = PERIOD_DATE_PATTERN.findall(text or "")
-    if not matches or len(matches) > 2:
-        return None
-    dates = []
-    for day, month, year in matches:
-        try:
-            value = date(int(year), int(month), int(day))
-        except ValueError:
-            return None
-        if not PERIOD_MIN_YEAR <= value.year <= PERIOD_MAX_YEAR:
-            return None
-        dates.append(value)
-    if len(dates) == 1:
-        return dates[0], dates[0]
-    if dates[0] > dates[1]:
-        return None
-    return dates[0], dates[1]
-
-
-def _period_export_payload(text):
-    """Аргумент команды «/выгрузить <даты>»; None — это не команда периода."""
-    parts = (text or "").strip().split(maxsplit=1)
-    if len(parts) < 2:
-        return None
-    if parts[0].lower() not in PERIOD_EXPORT_COMMANDS:
-        return None
-    return parts[1].strip() or None
-
-
 # Лист «Анкеты»: ФИО оставляем, чтобы человека можно было найти. Поля, которые
 # уже есть на районных листах (контакты, согласие, курс, группа, дата), не дублируем.
 EXPORT_FULL_COLUMNS = (
@@ -1303,7 +1263,6 @@ DISTRICT_HEADERS = [
     "Получивший сервис «Подбор стажировки», (да/нет)",
     "Получивший сервис «Подбор практики», (да/нет)",
     "Получивший сервис «Целевое обучение», (да/нет)",
-    "ID пользователя",
 ]
 
 SCORE_KEYS = [
@@ -1388,12 +1347,6 @@ def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
             action_cell = ws.cell(row=row_idx, column=18, value="\n".join(history))
             action_cell.alignment = Alignment(vertical="top", wrap_text=True)
             action_cell.fill = action_fill
-        # ID пользователя — служебная колонка; на листе района она скрыта.
-        ws.cell(
-            row=row_idx,
-            column=len(DISTRICT_HEADERS),
-            value=r.get("user_id") if r.get("user_id") is not None else ""
-        )
         row_idx += 1
 
     # Итоговые строки под таблицей: сколько людей в работе и что уже сделано.
@@ -1431,8 +1384,6 @@ def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
         elif col_idx == 18:
             width = 45   # Какая работа проведена
         ws.column_dimensions[get_column_letter(col_idx)].width = width
-    # ID скрыт, но остаётся в файле: по нему можно сверять людей с базой.
-    ws.column_dimensions[get_column_letter(len(DISTRICT_HEADERS))].hidden = True
 
 
 def _build_export_workbook(rows):
@@ -1610,8 +1561,7 @@ def _upload_export_document(path, title, admin_id):
     return attachment
 
 
-def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None,
-                         date_from=None, date_to=None):
+def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None):
     sheet_list = []
     for district_name in DISTRICTS_UNIVERSITIES:
         count = sum(1 for r in rows if resolve_district(r.get("institution")) == district_name)
@@ -1624,14 +1574,8 @@ def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None
     if other_count:
         sheet_list.append(f"  • «Прочие» — {other_count} чел.")
     sheets_text = "\n".join(sheet_list)
-    period_text = _format_period(date_from, date_to)
-    has_period = date_from is not None or date_to is not None
-    if city and has_period:
-        header = f"📊 Выгрузка по городу «{city}» за период {period_text}:\n\n"
-    elif city:
+    if city:
         header = f"📊 Выгрузка по городу «{city}»:\n\n"
-    elif has_period:
-        header = f"📊 Выгрузка анкет за период {period_text}:\n\n"
     elif today_only:
         header = f"📊 Выгрузка анкет за сегодня ({date.today().strftime('%d.%m.%Y')}):\n\n"
     else:
@@ -1651,32 +1595,19 @@ def _split_rows(rows, part_count):
     return [rows[i:i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
 
-def _fetch_answers(today_only=False, city=None, date_from=None, date_to=None):
-    """Анкеты (все, за сегодня или за период) в порядке прохождения анкеты.
+def _fetch_answers(today_only=False, city=None):
+    """Все анкеты (или только за сегодня) в порядке прохождения анкеты.
 
     city — если задан, остаются только анкеты заведений этого города.
-    date_from/date_to — границы периода включительно (date).
     """
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
-        where = []
-        params = []
         if today_only:
-            where.append("a.created_at::date = %s")
-            params.append(date.today())
-        if date_from is not None:
-            where.append("a.created_at::date >= %s")
-            params.append(date_from)
-        if date_to is not None:
-            where.append("a.created_at::date <= %s")
-            params.append(date_to)
-        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
-        c.execute(
-            "SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id "
-            f"{where_sql} ORDER BY p.started_at ASC NULLS FIRST",
-            tuple(params)
-        )
+            today = date.today()
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id WHERE a.created_at::date = %s ORDER BY p.started_at ASC NULLS FIRST", (today,))
+        else:
+            c.execute("SELECT a.* FROM answers a LEFT JOIN progress p ON a.user_id = p.user_id ORDER BY p.started_at ASC NULLS FIRST")
         rows = c.fetchall()
     finally:
         release_db(conn)
@@ -1686,33 +1617,18 @@ def _fetch_answers(today_only=False, city=None, date_from=None, date_to=None):
     return rows
 
 
-def export_to_table(admin_id, today_only=False, inbox_id=None, city=None,
-                    date_from=None, date_to=None):
-    rows = _fetch_answers(
-        today_only, city=city, date_from=date_from, date_to=date_to
-    )
+def export_to_table(admin_id, today_only=False, inbox_id=None, city=None):
+    rows = _fetch_answers(today_only, city=city)
 
     if not rows:
         log.info(
-            "Выгрузка: нет строк (today_only=%s city=%s period=%s..%s) admin=%s",
-            today_only, city, date_from, date_to, admin_id
+            "Выгрузка: нет строк (today_only=%s city=%s) admin=%s",
+            today_only, city, admin_id
         )
         if city:
-            period_note = (
-                f" за период {_format_period(date_from, date_to)}"
-                if date_from is not None or date_to is not None else ""
-            )
             _queue_export_reply(
                 admin_id,
-                f"В «{city}»{period_note} нет анкет для выгрузки.",
-                inbox_id
-            )
-        elif date_from is not None or date_to is not None:
-            _queue_export_reply(
-                admin_id,
-                MESSAGES["no_data_period"].format(
-                    period=_format_period(date_from, date_to)
-                ),
+                f"В «{city}» нет анкет для выгрузки.",
                 inbox_id
             )
         else:
@@ -1749,12 +1665,9 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None,
                 size, len(parts), sizes
             )
 
-        if date_from is not None or date_to is not None:
-            base_title = f"Выгрузка за период {_format_period(date_from, date_to)}"
-        elif today_only:
-            base_title = f"Выгрузка за {date.today().strftime('%d.%m.%Y')}"
-        else:
-            base_title = "Выгрузка анкет"
+        base_title = (
+            f"Выгрузка за {date.today().strftime('%d.%m.%Y')}" if today_only else "Выгрузка анкет"
+        )
         if city:
             base_title = f"{city} — {base_title.lower()}"
         for index, (path, chunk) in enumerate(parts, start=1):
@@ -1762,10 +1675,7 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None,
             attachment = _upload_export_document(path, title, admin_id)
             _queue_export_reply(
                 admin_id,
-                _export_message_text(
-                    chunk, today_only, index, len(parts),
-                    city=city, date_from=date_from, date_to=date_to
-                ),
+                _export_message_text(chunk, today_only, index, len(parts), city=city),
                 inbox_id,
                 attachment
             )
@@ -1782,21 +1692,11 @@ def export_to_table(admin_id, today_only=False, inbox_id=None, city=None,
                 log.warning("Не удалось удалить временный файл выгрузки: %s", path)
 
 
-def _run_export_task(admin_id, today_only, inbox_id=None, city=None,
-                     date_from=None, date_to=None):
-    log.info(
-        "Запуск задачи выгрузки admin=%s today_only=%s city=%s period=%s..%s",
-        admin_id, today_only, city, date_from, date_to
-    )
+def _run_export_task(admin_id, today_only, inbox_id=None, city=None):
+    log.info("Запуск задачи выгрузки admin=%s today_only=%s city=%s", admin_id, today_only, city)
     try:
-        export_to_table(
-            admin_id, today_only, inbox_id, city=city,
-            date_from=date_from, date_to=date_to
-        )
-        log.info(
-            "Задача выгрузки завершена admin=%s today_only=%s city=%s period=%s..%s",
-            admin_id, today_only, city, date_from, date_to
-        )
+        export_to_table(admin_id, today_only, inbox_id, city=city)
+        log.info("Задача выгрузки завершена admin=%s today_only=%s city=%s", admin_id, today_only, city)
     except Exception as exc:
         log.exception("Не удалось подготовить выгрузку для admin=%s", admin_id)
         if "no_free_space" in str(exc).casefold():
@@ -1807,23 +1707,23 @@ def _run_export_task(admin_id, today_only, inbox_id=None, city=None,
         else:
             failure_message = "❌ Не удалось сформировать или отправить выгрузку. Подробности записаны в журнал."
         try:
-            _queue_export_reply(admin_id, failure_message, inbox_id)
+            _queue_export_reply(
+                admin_id,
+                failure_message,
+                inbox_id
+            )
         except Exception:
             log.exception("Не удалось поставить сообщение об ошибке выгрузки в outbox admin=%s", admin_id)
 
 
-def _submit_export(admin_id, today_only, inbox_id=None, city=None,
-                   date_from=None, date_to=None):
+def _submit_export(admin_id, today_only, inbox_id=None, city=None):
     try:
         if _executor_heavy is None:
             raise RuntimeError("Фоновый исполнитель выгрузки ещё не запущен")
-        _executor_heavy.submit(
-            _run_export_task, admin_id, today_only, inbox_id, city,
-            date_from, date_to
-        )
+        _executor_heavy.submit(_run_export_task, admin_id, today_only, inbox_id, city)
         log.info(
-            "Задача выгрузки поставлена в очередь admin=%s today_only=%s city=%s period=%s..%s",
-            admin_id, today_only, city, date_from, date_to
+            "Задача выгрузки поставлена в очередь admin=%s today_only=%s city=%s",
+            admin_id, today_only, city
         )
     except Exception:
         log.exception("Не удалось запустить выгрузку для admin=%s", admin_id)
@@ -1837,16 +1737,12 @@ def _submit_export(admin_id, today_only, inbox_id=None, city=None,
             log.exception("Не удалось поставить сообщение о запуске выгрузки в outbox admin=%s", admin_id)
 
 
-def _schedule_export(admin_id, today_only, city=None, date_from=None, date_to=None):
+def _schedule_export(admin_id, today_only, city=None):
     context = _current_inbox_context()
     if context is not None:
-        context["exports"].append(
-            (admin_id, today_only, context["inbox_id"], city, date_from, date_to)
-        )
+        context["exports"].append((admin_id, today_only, context["inbox_id"], city))
         return
-    _submit_export(
-        admin_id, today_only, city=city, date_from=date_from, date_to=date_to
-    )
+    _submit_export(admin_id, today_only, city=city)
 
 
 # ----------------- ОТЧЁТ ПО ФОРМЕ «ОЦЕНКА РИСКА НЕТРУДОУСТРОЙСТВА» -----------------
@@ -2634,14 +2530,14 @@ def _schedule_report(admin_id, today_only):
 
 
 # ----------------- ДОЛГОВЕЧНАЯ ОЧЕРЕДЬ ВХОДЯЩИХ -----------------
-def enqueue_incoming(user_id, peer_id, message_id, text, vk_date=None):
+def enqueue_incoming(user_id, peer_id, message_id, text, vk_date=None, attachments=None):
     conn = get_db()
     try:
         c = conn.cursor()
         c.execute(
-            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text) "
-            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
-            (peer_id, user_id, message_id, int(vk_date or time.time()), text)
+            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text, attachments) "
+            "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
+            (peer_id, user_id, message_id, int(vk_date or time.time()), text, attachments)
         )
         inserted = c.rowcount > 0
         conn.commit()
@@ -2660,8 +2556,8 @@ def enqueue_incoming_batch(entries):
     try:
         c = conn.cursor()
         c.executemany(
-            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text) "
-            "VALUES (%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
+            "INSERT INTO bot_inbox (peer_id, user_id, vk_message_id, vk_date, text, attachments) "
+            "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (peer_id, vk_message_id) DO NOTHING",
             entries
         )
         inserted = max(c.rowcount, 0)
@@ -2737,7 +2633,10 @@ def process_unread_messages():
                 log.error("У непрочитанного сообщения нет id: peer=%s", peer_id)
                 failed = True
                 break
-            pending.append((peer_id, peer_id, message_id, int(message.get('date') or time.time()), text))
+            pending.append((
+                peer_id, peer_id, message_id, int(message.get('date') or time.time()), text,
+                _attachments_json(message.get('attachments'))
+            ))
 
         if len(messages) < unread_count:
             failed = True
@@ -3216,10 +3115,7 @@ def _city_from_export_command(text):
         return None
     head = parts[0].lstrip("/").strip().lower()
     if head in ("город", "выгрузить_город", "export_city", "город_выгрузка"):
-        rest = parts[1].strip() if len(parts) > 1 else ""
-        if not rest:
-            return None
-        return _resolve_city(rest.split(maxsplit=1)[0])
+        return _resolve_city(parts[1]) if len(parts) > 1 else None
     return _resolve_city(head)
 
 
@@ -3583,6 +3479,434 @@ def record_call_result(data):
         user_id, phone[-4:], data.get("status")
     )
     return {"ok": True, "matched": True, "user_id": user_id}
+
+
+# ----------------- ИМПОРТ ИСТОРИИ РАБОТЫ (ФАЙЛ ИЛИ ТЕКСТ В VK) -----------------
+#
+# Админ отправляет «/работа», а затем присылает боту файл (.xlsx/.xlsm/.csv/.txt)
+# или строки «ФИО | что сделано». Бот сопоставляет строки с анкетами (answers) по
+# ФИО (однофамильцев разводят заведение и контакты), показывает предпросмотр и после
+# «загрузить» дописывает историю в outreach_actions — оттуда её берёт колонка
+# «Какая работа проведена» в выгрузках (см. _outreach_actions_for_users).
+#
+# Ничего не удаляет и не переписывает: только добавляет записи, одинаковые
+# «студент + что сделано» повторно не пишет.
+#
+# Разбор файла и поиск студента живут в work_import.py — там нет ни VK, ни базы,
+# поэтому логика проверяется тестом (tests/test_work_import.py).
+
+WORK_IMPORT_COMMANDS = {
+    "/работа", "/работы", "/работа_файл", "/загрузить_работы", "/импорт_работ"
+}
+WORK_IMPORT_CONFIRM = {
+    "загрузить", "загружай", "/загрузить", "подтверждаю", "да", "ок", "окей"
+}
+WORK_IMPORT_CANCEL = {"отмена", "отменить", "/отмена", "нет", "cancel"}
+WORK_IMPORT_CHANNEL = "import"
+WORK_IMPORT_MAX_FILE_MB = float(os.getenv("WORK_IMPORT_MAX_FILE_MB", "25"))
+WORK_IMPORT_MAX_ROWS = int(os.getenv("WORK_IMPORT_MAX_ROWS", "5000"))
+WORK_IMPORT_TEXT_LIMIT = 3800
+
+
+def _attachments_json(attachments):
+    """Вложения входящего сообщения в JSON-строку для очереди (None — если их нет)."""
+    if not attachments:
+        return None
+    try:
+        return json.dumps(attachments, ensure_ascii=False)[:20000]
+    except (TypeError, ValueError):
+        log.warning("Вложения сообщения не удалось сохранить в JSON")
+        return None
+
+
+def _message_documents(attachments):
+    """Документы из вложений сообщения: [{id, owner_id, title, url, size…}]."""
+    if isinstance(attachments, str):
+        try:
+            attachments = json.loads(attachments)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(attachments, dict):
+        attachments = attachments.get("items") or []
+    documents = []
+    for attachment in attachments or []:
+        if not isinstance(attachment, dict):
+            continue
+        doc = attachment.get("doc") if attachment.get("type") == "doc" else None
+        if isinstance(doc, dict) and doc.get("id"):
+            documents.append(doc)
+    return documents
+
+
+def _download_document(doc):
+    """Скачать присланный документ: сначала прямая ссылка VK, иначе docs.getById."""
+    title = str(doc.get("title") or "файл")
+    size = doc.get("size")
+    if size and float(size) > WORK_IMPORT_MAX_FILE_MB * 1024 * 1024:
+        raise RuntimeError(f"файл больше {WORK_IMPORT_MAX_FILE_MB:.0f} МБ")
+    url = str(doc.get("url") or "")
+    if not url:
+        api = _get_message_vk()
+        info = api.docs.getById(docs=[f"{doc.get('owner_id')}_{doc.get('id')}"])
+        items = info.get("items") if isinstance(info, dict) else info
+        if items:
+            url = str((items[0] or {}).get("url") or "")
+    if not url:
+        raise RuntimeError("VK не отдал ссылку на файл")
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return title, response.content
+
+
+def _work_import_help_text():
+    return (
+        "📥 Загрузка истории работы («Какая работа проведена»)\n\n"
+        "1. Пришлите файл .xlsx/.xlsm/.csv с колонками «ФИО» и «Какая работа проведена».\n"
+        "   «Контакты», «Учебное заведение» и «Дата работы» можно добавить —\n"
+        "   они помогают найти человека и развести однофамильцев.\n"
+        "2. Или вставьте строки текстом: ФИО | что сделано\n"
+        "   (нужно три колонки — пишите ФИО | Учебное заведение | что сделано;\n"
+        "   в одном сообщении можно сколько угодно строк, можно несколькими сообщениями).\n"
+        "3. Я покажу предпросмотр: сколько строк нашло студента, кого не нашёл\n"
+        "   и где однофамильцы. Затем отправьте «загрузить» или «отмена».\n\n"
+        "Старые записи не меняются: история только дописывается, одинаковые\n"
+        "«студент + что сделано» повторно не записываются."
+    )
+
+
+def _save_work_draft(admin_id, draft):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO work_import_drafts (admin_id, source, payload, created_at) "
+            "VALUES (%s,%s,%s, now()) ON CONFLICT (admin_id) DO UPDATE SET "
+            "source=EXCLUDED.source, payload=EXCLUDED.payload, created_at=now()",
+            (admin_id, draft.get("source") or "", json.dumps(draft, ensure_ascii=False))
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def _get_work_draft(admin_id):
+    """Черновик загрузки: строки, которые ждут подтверждения админа."""
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT source, payload FROM work_import_drafts WHERE admin_id=%s", (admin_id,)
+        )
+        row = c.fetchone()
+    finally:
+        release_db(conn)
+    if not row:
+        return None
+    try:
+        draft = json.loads(row[1] or "{}")
+    except (TypeError, ValueError):
+        log.warning("Черновик загрузки admin=%s повреждён, начинаю заново", admin_id)
+        return None
+    if not isinstance(draft, dict):
+        return None
+    draft["source"] = row[0] or draft.get("source") or ""
+    draft.setdefault("rows", [])
+    draft.setdefault("mode", "awaiting")
+    return draft
+
+
+def _clear_work_draft(admin_id):
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        c.execute("DELETE FROM work_import_drafts WHERE admin_id=%s", (admin_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+
+
+def _answer_candidates():
+    """Анкеты для сопоставления: user_id, ФИО, заведение, контакты."""
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT user_id, fio, institution, contacts FROM answers")
+        rows = c.fetchall()
+    finally:
+        release_db(conn)
+    return [dict(row) for row in rows]
+
+
+def _prepare_work_rows(raw_rows):
+    """Привязать строки из файла к анкетам и определить город для истории."""
+    matched = work_import.match_rows(raw_rows, _answer_candidates())
+    for row in matched:
+        if str(row.get("status") or "").startswith("ok"):
+            row["city"] = resolve_district(row.get("matched_institution"))
+    return matched[:WORK_IMPORT_MAX_ROWS]
+
+
+def _short(text, limit=70):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _work_import_preview(draft, added=None):
+    """Предпросмотр: что найдено, что не найдено и что именно будет записано."""
+    rows = draft.get("rows") or []
+    counts = work_import.count_statuses(rows)
+    ready = work_import.ready_rows(rows)
+    lines = ["📥 Предпросмотр загрузки истории работы", ""]
+    if draft.get("source"):
+        lines.append(f"• Источник: {_short(draft['source'], 60)}")
+    if added is not None:
+        lines.append(f"• Добавлено строк в этом сообщении: {added}")
+    lines.append(f"• Строк прочитано: {len(rows)}")
+    lines.append(f"• Нашли студента: {len(ready)}")
+    details = []
+    if counts.get("ok_short_fio"):
+        details.append(f"короткое ФИО — {counts['ok_short_fio']}")
+    if counts.get("ok_contacts"):
+        details.append(f"по контактам — {counts['ok_contacts']}")
+    if counts.get("ok_institution"):
+        details.append(f"по заведению — {counts['ok_institution']}")
+    if details:
+        lines.append("  (" + ", ".join(details) + ")")
+    for status, title in (
+        ("ambiguous", "Однофамильцы, угадывать не буду"),
+        ("not_found", "Студент не найден"),
+        ("empty_action", "Работа не заполнена"),
+        ("no_student", "Не понятно, о ком речь"),
+    ):
+        if counts.get(status):
+            lines.append(f"• {title}: {counts[status]}")
+
+    examples = ready[:8]
+    if examples:
+        lines += ["", "Что запишу (примеры):"]
+        lines += [
+            f"• {_short(row.get('matched_fio') or row.get('fio'), 42)} — {_short(row.get('action'), 60)}"
+            for row in examples
+        ]
+    problems = [row for row in rows if row.get("status") in ("not_found", "ambiguous")][:10]
+    if problems:
+        lines += ["", "Проверьте руками:"]
+        for row in problems:
+            if row.get("status") == "ambiguous":
+                variants = "; ".join(_short(v, 40) for v in (row.get("candidates") or []))
+                lines.append(f"• {_short(row.get('fio'), 40)} — однофамильцы: {variants}")
+            else:
+                lines.append(f"• {_short(row.get('fio'), 40)} — не найден")
+    lines += [
+        "",
+        f"Отправьте «загрузить», чтобы записать {len(ready)} записей, или «отмена».",
+    ]
+    message = "\n".join(lines)
+    if len(message) > WORK_IMPORT_TEXT_LIMIT:
+        message = message[:WORK_IMPORT_TEXT_LIMIT - 1] + "…"
+    return message
+
+
+def _work_import_from_documents(admin_id, documents, draft):
+    """Файл из сообщения: скачать, разобрать и показать предпросмотр."""
+    errors = []
+    for doc in documents:
+        try:
+            title, data = _download_document(doc)
+            rows, meta = work_import.parse_file(title, data)
+        except Exception as exc:
+            log.warning("Загрузка работы: файл %r не разобран (%s)", doc.get("title"), exc)
+            errors.append(f"«{_short(doc.get('title'), 40)}»: {exc}")
+            continue
+        if not rows:
+            errors.append(f"«{_short(title, 40)}»: строк с ФИО не нашлось")
+            continue
+        if not meta.get("actions_filled"):
+            errors.append(
+                f"«{_short(title, 40)}»: колонка «Какая работа проведена» пустая "
+                f"(прочитано строк: {len(rows)})"
+            )
+            continue
+        new_draft = {"mode": "awaiting", "source": title, "rows": _prepare_work_rows(rows)}
+        _save_work_draft(admin_id, new_draft)
+        log.info(
+            "Загрузка работы: admin=%s файл=%r строк=%s (в базе: %s)",
+            admin_id, title, len(new_draft["rows"]), len(work_import.ready_rows(new_draft["rows"]))
+        )
+        send_message(admin_id, _work_import_preview(new_draft), KB_WORK_IMPORT)
+        return True
+    send_message(
+        admin_id,
+        "Не смог прочитать файл:\n• " + "\n• ".join(errors) + "\n\n" + _work_import_help_text(),
+        KB_WORK_IMPORT
+    )
+    return True
+
+
+def _work_row_key(row):
+    """Ключ строки черновика: одна и та же работа по одному студенту не дублируется."""
+    return tuple(
+        str(row.get(field) or "").strip().casefold()
+        for field in ("fio", "contacts", "institution", "action")
+    )
+
+
+def _work_import_from_text(admin_id, text, draft):
+    """Строки «ФИО | что сделано» из сообщения: добавить к черновику."""
+    raw_rows = work_import.rows_from_text(text)
+    if not raw_rows:
+        send_message(
+            admin_id,
+            "Не увидел строк вида «ФИО | что сделано». Пример:\n"
+            "Иванов Иван Иванович | отправлено письмо в техникум\n\n"
+            "Или пришлите файлом .xlsx/.csv.",
+            KB_WORK_IMPORT
+        )
+        return True
+    rows = list((draft or {}).get("rows") or [])
+    seen = {_work_row_key(row) for row in rows}
+    added = 0
+    for row in _prepare_work_rows(raw_rows):
+        key = _work_row_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+        added += 1
+    new_draft = {
+        "mode": "awaiting",
+        "source": (draft or {}).get("source") or "строки из VK",
+        "rows": rows[:WORK_IMPORT_MAX_ROWS],
+    }
+    _save_work_draft(admin_id, new_draft)
+    send_message(admin_id, _work_import_preview(new_draft, added=added), KB_WORK_IMPORT)
+    return True
+
+
+def _apply_work_import(draft):
+    """Записать привязанные строки в outreach_actions. Возвращает (записано, дубли)."""
+    ready = work_import.ready_rows(draft.get("rows") or [])[:WORK_IMPORT_MAX_ROWS]
+    if not ready:
+        return 0, 0
+    conn = get_db()
+    try:
+        c = conn.cursor()
+        user_ids = sorted({row["user_id"] for row in ready})
+        c.execute(
+            "SELECT user_id, action FROM outreach_actions WHERE user_id = ANY(%s)", (user_ids,)
+        )
+        existing = {
+            (user_id, str(action or "").strip().casefold()) for user_id, action in c.fetchall()
+        }
+        inserts = []
+        duplicates = 0
+        for row in ready:
+            action = str(row.get("action") or "").strip()
+            key = (row["user_id"], action.casefold())
+            if key in existing:
+                duplicates += 1
+                continue
+            existing.add(key)
+            inserts.append((
+                row["user_id"], row.get("city"), WORK_IMPORT_CHANNEL, action,
+                row.get("date") or None
+            ))
+        if inserts:
+            c.executemany(
+                "INSERT INTO outreach_actions (user_id, city, channel, action, created_at) "
+                "VALUES (%s,%s,%s,%s, COALESCE(%s::timestamp, now()))",
+                inserts
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        release_db(conn)
+    return len(inserts), duplicates
+
+
+def _handle_work_import_command(user_id, text, text_lower, normalized, attachments):
+    """Диалог загрузки истории работы. True — сообщение обработано здесь."""
+    documents = _message_documents(attachments)
+    is_admin = user_id in ADMIN_IDS
+    draft = _get_work_draft(user_id) if is_admin else None
+
+    parts = text.strip().split(maxsplit=1)
+    head = parts[0].lower() if parts else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if not is_admin:
+        if head in WORK_IMPORT_COMMANDS:
+            send_message(user_id, MESSAGES["admin_only"])
+            return True
+        return False
+
+    if head in WORK_IMPORT_COMMANDS:
+        if documents:
+            return _work_import_from_documents(user_id, documents, None)
+        if rest:
+            return _work_import_from_text(user_id, rest, None)
+        _save_work_draft(user_id, {"mode": "awaiting", "source": "", "rows": []})
+        send_message(user_id, _work_import_help_text(), KB_WORK_IMPORT)
+        return True
+
+    if documents:
+        if draft is not None:
+            return _work_import_from_documents(user_id, documents, draft)
+        send_message(
+            user_id,
+            "Файл получил, но сейчас я не жду загрузку. Отправьте «/работа» и пришлите файл ещё раз."
+        )
+        return True
+
+    if normalized in WORK_IMPORT_CONFIRM and draft and draft.get("rows"):
+        try:
+            inserted, duplicates = _apply_work_import(draft)
+        except Exception:
+            log.exception("Не удалось записать историю работы admin=%s", user_id)
+            send_message(
+                user_id, "Не получилось записать: ошибка базы. Черновик сохранил, попробуйте ещё раз."
+            )
+            return True
+        counts = work_import.count_statuses(draft.get("rows") or [])
+        _clear_work_draft(user_id)
+        report = ["✅ История работы записана.", f"• Новых записей: {inserted}"]
+        if duplicates:
+            report.append(f"• Пропущено как уже записанное: {duplicates}")
+        if counts.get("not_found"):
+            report.append(f"• Студент не найден: {counts['not_found']} (эти строки не записаны)")
+        if counts.get("ambiguous"):
+            report.append(f"• Однофамильцы: {counts['ambiguous']} (не записаны)")
+        report += [
+            "",
+            "Смотреть колонку «Какая работа проведена»: «/Ижевск» или «/выгрузить».",
+        ]
+        log.info(
+            "Загрузка работы: admin=%s записано=%s дублей=%s не найдено=%s",
+            user_id, inserted, duplicates, counts.get("not_found", 0)
+        )
+        send_message(user_id, "\n".join(report))
+        return True
+
+    if normalized in WORK_IMPORT_CANCEL and draft is not None:
+        _clear_work_draft(user_id)
+        send_message(user_id, "Отменил: ничего не записал.")
+        return True
+
+    # Обычный текст админа ловим только в режиме загрузки: «не беспокоить» и другие
+    # команды подписки должны доходить до своей обработки как раньше.
+    if normalized in OPT_OUT_COMMANDS or normalized in OPT_IN_COMMANDS:
+        return False
+    if draft is not None and text and not text_lower.startswith("/"):
+        return _work_import_from_text(user_id, text, draft)
+    return False
 
 
 def _broadcast_city(admin_id, city, message, channels, inbox_id=None):
@@ -3975,22 +4299,33 @@ def _lock_user(user_id):
                 del _USER_LOCKS[user_id]
 
 def _serialize_user_messages(func):
-    def wrapped(user_id, text):
+    def wrapped(user_id, text, attachments=None):
         with _lock_user(user_id) as lock_wait:
             if lock_wait >= 0.05:
                 log.warning(
                     "Ожидание блокировки пользователя peer=%s duration=%.3fs",
                     user_id, lock_wait
                 )
-            return func(user_id, text)
+            return func(user_id, text, attachments)
     return wrapped
 
 @_serialize_user_messages
-def handle_message(user_id, text):
+def handle_message(user_id, text, attachments=None):
     t0 = time.time()
     if not user_id:
         return
     text = (text or "").strip()
+    text_lower = text.lower()
+    normalized = " ".join(text_lower.split())
+
+    # Загрузка истории работы админом («/работа», файл или строки «ФИО | что сделано»)
+    # проверяется до всего остального: сообщение с одним вложением приходит без текста,
+    # и обычный разбор пустого текста его бы съел.
+    if _handle_work_import_command(user_id, text, text_lower, normalized, attachments):
+        t_total = time.time() - t0
+        log_msg(f"handle_message user={user_id} step=work_import duration={t_total:.3f}s")
+        return
+
     if not text:
         step_index, uni_page, started = get_progress_cached(user_id)
         if started == 0:
@@ -4000,8 +4335,6 @@ def handle_message(user_id, text):
         else:
             ask_step(user_id, STEPS[max(0, step_index)], uni_page)
         return
-    text_lower = text.lower()
-    normalized = " ".join(text_lower.split())
 
     # «Не беспокоить» и возврат в рассылки — до всех остальных команд.
     if normalized in OPT_OUT_COMMANDS:
@@ -4038,33 +4371,17 @@ def handle_message(user_id, text):
     if _is_city_export_command(text):
         is_admin = user_id in ADMIN_IDS
         city = _city_from_export_command(text)
-        period = _parse_export_period(text)
-        has_period = PERIOD_DATE_PATTERN.search(text) is not None
-        log.info(
-            "Команда выгрузки по городу user=%s city=%s period=%s..%s is_admin=%s",
-            user_id, city, period[0] if period else None,
-            period[1] if period else None, is_admin
-        )
+        log.info("Команда выгрузки по городу user=%s city=%s is_admin=%s", user_id, city, is_admin)
         if not is_admin:
             send_message(user_id, MESSAGES["admin_only"])
         elif not city:
             send_message(user_id, "Не узнал город.\n\n" + _city_export_help_text())
-        elif has_period and period is None:
-            send_message(user_id, MESSAGES["invalid_period"])
         else:
-            period_note = (
-                f" за период {_format_period(period[0], period[1])}" if period else ""
-            )
             send_message(
                 user_id,
-                f"📊 Запрос на выгрузку по городу «{city}»{period_note} принят. "
-                "Подготавливаю файл…"
+                f"📊 Запрос на выгрузку по городу «{city}» принят. Подготавливаю файл…"
             )
-            _schedule_export(
-                user_id, False, city=city,
-                date_from=period[0] if period else None,
-                date_to=period[1] if period else None
-            )
+            _schedule_export(user_id, False, city=city)
         return
 
     if text_lower in ["/export today", "/выгрузить сегодня", "/выгрузить_сегодня"]:
@@ -4075,32 +4392,6 @@ def handle_message(user_id, text):
             _schedule_export(user_id, True)
         else:
             send_message(user_id, MESSAGES["admin_only"])
-        return
-
-    # Произвольный период: «/выгрузить 01.01.2025 31.12.2025»,
-    # «/export 01.01.2025-31.12.2025», «/выгрузить с 01.01.2025 по 31.12.2025».
-    period_payload = _period_export_payload(text)
-    if period_payload:
-        is_admin = user_id in ADMIN_IDS
-        period = _parse_export_period(period_payload)
-        log.info(
-            "Команда выгрузки за период user=%s payload=%r is_admin=%s",
-            user_id, period_payload, is_admin
-        )
-        if not is_admin:
-            send_message(user_id, MESSAGES["admin_only"])
-        elif period is None:
-            send_message(user_id, MESSAGES["invalid_period"])
-        else:
-            date_from, date_to = period
-            send_message(
-                user_id,
-                f"📊 Запрос на выгрузку за период {_format_period(date_from, date_to)} "
-                "принят. Подготавливаю файл…"
-            )
-            _schedule_export(
-                user_id, False, date_from=date_from, date_to=date_to
-            )
         return
 
     if text_lower in ["/отчет", "/отчёт", "/report"]:
@@ -4365,7 +4656,7 @@ def _process_one_inbox():
         conn = db_pool.getconn()
         c = conn.cursor()
         c.execute("""
-            SELECT m.id, m.user_id, m.text
+            SELECT m.id, m.user_id, m.text, m.attachments
             FROM bot_inbox m
             WHERE m.status='pending' AND m.available_at <= now()
               AND NOT EXISTS (
@@ -4385,7 +4676,7 @@ def _process_one_inbox():
             conn.rollback()
             return False
 
-        inbox_id, user_id, text = row
+        inbox_id, user_id, text, attachments = row
         context = {
             "inbox_id": inbox_id,
             "borrowed_connection": _BorrowedConnection(conn),
@@ -4398,7 +4689,7 @@ def _process_one_inbox():
         }
         _inbox_context.current = context
         with _lock_user(user_id):
-            handle_message(user_id, text)
+            handle_message(user_id, text, attachments)
 
             c = conn.cursor()
             for sequence, reply in enumerate(context["replies"]):
@@ -4697,7 +4988,8 @@ async def vk_callback(request: Request):
 
         try:
             await asyncio.to_thread(
-                enqueue_incoming, user_id, peer_id, message_id, text, msg.get("date")
+                enqueue_incoming, user_id, peer_id, message_id, text, msg.get("date"),
+                _attachments_json(msg.get("attachments"))
             )
         except Exception:
             log.exception("Не удалось сохранить callback peer=%s id=%s", peer_id, message_id)

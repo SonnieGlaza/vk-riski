@@ -880,7 +880,7 @@ QUESTIONS = {
 
 OPTIONS = {
     "consent": ["Да, я согласен(на)", "Нет, я не согласен(на)"],
-    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "6 курс"],
+    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
     "form_of_study": ["очная", "очно-заочная", "заочная"],
     "employment_status": [
         "Работаю по трудовому договору (в том числе по совместительству)",
@@ -1304,27 +1304,35 @@ def detect_education_level(row):
 
 
 # Разбивка по курсам рядом с итогами СПО/ВО: те же анкеты, но по курсам обучения.
-COURSE_LABELS = (
-    "1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "6 курс",
-    "Курс не указан",
-)
+COURSE_LABELS = ("1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "Курс не указан")
 
 
 def _course_label(row):
-    """Нормализовать курс из анкеты: «1 курс» … «6 курс» или «Курс не указан»."""
+    """Нормализовать курс из анкеты: «1 курс» … «5 курс» или «Курс не указан»."""
     raw = str(row.get("course") or "").strip()
-    match = re.search(r"[1-6]", raw)
+    match = re.search(r"[1-5]", raw)
     if match:
         return COURSE_LABELS[int(match.group()) - 1]
     return COURSE_LABELS[-1]
 
 
-def _course_counts(rows):
-    """Сколько анкет пришло с каждого курса; порядок совпадает с COURSE_LABELS."""
-    counts = [0] * len(COURSE_LABELS)
+def _present_course_labels(rows):
+    """Только те курсы, по которым есть хотя бы одна анкета."""
+    present = {_course_label(row) for row in rows}
+    return [label for label in COURSE_LABELS if label in present]
+
+
+def _course_counts(rows, labels=None):
+    """Сколько анкет пришло с каждого курса (по умолчанию — все COURSE_LABELS)."""
+    if labels is None:
+        labels = COURSE_LABELS
+    labels = list(labels)
+    counts = {label: 0 for label in labels}
     for row in rows:
-        counts[COURSE_LABELS.index(_course_label(row))] += 1
-    return counts
+        label = _course_label(row)
+        if label in counts:
+            counts[label] += 1
+    return [counts[label] for label in labels]
 
 
 def _format_created_at(value):
@@ -1466,24 +1474,29 @@ def _build_export_workbook(rows):
         "Студентов, призывающихся на военную службу или собирающихся "
         "осуществлять уход за ребенком"
     )
-    # Справа от сводки — те же СПО/ВО, но с разбивкой по курсам обучения.
+    # Справа от сводки — те же СПО/ВО, но только по тем курсам, где есть анкеты.
     course_start_col = 32  # столбец AF
-    course_end_col = course_start_col + len(COURSE_LABELS) - 1
-    ws1.cell(row=1, column=course_start_col, value="Из них по курсам обучения, чел.")
-    for offset, label in enumerate(COURSE_LABELS):
-        ws1.cell(row=2, column=course_start_col + offset, value=label)
+    course_labels = _present_course_labels(rows)
+    course_end_col = course_start_col + len(course_labels) - 1
+    if course_labels:
+        ws1.cell(row=1, column=course_start_col, value="Из них по курсам обучения, чел.")
+        for offset, label in enumerate(course_labels):
+            ws1.cell(row=2, column=course_start_col + offset, value=label)
     for merged_range in (
         "Y1:Y4", "Z1:AA1", "Z2:Z4", "AA2:AA3", "AB1:AE1", "AB2:AB4",
         "AC2:AE2", "AC3:AC4", "AD3:AD4"
     ):
         ws1.merge_cells(merged_range)
-    ws1.merge_cells(
-        start_row=1, start_column=course_start_col,
-        end_row=1, end_column=course_end_col
-    )
-    for offset in range(len(COURSE_LABELS)):
-        column = course_start_col + offset
-        ws1.merge_cells(start_row=2, start_column=column, end_row=4, end_column=column)
+    if course_labels:
+        ws1.merge_cells(
+            start_row=1, start_column=course_start_col,
+            end_row=1, end_column=course_end_col
+        )
+        for offset in range(len(course_labels)):
+            column = course_start_col + offset
+            ws1.merge_cells(
+                start_row=2, start_column=column, end_row=4, end_column=column
+            )
 
     thin_border = Border(
         left=Side(style="thin", color="000000"),
@@ -1517,7 +1530,7 @@ def _build_export_workbook(rows):
             sum(1 for r in risk_rows if _has_special_circumstances(r)),
             len(risk_graduates),
             sum(1 for r in risk_graduates if _has_special_circumstances(r)),
-            *_course_counts(level_rows),
+            *_course_counts(level_rows, course_labels),
         )
         for col_idx, value in enumerate(values, start=25):
             cell = ws1.cell(row=row_idx, column=col_idx, value=value)
@@ -1534,10 +1547,10 @@ def _build_export_workbook(rows):
         "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
     }.items():
         ws1.column_dimensions[column].width = width
-    for offset in range(len(COURSE_LABELS)):
+    for offset, label in enumerate(course_labels):
         column = get_column_letter(course_start_col + offset)
         ws1.column_dimensions[column].width = (
-            14 if offset == len(COURSE_LABELS) - 1 else 10
+            14 if label == COURSE_LABELS[-1] else 10
         )
 
     for district_name in DISTRICTS_UNIVERSITIES:
@@ -2422,9 +2435,9 @@ def _write_report_summary_sheet(ws, stats, skipped, today_only):
 
     grouped = _grouped_report_rows(stats)
     totals = grouped["СПО"] + grouped["ВО"] + grouped["Не указано"]
-    levels = ["СПО", "ВО"]
-    if grouped["Не указано"]:
-        levels.append("Не указано")
+    levels = [
+        level for level in ("СПО", "ВО", "Не указано") if grouped[level]
+    ]
 
     level_fill = PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid")
     total_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
@@ -2436,11 +2449,13 @@ def _write_report_summary_sheet(ws, stats, skipped, today_only):
             ws, excel_row, level, level_rows, border, center,
             bold=True, fill=level_fill
         )
-        # Под уровнем — построчная разбивка по каждому курсу.
+        # Под уровнем — только те курсы, по которым есть анкеты.
         for course_label in COURSE_LABELS:
             course_rows = [
                 r for r in level_rows if _course_label(r) == course_label
             ]
+            if not course_rows:
+                continue
             excel_row += 1
             _write_report_summary_row(
                 ws, excel_row, f"{level} {course_label}", course_rows,
@@ -2519,10 +2534,11 @@ def _report_message_text(stats, today_only):
         1 for r in form_rows if calculate_scores(dict(r))[1] >= REPORT_RISK_THRESHOLD
     )
     filled_count = sum(1 for level_rows in stats if level_rows["СПО"] or level_rows["ВО"])
-    course_totals = _course_counts(form_rows)
+    present_labels = _present_course_labels(form_rows)
+    course_totals = _course_counts(form_rows, present_labels)
     courses_text = ", ".join(
         f"{label} — {count}"
-        for label, count in zip(COURSE_LABELS, course_totals)
+        for label, count in zip(present_labels, course_totals)
         if count
     )
     period = "за сегодня" if today_only else "за весь период"

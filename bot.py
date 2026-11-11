@@ -880,7 +880,7 @@ QUESTIONS = {
 
 OPTIONS = {
     "consent": ["Да, я согласен(на)", "Нет, я не согласен(на)"],
-    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс"],
+    "course": ["1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "6 курс"],
     "form_of_study": ["очная", "очно-заочная", "заочная"],
     "employment_status": [
         "Работаю по трудовому договору (в том числе по совместительству)",
@@ -1304,13 +1304,16 @@ def detect_education_level(row):
 
 
 # Разбивка по курсам рядом с итогами СПО/ВО: те же анкеты, но по курсам обучения.
-COURSE_LABELS = ("1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "Курс не указан")
+COURSE_LABELS = (
+    "1 курс", "2 курс", "3 курс", "4 курс", "5 курс", "6 курс",
+    "Курс не указан",
+)
 
 
 def _course_label(row):
-    """Нормализовать курс из анкеты: «1 курс» … «5 курс» или «Курс не указан»."""
+    """Нормализовать курс из анкеты: «1 курс» … «6 курс» или «Курс не указан»."""
     raw = str(row.get("course") or "").strip()
-    match = re.search(r"[1-5]", raw)
+    match = re.search(r"[1-6]", raw)
     if match:
         return COURSE_LABELS[int(match.group()) - 1]
     return COURSE_LABELS[-1]
@@ -1464,17 +1467,23 @@ def _build_export_workbook(rows):
         "осуществлять уход за ребенком"
     )
     # Справа от сводки — те же СПО/ВО, но с разбивкой по курсам обучения.
-    ws1["AF1"] = "Из них по курсам обучения, чел."
+    course_start_col = 32  # столбец AF
+    course_end_col = course_start_col + len(COURSE_LABELS) - 1
+    ws1.cell(row=1, column=course_start_col, value="Из них по курсам обучения, чел.")
     for offset, label in enumerate(COURSE_LABELS):
-        ws1.cell(row=2, column=32 + offset, value=label)
+        ws1.cell(row=2, column=course_start_col + offset, value=label)
     for merged_range in (
         "Y1:Y4", "Z1:AA1", "Z2:Z4", "AA2:AA3", "AB1:AE1", "AB2:AB4",
-        "AC2:AE2", "AC3:AC4", "AD3:AD4", "AF1:AK1"
+        "AC2:AE2", "AC3:AC4", "AD3:AD4"
     ):
         ws1.merge_cells(merged_range)
+    ws1.merge_cells(
+        start_row=1, start_column=course_start_col,
+        end_row=1, end_column=course_end_col
+    )
     for offset in range(len(COURSE_LABELS)):
-        column = get_column_letter(32 + offset)
-        ws1.merge_cells(f"{column}2:{column}4")
+        column = course_start_col + offset
+        ws1.merge_cells(start_row=2, start_column=column, end_row=4, end_column=column)
 
     thin_border = Border(
         left=Side(style="thin", color="000000"),
@@ -1483,7 +1492,9 @@ def _build_export_workbook(rows):
         bottom=Side(style="thin", color="000000")
     )
     summary_header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
-    for row in ws1.iter_rows(min_row=1, max_row=4, min_col=25, max_col=37):
+    for row in ws1.iter_rows(
+        min_row=1, max_row=4, min_col=25, max_col=course_end_col
+    ):
         for cell in row:
             cell.font = Font(bold=True, size=10)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -1520,10 +1531,14 @@ def _build_export_workbook(rows):
     for col_idx in range(1, ws1.max_column + 1):
         ws1.column_dimensions[get_column_letter(col_idx)].width = 25
     for column, width in {
-        "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30,
-        "AF": 10, "AG": 10, "AH": 10, "AI": 10, "AJ": 10, "AK": 14
+        "Y": 14, "Z": 12, "AA": 15, "AB": 12, "AC": 27, "AD": 16, "AE": 30
     }.items():
         ws1.column_dimensions[column].width = width
+    for offset in range(len(COURSE_LABELS)):
+        column = get_column_letter(course_start_col + offset)
+        ws1.column_dimensions[column].width = (
+            14 if offset == len(COURSE_LABELS) - 1 else 10
+        )
 
     for district_name in DISTRICTS_UNIVERSITIES:
         district_rows = [r for r in rows if resolve_district(r.get("institution")) == district_name]
@@ -2284,25 +2299,6 @@ def _write_report_form_sheet(ws, stats):
         ws.cell(row=REPORT_HEADER_ROWS, column=col_idx, value=label)
 
     first_data_row = REPORT_HEADER_ROWS + 1
-    # Справа от граф ПОО/ВО — справка по курсам: сколько анкет с каждого курса.
-    course_block_start = 16  # столбец P, столбец O оставляем пустым разделителем
-    for level_offset, level in enumerate(("СПО", "ВО")):
-        start_col = course_block_start + level_offset * len(COURSE_LABELS)
-        ws.cell(
-            row=1, column=start_col,
-            value=f"Справка по курсам обучения ({level}), анкет, чел."
-        )
-        ws.merge_cells(
-            start_row=1, start_column=start_col,
-            end_row=1, end_column=start_col + len(COURSE_LABELS) - 1
-        )
-        for course_offset, label in enumerate(COURSE_LABELS):
-            column = start_col + course_offset
-            ws.cell(row=2, column=column, value=label)
-            ws.merge_cells(
-                start_row=2, start_column=column,
-                end_row=4, end_column=column
-            )
     for offset, (district, name, form_level, _sources) in enumerate(REPORT_FORM_ROWS):
         excel_row = first_data_row + offset
         ws.cell(row=excel_row, column=1, value=district)
@@ -2319,15 +2315,6 @@ def _write_report_form_sheet(ws, stats):
             vo_cells = vo_values if stats[offset]["ВО"] else empty_marker
         for col_idx, value in enumerate(list(spo_cells) + list(vo_cells), start=3):
             ws.cell(row=excel_row, column=col_idx, value=value)
-        for level_offset, level in enumerate(("СПО", "ВО")):
-            start_col = course_block_start + level_offset * len(COURSE_LABELS)
-            level_rows = stats[offset][level]
-            course_values = (
-                _course_counts(level_rows) if level_rows
-                else [REPORT_EMPTY_MARKER] * len(COURSE_LABELS)
-            )
-            for course_offset, value in enumerate(course_values):
-                ws.cell(row=excel_row, column=start_col + course_offset, value=value)
         name_lines = max(1, -(-len(name) // 38))
         ws.row_dimensions[excel_row].height = max(31.5, 15.0 * name_lines + 3)
 
@@ -2351,8 +2338,7 @@ def _write_report_form_sheet(ws, stats):
         fill_type="solid"
     )
     for cells_row in ws.iter_rows(
-        min_row=1, max_row=last_data_row, min_col=1,
-        max_col=course_block_start + 2 * len(COURSE_LABELS) - 1
+        min_row=1, max_row=last_data_row, min_col=1, max_col=14
     ):
         for cell in cells_row:
             cell.border = border
@@ -2373,17 +2359,31 @@ def _write_report_form_sheet(ws, stats):
     ws.row_dimensions[4].height = 77.25
     for column, width in REPORT_FORM_WIDTHS.items():
         ws.column_dimensions[column].width = width
-    ws.column_dimensions[get_column_letter(course_block_start - 1)].width = 3
-    for col_idx in range(
-        course_block_start, course_block_start + 2 * len(COURSE_LABELS)
-    ):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 10
 
     ws.print_title_rows = f"1:{REPORT_HEADER_ROWS}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr = PageSetupProperties(fitToPage=True)
+
+
+def _write_report_summary_row(
+    ws, row, label, rows, border, center, bold=False, fill=None, indent=0
+):
+    """Записать строку сводки: уровень/курс и те же шесть показателей."""
+    values = [label] + _form_metrics_values(_form_level_metrics(rows))
+    for col_idx, value in enumerate(values, start=1):
+        cell = ws.cell(row=row, column=col_idx, value=value)
+        cell.alignment = center
+        cell.border = border
+        if bold:
+            cell.font = Font(bold=True)
+        if fill is not None:
+            cell.fill = fill
+    if indent:
+        ws.cell(row=row, column=1).alignment = Alignment(
+            horizontal="left", vertical="center", indent=indent
+        )
 
 
 def _write_report_summary_sheet(ws, stats, skipped, today_only):
@@ -2411,7 +2411,6 @@ def _write_report_summary_sheet(ws, stats, skipped, today_only):
         "из них студентов выпускных курсов",
         "из них призывающихся на военную службу или собирающихся осуществлять "
         "уход за ребенком",
-        *COURSE_LABELS,
     )
     header_row = 5
     for col_idx, header in enumerate(headers, start=1):
@@ -2421,29 +2420,38 @@ def _write_report_summary_sheet(ws, stats, skipped, today_only):
         cell.border = border
         cell.fill = header_fill
 
-    grouped = {"СПО": [], "ВО": [], "Не указано": []}
-    for row_stats in stats:
-        for level, level_rows in row_stats.items():
-            grouped[level].extend(level_rows)
+    grouped = _grouped_report_rows(stats)
     totals = grouped["СПО"] + grouped["ВО"] + grouped["Не указано"]
     levels = ["СПО", "ВО"]
     if grouped["Не указано"]:
         levels.append("Не указано")
 
+    level_fill = PatternFill(start_color="EDEDED", end_color="EDEDED", fill_type="solid")
+    total_fill = PatternFill(start_color="DDEBF7", end_color="DDEBF7", fill_type="solid")
     excel_row = header_row
-    for level in levels + ["ИТОГО"]:
+    for level in levels:
+        level_rows = grouped[level]
         excel_row += 1
-        level_rows = totals if level == "ИТОГО" else grouped[level]
-        values = (
-            [level] + _form_metrics_values(_form_level_metrics(level_rows))
-            + _course_counts(level_rows)
+        _write_report_summary_row(
+            ws, excel_row, level, level_rows, border, center,
+            bold=True, fill=level_fill
         )
-        for col_idx, value in enumerate(values, start=1):
-            cell = ws.cell(row=excel_row, column=col_idx, value=value)
-            cell.alignment = center
-            cell.border = border
-            if level == "ИТОГО":
-                cell.font = Font(bold=True)
+        # Под уровнем — построчная разбивка по каждому курсу.
+        for course_label in COURSE_LABELS:
+            course_rows = [
+                r for r in level_rows if _course_label(r) == course_label
+            ]
+            excel_row += 1
+            _write_report_summary_row(
+                ws, excel_row, f"{level} {course_label}", course_rows,
+                border, center, indent=1
+            )
+
+    excel_row += 1
+    _write_report_summary_row(
+        ws, excel_row, "ИТОГО", totals, border, center,
+        bold=True, fill=total_fill
+    )
 
     # Сколько человек осталось за рамками формы: не завершили анкету или их
     # заведения нет в перечне.
@@ -2466,14 +2474,22 @@ def _write_report_summary_sheet(ws, stats, skipped, today_only):
         value_cell.border = border
 
     for column, width in {
-        "A": 46, "B": 12, "C": 14, "D": 20, "E": 26, "F": 16, "G": 26,
-        "H": 10, "I": 10, "J": 10, "K": 10, "L": 10, "M": 14
+        "A": 46, "B": 12, "C": 14, "D": 20, "E": 26, "F": 16, "G": 26
     }.items():
         ws.column_dimensions[column].width = width
 
 
+def _grouped_report_rows(stats):
+    """Собрать строки отчёта по уровням обучения (СПО, ВО, Не указано)."""
+    grouped = {"СПО": [], "ВО": [], "Не указано": []}
+    for row_stats in stats:
+        for level, level_rows in row_stats.items():
+            grouped[level].extend(level_rows)
+    return grouped
+
+
 def _build_report_workbook(rows, today_only=False, unfinished_count=0):
-    """Собрать книгу отчёта (заполненная форма и сводка) и вернуть путь к файлу."""
+    """Собрать книгу отчёта (форма и сводка с разбивкой по курсам)."""
     stats = _collect_form_stats(rows)
     skipped = {
         "unfinished": unfinished_count,
@@ -2521,9 +2537,9 @@ def _report_message_text(stats, today_only):
         lines.append(f"• По курсам: {courses_text}")
     lines += [
         "",
-        f"Лист «{REPORT_FORM_SHEET}» — форма с заполненными графами и справкой "
-        f"по курсам, лист «{REPORT_SUMMARY_SHEET}» — сводка по уровням обучения "
-        f"и курсам."
+        f"Лист «{REPORT_FORM_SHEET}» — форма с заполненными графами, "
+        f"лист «{REPORT_SUMMARY_SHEET}» — сводка по уровням обучения "
+        f"с разбивкой по курсам СПО/ВО."
     ]
     return "\n".join(lines)
 

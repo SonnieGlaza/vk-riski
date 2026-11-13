@@ -832,6 +832,86 @@ def resolve_district(institution):
         return district
     return None
 
+
+# ----------------- РУЧНОЙ ПЕРЕНОС АНКЕТ В ДРУГОЙ ГОРОД -----------------
+# Город анкеты определяется по учебному заведению, но студент может учиться в
+# филиале другого города, а в анкете выбрать головное заведение. Так, студенты
+# Воткинского филиала медицинского колледжа имени Ф.А. Пушиной отметили головной
+# колледж в Ижевске и попадали в лист «Ижевск». Такие анкеты переносим вручную,
+# по user_id: список ведёт администратор (исходник — воткинск.xlsx в папке бота).
+# Формат: {user_id: город из DISTRICTS_UNIVERSITIES}.
+MANUAL_DISTRICT_BY_USER = {
+    # Воткинский филиал АПОУ УР «Республиканский медицинский колледж
+    # имени Героя Советского Союза Ф.А. Пушиной», группы В-СД-30х.
+    297599068: "Воткинск",   # Савинцева Екатерина Александровна
+    416599337: "Воткинск",   # Стерхова Софья Дмитриевна
+    465427090: "Воткинск",   # Казаков Данил Михайлович
+    466301547: "Воткинск",   # Фертикова Дарья Алексеевна
+    485186372: "Воткинск",   # Обухова Валерия Дмитриевна
+    505800008: "Воткинск",   # Шкляева Полина Александровна
+    527975749: "Воткинск",   # Овчинникова Кристина Владиславовна
+    530804501: "Воткинск",   # Вахрушева Юлия Алексеевна
+    555572926: "Воткинск",   # Созонова Татьяна Сергеевна
+    581145033: "Воткинск",   # Ашихмина Алиса Александровна
+    591013399: "Воткинск",   # Мартюшева Софья Алексеевна
+    594655254: "Воткинск",   # Михалева Вероника Алексеевна
+    631999060: "Воткинск",   # Шушакова Софья Михайловна
+    635240553: "Воткинск",   # Бочкарева Мария Александровна
+    652031911: "Воткинск",   # Шадрина Радалина Артёмовна
+    654059880: "Воткинск",   # Кашин Никита Александрович
+    655426352: "Воткинск",   # Сазонова Марина Олеговна
+    668938495: "Воткинск",   # Фурина Софья Сергеевна
+    692653677: "Воткинск",   # Макарова Ангелина Владимировна
+    761288056: "Воткинск",   # Шишкина София Викторовна
+    823688213: "Воткинск",   # Назарова Карина Сергеевна
+    -412626513: "Воткинск",  # Чубукова Екатерина Николаевна
+    -455417431: "Воткинск",  # Власова Ксения Николаевна
+    # КПОУ УР «Удмуртский республиканский колледж культуры», группа В-СД-301.
+    431476369: "Воткинск",   # Бабушкина Алиса Михайловна
+}
+
+
+def manual_district(user_id):
+    """Город, заданный для анкеты вручную; None — город берём из заведения."""
+    try:
+        key = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    return MANUAL_DISTRICT_BY_USER.get(key)
+
+
+def manual_user_ids_for_city(city):
+    """user_id анкет, перенесённых в этот город вручную."""
+    return [
+        user_id for user_id, district in MANUAL_DISTRICT_BY_USER.items()
+        if district == city
+    ]
+
+
+def resolve_district_for_row(row):
+    """Город анкеты: сначала ручной перенос по user_id, потом по заведению."""
+    if not row:
+        return None
+    district = manual_district(row.get("user_id"))
+    if district:
+        return district
+    return resolve_district(row.get("institution"))
+
+
+def row_is_in_city(row, city, institutions=None):
+    """Относится ли анкета к городу — с учётом ручного переноса по user_id.
+
+    У перенесённых анкет заведение может быть из другого города, поэтому они
+    отбираются по user_id и в списки своего прежнего города не попадают.
+    """
+    district = manual_district(row.get("user_id"))
+    if district is not None:
+        return district == city
+    if institutions is None:
+        institutions = set(_institutions_for_city(city))
+    return (row.get("institution") or "") in institutions
+
+
 # ----------------- ШАГИ АНКЕТЫ -----------------
 STEPS = [
     "fio", "consent", "institution", "specialty", "study_group",
@@ -1554,13 +1634,13 @@ def _build_export_workbook(rows):
         )
 
     for district_name in DISTRICTS_UNIVERSITIES:
-        district_rows = [r for r in rows if resolve_district(r.get("institution")) == district_name]
+        district_rows = [r for r in rows if resolve_district_for_row(r) == district_name]
         if district_rows:
             write_score_sheet(
                 wb, district_name, district_rows,
                 _outreach_actions_for_users([r.get("user_id") for r in district_rows])
             )
-    other_rows = [r for r in rows if r.get("institution") and resolve_district(r.get("institution")) is None]
+    other_rows = [r for r in rows if r.get("institution") and resolve_district_for_row(r) is None]
     if other_rows:
         unknown = sorted({str(r.get("institution") or "не указано") for r in other_rows})
         log.warning(
@@ -1630,12 +1710,12 @@ def _upload_export_document(path, title, admin_id):
 def _export_message_text(rows, today_only, part_index=1, part_count=1, city=None):
     sheet_list = []
     for district_name in DISTRICTS_UNIVERSITIES:
-        count = sum(1 for r in rows if resolve_district(r.get("institution")) == district_name)
+        count = sum(1 for r in rows if resolve_district_for_row(r) == district_name)
         if count:
             sheet_list.append(f"  • «{district_name}» — {count} чел.")
     other_count = sum(
         1 for r in rows
-        if r.get("institution") and resolve_district(r.get("institution")) is None
+        if r.get("institution") and resolve_district_for_row(r) is None
     )
     if other_count:
         sheet_list.append(f"  • «Прочие» — {other_count} чел.")
@@ -1680,7 +1760,7 @@ def _fetch_answers(today_only=False, city=None):
         release_db(conn)
     if city:
         institutions = set(_institutions_for_city(city))
-        rows = [r for r in rows if (r.get("institution") or "") in institutions]
+        rows = [r for r in rows if row_is_in_city(r, city, institutions)]
     return rows
 
 
@@ -3323,6 +3403,14 @@ def _fetch_city_recipients(city):
     institutions = _institutions_for_city(city)
     if not institutions:
         return [], [], {}
+    # Анкеты, перенесённые в город вручную, выбираем по user_id: заведение в них
+    # может быть из другого города (например, головной колледж с филиалом).
+    manual_ids = manual_user_ids_for_city(city)
+    condition = "a.institution = ANY(%s)"
+    params = [institutions]
+    if manual_ids:
+        condition += " OR a.user_id = ANY(%s)"
+        params.append(manual_ids)
     conn = get_db()
     try:
         c = conn.cursor(cursor_factory=RealDictCursor)
@@ -3334,13 +3422,15 @@ def _fetch_city_recipients(city):
             "LEFT JOIN max_contacts m ON m.user_id = a.user_id "
             "WHERE p.started = 2 AND a.created_at IS NOT NULL "
             "AND o.user_id IS NULL "
-            "AND a.institution = ANY(%s) "
+            "AND (" + condition + ") "
             "ORDER BY a.user_id",
-            (institutions,)
+            tuple(params)
         )
         rows = c.fetchall()
     finally:
         release_db(conn)
+    # Анкеты, перенесённые вручную в другой город, в этой рассылке не участвуют.
+    rows = [row for row in rows if row_is_in_city(row, city, set(institutions))]
 
     stats = {
         "candidates": len(rows), "suitable": 0,
@@ -3591,7 +3681,7 @@ def record_call_result(data):
     user_id = entry["user_id"]
     record_outreach_action(
         user_id,
-        resolve_district(entry.get("institution")),
+        resolve_district_for_row(entry),
         "call",
         _call_action_text(data)
     )
@@ -3769,7 +3859,10 @@ def _prepare_work_rows(raw_rows):
     matched = work_import.match_rows(raw_rows, _answer_candidates())
     for row in matched:
         if str(row.get("status") or "").startswith("ok"):
-            row["city"] = resolve_district(row.get("matched_institution"))
+            row["city"] = resolve_district_for_row({
+                "user_id": row.get("user_id"),
+                "institution": row.get("matched_institution"),
+            })
     return matched[:WORK_IMPORT_MAX_ROWS]
 
 

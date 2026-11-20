@@ -381,6 +381,18 @@ def init_db():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_outreach_actions_user "
                   "ON outreach_actions(user_id, created_at)")
+        # «Да/нет»-отметки по человеку из колонок R–X выгрузки (ПКР, стажировка,
+        # практика, целевое обучение). Заполняются при загрузке истории «/работа»
+        # и возвращаются в те же колонки при следующей выгрузке.
+        c.execute("""CREATE TABLE IF NOT EXISTS work_services (
+                user_id BIGINT PRIMARY KEY,
+                pkr_plan TEXT,
+                pkr_any TEXT,
+                pkr_full TEXT,
+                internship TEXT,
+                practice TEXT,
+                target_education TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""")
         # Вложения входящих сообщений: нужны, чтобы админ мог прислать боту файл
         # (например, таблицу «какая работа проведена») — см. блок «ИМПОРТ ИСТОРИИ РАБОТЫ».
         c.execute("ALTER TABLE bot_inbox ADD COLUMN IF NOT EXISTS attachments TEXT")
@@ -1353,6 +1365,23 @@ DISTRICT_HEADERS = [
     "Получивший сервис «Целевое обучение», (да/нет)",
 ]
 
+# Порядок колонок 19–24 листа района — те же ключи, что и в work_import.SERVICE_KEYS.
+DISTRICT_SERVICE_KEYS = (
+    "pkr_plan", "pkr_any", "pkr_full",
+    "internship", "practice", "target_education",
+)
+
+
+def _yes_no_text(value):
+    """«да»/«нет» из ячейки; прочее возвращаем как есть."""
+    text = str(value or "").strip()
+    low = text.casefold()
+    if low.startswith("да"):
+        return "да"
+    if low.startswith("нет"):
+        return "нет"
+    return text
+
 SCORE_KEYS = [
     "employment", "target_contract", "experience", "practice_eval",
     "events", "resume", "interview", "special_status", "military",
@@ -1423,13 +1452,15 @@ def _format_created_at(value):
     return str(value)
 
 
-def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
+def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None, services=None):
     """Лист района: ФИО, вуз, контакты, согласие, курс, группа, дата, баллы, сводка.
 
     actions — история работы по людям (user_id -> список строк), выводится в
     колонке «Какая работа проведена».
+    services — отметки «да/нет» из колонок ПКР и сервисов (user_id -> {ключ: значение}).
     """
     actions = actions or {}
+    services = services or {}
     ws = workbook.create_sheet(title=sheet_name)
     header_font = Font(bold=True)
     bold_font = Font(bold=True)
@@ -1467,6 +1498,14 @@ def write_score_sheet(workbook, sheet_name, sheet_rows, actions=None):
             action_cell = ws.cell(row=row_idx, column=18, value="\n".join(history))
             action_cell.alignment = Alignment(vertical="top", wrap_text=True)
             action_cell.fill = action_fill
+        # Колонки 19–24: ПКР и сервисы «да/нет» из истории работы.
+        person_services = services.get(r.get("user_id")) or {}
+        for offset, key in enumerate(DISTRICT_SERVICE_KEYS):
+            value = _yes_no_text(person_services.get(key))
+            if not value:
+                continue
+            service_cell = ws.cell(row=row_idx, column=19 + offset, value=value)
+            service_cell.alignment = Alignment(horizontal="center", vertical="top")
         row_idx += 1
 
     # Итоговые строки под таблицей: сколько людей в работе и что уже сделано.
@@ -1638,7 +1677,8 @@ def _build_export_workbook(rows):
         if district_rows:
             write_score_sheet(
                 wb, district_name, district_rows,
-                _outreach_actions_for_users([r.get("user_id") for r in district_rows])
+                _outreach_actions_for_users([r.get("user_id") for r in district_rows]),
+                _work_services_for_users([r.get("user_id") for r in district_rows])
             )
     other_rows = [r for r in rows if r.get("institution") and resolve_district_for_row(r) is None]
     if other_rows:
@@ -1649,7 +1689,8 @@ def _build_export_workbook(rows):
         )
         write_score_sheet(
             wb, "Прочие", other_rows,
-            _outreach_actions_for_users([r.get("user_id") for r in other_rows])
+            _outreach_actions_for_users([r.get("user_id") for r in other_rows]),
+            _work_services_for_users([r.get("user_id") for r in other_rows])
         )
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
@@ -3696,6 +3737,33 @@ def _outreach_actions_for_users(user_ids):
     return history
 
 
+def _work_services_for_users(user_ids):
+    """Отметки «да/нет» по людям: user_id -> {pkr_plan: 'да', ...}."""
+    user_ids = [uid for uid in user_ids if uid is not None]
+    if not user_ids:
+        return {}
+    conn = get_db()
+    try:
+        c = conn.cursor(cursor_factory=RealDictCursor)
+        c.execute("SELECT * FROM work_services WHERE user_id = ANY(%s)", (user_ids,))
+        rows = c.fetchall()
+    except Exception:
+        log.exception("Не удалось прочитать work_services — колонки ПКР будут пустыми")
+        return {}
+    finally:
+        release_db(conn)
+    services = {}
+    for row in rows:
+        person = {
+            key: row.get(key)
+            for key in DISTRICT_SERVICE_KEYS
+            if str(row.get(key) or "").strip()
+        }
+        if person:
+            services[row.get("user_id")] = person
+    return services
+
+
 def _outreach_channel_phrase(channel, sent=0):
     """Формулировка для колонки «Какая работа проведена»."""
     channel = (channel or "").lower()
@@ -3831,6 +3899,8 @@ def record_call_result(data):
 # ФИО (однофамильцев разводят заведение и контакты), показывает предпросмотр и после
 # «загрузить» дописывает историю в outreach_actions — оттуда её берёт колонка
 # «Какая работа проведена» в выгрузках (см. _outreach_actions_for_users).
+# Отметки «да/нет» из колонок R–X (ПКР, стажировка, практика, целевое обучение)
+# сохраняются в work_services и возвращаются в те же колонки выгрузки.
 #
 # Ничего не удаляет и не переписывает: только добавляет записи, одинаковые
 # «студент + что сделано» повторно не пишет.
@@ -3907,6 +3977,10 @@ def _work_import_help_text():
         "1. Пришлите файл .xlsx/.xlsm/.csv с колонками «ФИО» и «Какая работа проведена».\n"
         "   «Контакты», «Учебное заведение» и «Дата работы» можно добавить —\n"
         "   они помогают найти человека и развести однофамильцев.\n"
+        "   Если в файле есть «да/нет»-колонки ПКР, «Подбор стажировки»,\n"
+        "   «Подбор практики», «Целевое обучение» — они тоже прочитаются\n"
+        "   и вернутся в те же колонки следующей выгрузки. Можно прислать\n"
+        "   саму выгрузку бота: заполненные колонки R–X подхватятся.\n"
         "2. Или вставьте строки текстом: ФИО | что сделано\n"
         "   (нужно три колонки — пишите ФИО | Учебное заведение | что сделано;\n"
         "   в одном сообщении можно сколько угодно строк, можно несколькими сообщениями).\n"
@@ -4003,6 +4077,21 @@ def _short(text, limit=70):
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
+def _work_row_summary(row, limit=70):
+    """Что запишем по строке: текст работы и/или отметки ПКР и сервисов."""
+    parts = []
+    action = " ".join(str(row.get("action") or "").split())
+    if action:
+        parts.append(action)
+    services = row.get("services") or {}
+    if services:
+        parts.append("; ".join(
+            f"{work_import.SERVICE_TITLES.get(key, key)}: {value}"
+            for key, value in services.items()
+        ))
+    return _short("; ".join(parts), limit)
+
+
 def _work_import_preview(draft, added=None):
     """Предпросмотр: что найдено, что не найдено и что именно будет записано."""
     rows = draft.get("rows") or []
@@ -4015,6 +4104,9 @@ def _work_import_preview(draft, added=None):
         lines.append(f"• Добавлено строк в этом сообщении: {added}")
     lines.append(f"• Строк прочитано: {len(rows)}")
     lines.append(f"• Нашли студента: {len(ready)}")
+    with_services = sum(1 for row in ready if row.get("services"))
+    if with_services:
+        lines.append(f"• С отметками ПКР/сервисов: {with_services}")
     details = []
     if counts.get("ok_short_fio"):
         details.append(f"короткое ФИО — {counts['ok_short_fio']}")
@@ -4037,7 +4129,7 @@ def _work_import_preview(draft, added=None):
     if examples:
         lines += ["", "Что запишу (примеры):"]
         lines += [
-            f"• {_short(row.get('matched_fio') or row.get('fio'), 42)} — {_short(row.get('action'), 60)}"
+            f"• {_short(row.get('matched_fio') or row.get('fio'), 42)} — {_work_row_summary(row, 60)}"
             for row in examples
         ]
     problems = [row for row in rows if row.get("status") in ("not_found", "ambiguous")][:10]
@@ -4073,10 +4165,10 @@ def _work_import_from_documents(admin_id, documents, draft):
         if not rows:
             errors.append(f"«{_short(title, 40)}»: строк с ФИО не нашлось")
             continue
-        if not meta.get("actions_filled"):
+        if not meta.get("work_filled"):
             errors.append(
-                f"«{_short(title, 40)}»: колонка «Какая работа проведена» пустая "
-                f"(прочитано строк: {len(rows)})"
+                f"«{_short(title, 40)}»: колонки «Какая работа проведена» и ПКР/сервисов "
+                f"пустые (прочитано строк: {len(rows)})"
             )
             continue
         new_draft = {"mode": "awaiting", "source": title, "rows": _prepare_work_rows(rows)}
@@ -4097,9 +4189,17 @@ def _work_import_from_documents(admin_id, documents, draft):
 
 def _work_row_key(row):
     """Ключ строки черновика: одна и та же работа по одному студенту не дублируется."""
-    return tuple(
-        str(row.get(field) or "").strip().casefold()
-        for field in ("fio", "contacts", "institution", "action")
+    return (
+        tuple(
+            str(row.get(field) or "").strip().casefold()
+            for field in ("fio", "contacts", "institution", "action")
+        )
+        + (
+            tuple(sorted(
+                (str(key), str(value or "").strip().casefold())
+                for key, value in (row.get("services") or {}).items()
+            )),
+        )
     )
 
 
@@ -4136,7 +4236,11 @@ def _work_import_from_text(admin_id, text, draft):
 
 
 def _apply_work_import(draft):
-    """Записать привязанные строки в outreach_actions. Возвращает (записано, дубли)."""
+    """Записать привязанные строки в outreach_actions и work_services.
+
+    Возвращает (записано, дубли): дубли считаются только по тексту работы,
+    отметки «да/нет» обновляются, если значение изменилось.
+    """
     ready = work_import.ready_rows(draft.get("rows") or [])[:WORK_IMPORT_MAX_ROWS]
     if not ready:
         return 0, 0
@@ -4150,10 +4254,46 @@ def _apply_work_import(draft):
         existing = {
             (user_id, str(action or "").strip().casefold()) for user_id, action in c.fetchall()
         }
+        current_services = {}
+        services_available = True
+        try:
+            c.execute(
+                "SELECT user_id, pkr_plan, pkr_any, pkr_full, internship, practice, "
+                "target_education FROM work_services WHERE user_id = ANY(%s)",
+                (user_ids,)
+            )
+            for record in c.fetchall():
+                current_services[record[0]] = {
+                    key: str(value or "").strip().casefold()
+                    for key, value in zip(DISTRICT_SERVICE_KEYS, record[1:])
+                }
+        except Exception:
+            # Таблицы может не быть на старой базе — историю работы всё равно пишем.
+            services_available = False
+            conn.rollback()
+            log.warning("work_services недоступна — отметки ПКР/сервисов пропущены")
+
         inserts = []
         duplicates = 0
+        service_updates = {}
+        service_inserts = 0
+        service_duplicates = 0
         for row in ready:
             action = str(row.get("action") or "").strip()
+            services = {
+                key: str(value or "").strip()
+                for key, value in (row.get("services") or {}).items()
+                if str(value or "").strip()
+            }
+            if services and services_available:
+                service_updates.setdefault(row["user_id"], {}).update(services)
+                current = current_services.get(row["user_id"], {})
+                if any(current.get(key) != value.casefold() for key, value in services.items()):
+                    service_inserts += 1
+                elif not action:
+                    service_duplicates += 1
+            if not action:
+                continue
             key = (row["user_id"], action.casefold())
             if key in existing:
                 duplicates += 1
@@ -4169,13 +4309,32 @@ def _apply_work_import(draft):
                 "VALUES (%s,%s,%s,%s, COALESCE(%s::timestamp, now()))",
                 inserts
             )
+        if services_available:
+            for user_id, services in service_updates.items():
+                values = [services.get(key) for key in DISTRICT_SERVICE_KEYS]
+                c.execute(
+                    "INSERT INTO work_services "
+                    "(user_id, pkr_plan, pkr_any, pkr_full, internship, practice, "
+                    "target_education, updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s, now()) "
+                    "ON CONFLICT (user_id) DO UPDATE SET "
+                    "pkr_plan=COALESCE(EXCLUDED.pkr_plan, work_services.pkr_plan), "
+                    "pkr_any=COALESCE(EXCLUDED.pkr_any, work_services.pkr_any), "
+                    "pkr_full=COALESCE(EXCLUDED.pkr_full, work_services.pkr_full), "
+                    "internship=COALESCE(EXCLUDED.internship, work_services.internship), "
+                    "practice=COALESCE(EXCLUDED.practice, work_services.practice), "
+                    "target_education=COALESCE(EXCLUDED.target_education, "
+                    "work_services.target_education), "
+                    "updated_at=now()",
+                    (user_id, *values)
+                )
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         release_db(conn)
-    return len(inserts), duplicates
+    return len(inserts) + service_inserts, duplicates + service_duplicates
 
 
 def _handle_work_import_command(user_id, text, text_lower, normalized, attachments):

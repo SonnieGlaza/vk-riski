@@ -18,6 +18,12 @@
 Обязательны только ФИО и работа. Если контакты или заведение есть — они помогают
 развести однофамильцев и найти человека, чьё ФИО в файле записано иначе.
 
+Кроме «Какая работа проведена» распознаются «да/нет»-колонки выгрузки (R–X):
+ПКР, хотя бы один сервис ПКР, полностью получивший сервисы ПКР, «Подбор
+стажировки», «Подбор практики», «Целевое обучение». Они попадают в строку как
+`services` и переносятся в те же колонки выгрузки. Строка может содержать только
+эти отметки — без текста «Какая работа проведена».
+
 Текстовый режим (админ копирует две колонки из Excel и вставляет в VK):
 
     Иванов Иван Иванович | отправлено письмо в техникум
@@ -129,6 +135,45 @@ COLUMN_ALIASES = {
 DATE_STOPWORDS = ("дата заполнения", "дата рождения", "дата анкетирования")
 
 
+# «Да/нет»-колонки выгрузки (R–X). Ключ → варианты заголовка.
+# Сравнение мягкое: кавычки, запятые и «(да/нет)» не важны.
+SERVICE_COLUMNS = (
+    ("pkr_plan", (
+        "реализуется индивидуальный план карьерного развития",
+        "индивидуальный план карьерного развития (пкр)",
+    )),
+    ("pkr_any", (
+        "получивший хотя бы один сервис из пкр",
+        "хотя бы один сервис из пкр",
+    )),
+    ("pkr_full", (
+        "полностью получивший сервисы из пкр",
+        "полностью получивший сервис из пкр",
+    )),
+    ("internship", (
+        "получивший сервис подбор стажировки",
+        "подбор стажировки",
+    )),
+    ("practice", (
+        "получивший сервис подбор практики",
+        "подбор практики",
+    )),
+    ("target_education", (
+        "получивший сервис целевое обучение",
+        "целевое обучение",
+    )),
+)
+SERVICE_KEYS = tuple(key for key, _ in SERVICE_COLUMNS)
+SERVICE_TITLES = {
+    "pkr_plan": "ПКР",
+    "pkr_any": "хотя бы один сервис ПКР",
+    "pkr_full": "все сервисы ПКР",
+    "internship": "подбор стажировки",
+    "practice": "подбор практики",
+    "target_education": "целевое обучение",
+}
+
+
 def _norm_header(value):
     return re.sub(r"\s+", " ", str(value or "").strip().casefold()).replace("ё", "е")
 
@@ -168,16 +213,50 @@ def detect_columns(headers):
     return found
 
 
+def _service_header_key(value):
+    """Заголовок «да/нет»-колонки без кавычек, запятых и «(да/нет)»."""
+    text = _norm_header(value)
+    text = re.sub(r"[«»\"'(),.;:/\-]", " ", text)
+    return " ".join(text.split())
+
+
+def detect_service_columns(headers):
+    """Индексы «да/нет»-колонок выгрузки: {ключ: индекс}."""
+    normalized = [_service_header_key(h) for h in headers]
+    found = {}
+    for field, aliases in SERVICE_COLUMNS:
+        for alias in aliases:
+            key = _service_header_key(alias)
+            if not key:
+                continue
+            for idx, header in enumerate(normalized):
+                if not header or idx in found.values():
+                    continue
+                if header.startswith(key) or key in header:
+                    found[field] = idx
+                    break
+            if field in found:
+                break
+    return found
+
+
 def _text(value):
     return "" if value is None else str(value).strip()
 
 
-def _row_from_values(values, columns):
+def _row_from_values(values, columns, service_columns=None):
     def pick(field):
         idx = columns.get(field)
         if idx is None or idx >= len(values):
             return ""
         return _text(values[idx])
+
+    services = {}
+    for field, idx in (service_columns or {}).items():
+        if idx < len(values):
+            value = _text(values[idx])
+            if value:
+                services[field] = value
 
     return {
         "fio": pick("fio"),
@@ -185,12 +264,13 @@ def _row_from_values(values, columns):
         "contacts": pick("contacts"),
         "institution": pick("institution"),
         "date": pick("date"),
+        "services": services,
     }
 
 
-def _looks_like_header(values, columns):
+def _looks_like_header(values, columns, service_columns=None):
     """Шапка — строка, в которой распознано минимум два поля (или ФИО и работа)."""
-    if not columns:
+    if not columns and not service_columns:
         return False
     hits = 0
     for field, idx in columns.items():
@@ -199,6 +279,7 @@ def _looks_like_header(values, columns):
         header = _norm_header(values[idx])
         if any(alias == header or header.startswith(alias) for alias in COLUMN_ALIASES[field]):
             hits += 1
+    hits += len(service_columns or {})
     return hits >= 2
 
 
@@ -212,11 +293,14 @@ def rows_from_grid(grid, header_scan=5):
     rows = []
     header_row = None
     columns = {}
+    service_columns = {}
     for offset, values in enumerate(grid[:header_scan]):
         candidate = detect_columns(values)
-        if _looks_like_header(values, candidate):
+        candidate_services = detect_service_columns(values)
+        if _looks_like_header(values, candidate, candidate_services):
             header_row = offset
             columns = candidate
+            service_columns = candidate_services
             break
     if header_row is None:
         # Шапки нет: считаем, что первая колонка — ФИО, вторая — работа.
@@ -225,12 +309,17 @@ def rows_from_grid(grid, header_scan=5):
     for values in grid[header_row + 1:]:
         if values is None or all(_text(v) == "" for v in values):
             continue
-        rows.append(_row_from_values(list(values), columns))
+        rows.append(_row_from_values(list(values), columns, service_columns))
     meta = {
         "columns": {field: idx + 1 for field, idx in columns.items()},
+        "service_columns": {field: idx + 1 for field, idx in service_columns.items()},
         "header_row": header_row + 1 if header_row >= 0 else None,
         "rows_total": len(rows),
         "actions_filled": sum(1 for row in rows if row["action"]),
+        "services_filled": sum(1 for row in rows if row.get("services")),
+        "work_filled": sum(
+            1 for row in rows if row["action"] or row.get("services")
+        ),
     }
     return rows, meta
 
@@ -238,26 +327,51 @@ def rows_from_grid(grid, header_scan=5):
 # --- Файлы ------------------------------------------------------------------------
 
 def rows_from_xlsx(data):
-    """Строки из первого листа, где есть заполненная колонка «какая работа проведена»."""
+    """Строки из всех листов, где заполнена работа или отметки ПКР/сервисов.
+
+    Полная выгрузка бота содержит по листу на город — читаем все заполненные
+    листы, а не только первый, чтобы отметки из колонок R–X не терялись.
+    """
     import openpyxl
 
     source = io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data
     workbook = openpyxl.load_workbook(source, read_only=True, data_only=True)
+    single_sheet = len(workbook.worksheets) == 1
     try:
         best = None
+        collected = []
+        metas = []
         for ws in workbook.worksheets:
             grid = [list(row) for row in ws.iter_rows(values_only=True)]
             rows, meta = rows_from_grid(grid)
             if not rows:
                 continue
-            if meta["actions_filled"]:
-                return rows, dict(meta, sheet=ws.title)
-            if best is None:
+            # Лист без шапки считаем рабочим, только если он единственный:
+            # в книге с несколькими листами это обычно служебная вкладка.
+            usable = meta.get("work_filled") and (
+                meta.get("header_row") is not None or single_sheet
+            )
+            if usable:
+                collected.extend(rows)
+                metas.append(dict(meta, sheet=ws.title))
+            elif best is None:
                 best = (rows, dict(meta, sheet=ws.title))
+        if collected:
+            meta = dict(metas[0])
+            meta["sheet"] = ", ".join(m["sheet"] for m in metas)
+            meta["sheets"] = [m["sheet"] for m in metas]
+            meta["rows_total"] = len(collected)
+            meta["actions_filled"] = sum(1 for row in collected if row["action"])
+            meta["services_filled"] = sum(1 for row in collected if row.get("services"))
+            meta["work_filled"] = sum(
+                1 for row in collected if row["action"] or row.get("services")
+            )
+            return collected, meta
         if best is not None:
             return best
-        return [], {"columns": {}, "header_row": None, "rows_total": 0, "actions_filled": 0,
-                    "sheet": None}
+        return [], {"columns": {}, "service_columns": {}, "header_row": None,
+                    "rows_total": 0, "actions_filled": 0, "services_filled": 0,
+                    "work_filled": 0, "sheet": None}
     finally:
         workbook.close()
 
@@ -323,6 +437,7 @@ def rows_from_text(text):
             "institution": institution,
             "action": parts[-1],
             "date": "",
+            "services": {},
         })
     return rows
 
@@ -336,8 +451,12 @@ def parse_file(filename, data):
         return rows_from_csv(data)
     if name.endswith(".txt"):
         rows = rows_from_text(data.decode("utf-8-sig", errors="replace") if isinstance(data, (bytes, bytearray)) else data)
-        return rows, {"columns": {}, "header_row": None, "rows_total": len(rows),
-                      "actions_filled": sum(1 for row in rows if row["action"]), "sheet": None}
+        return rows, {"columns": {}, "service_columns": {}, "header_row": None,
+                      "rows_total": len(rows),
+                      "actions_filled": sum(1 for row in rows if row["action"]),
+                      "services_filled": 0,
+                      "work_filled": sum(1 for row in rows if row["action"]),
+                      "sheet": None}
     if name.endswith(".xls"):
         raise ValueError("Формат .xls не поддерживается: сохраните файл как .xlsx или .csv")
     raise ValueError("Поддерживаются файлы .xlsx, .xlsm, .csv и .txt")
@@ -414,12 +533,14 @@ def match_rows(rows, candidates):
         item = dict(row)
         item.setdefault("contacts", "")
         item.setdefault("institution", "")
+        item.setdefault("services", {})
         item["user_id"] = None
         item["matched_fio"] = ""
         item["matched_institution"] = ""
         action = _text(item.get("action"))
+        services = item.get("services") or {}
         fio = _text(item.get("fio"))
-        if not action:
+        if not action and not services:
             item["status"] = "empty_action"
             matched.append(item)
             continue
@@ -484,5 +605,7 @@ def ready_rows(rows):
     """Только те строки, которые можно записывать в историю работы."""
     return [
         row for row in rows or []
-        if str(row.get("status") or "").startswith("ok") and row.get("user_id") and _text(row.get("action"))
+        if str(row.get("status") or "").startswith("ok")
+        and row.get("user_id")
+        and (_text(row.get("action")) or row.get("services"))
     ]
